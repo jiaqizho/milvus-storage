@@ -220,7 +220,7 @@ FFIResult get_chunks(ChunkReaderHandle reader,
   auto* cpp_reader = reinterpret_cast<ChunkReader*>(reader);
   std::vector<int64_t> indices(chunk_indices, chunk_indices + num_indices);
 
-  auto result = cpp_reader->get_chunks(indices, parallelism);
+  auto result = cpp_reader->get_chunks(indices, parallelism, true /* need_sliced */);
   if (!result.ok()) {
     RETURN_ERROR(LOON_ARROW_ERROR, result.status().ToString());
   }

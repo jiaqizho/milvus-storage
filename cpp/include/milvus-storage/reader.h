@@ -79,10 +79,11 @@ class ChunkReader {
    *
    * @param chunk_indices Vector of chunk indices to retrieve
    * @param parallelism Number of threads to use for parallel reading
+   * @param need_sliced Whether to slice the record batches to make result size equal to chunk indices size
    * @return Result containing vector of record batches for the specified chunks, or error status
    */
   [[nodiscard]] virtual arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> get_chunks(
-      const std::vector<int64_t>& chunk_indices, int64_t parallelism) = 0;
+      const std::vector<int64_t>& chunk_indices, int64_t parallelism, bool need_sliced) = 0;
 
   /**
    * @brief Retrieves the metadata of chunks
