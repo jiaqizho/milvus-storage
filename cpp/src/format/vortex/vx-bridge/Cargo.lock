@@ -5893,6 +5893,7 @@ dependencies = [
  "arrow-schema 56.2.0",
  "arrow-select 56.2.0",
  "arrow-string 56.2.0",
+ "async-compat",
  "aws-config",
  "aws-sdk-s3",
  "bytes",

@@ -18,18 +18,16 @@ use arrow_array::cast::AsArray;
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_array::ffi::FFI_ArrowSchema;
 use arrow_array::ffi_stream::{FFI_ArrowArrayStream};
-use arrow_array::{Array as ArrowArray};
 use arrow_data::ffi::{FFI_ArrowArray};
 use arrow_schema::{Field, ArrowError, DataType, Schema, SchemaRef};
 
 
-use vortex::pipeline::vec;
 use vortex::stats::Precision;
-use vortex::stats::{Stat, StatsProvider};
+use vortex::stats::{Stat};
 use vortex::{ArrayRef};
 use vortex::arrow::{FromArrowArray, IntoArrowArray};
 use vortex::buffer::Buffer;
-use vortex::file::{VortexOpenOptions, Writer as VortexBlockWriter, VortexWriteOptions, BlockingWriter};
+use vortex::file::{VortexOpenOptions, BlockingWriter};
 use vortex::scan::ScanBuilder;
 use vortex::scan::arrow::RecordBatchIteratorAdapter;
 use vortex::dtype::{DType as RustDType, DecimalDType, Nullability, PType as RustPType, FieldName};
@@ -38,9 +36,11 @@ use vortex::expr::ExprRef;
 use vortex::io::runtime::current::{CurrentThreadRuntime};
 use vortex::io::runtime::BlockingRuntime;
 use vortex::error::VortexError;
+use crate::fscpp::*;
 
 use crate::ffi;
 use crate::RUNTIME;
+
 
 /*
  * Blocking ObjectStoreWriter
@@ -452,9 +452,13 @@ pub(crate) unsafe fn write(&mut self, in_schema: *mut u8, in_array: *mut u8) -> 
     
     // lazy init the inner_writer
     if self.inner_writer.is_none() {
-        let objw: ObjectStoreWriter = RUNTIME.block_on(|_h| async {
-            ObjectStoreWriter::new(self.objstore.clone(), &self.path).await
-        }).map_err(|e| VortexError::from(e))?;
+        println!("write call2!");
+        let objw = ObjectStoreWriterCpp::new(std::ptr::null_mut())
+            .map_err(|e| VortexError::from(e))?;
+        println!("write call3!");
+        // let objw: ObjectStoreWriter = RUNTIME.block_on(|_h| async {
+        //     ObjectStoreWriter::new(self.objstore.clone(), &self.path).await
+        // }).map_err(|e| VortexError::from(e))?;
         
         // stats options
         let stats_options = if self.enable_stats {

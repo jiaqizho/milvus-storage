@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 pub mod bridgeimpl;
+mod fscpp;
 use bridgeimpl::*;
 
 use std::sync::LazyLock;
