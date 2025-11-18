@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "milvus-storage/format/parquet/parquet_chunk_reader.h"
+
 #include <memory>
 #include <string>
 #include <algorithm>
@@ -25,15 +27,13 @@
 #include <arrow/type.h>
 #include <arrow/type_fwd.h>
 #include <arrow/util/key_value_metadata.h>
-
 #include <parquet/arrow/schema.h>
 #include <parquet/type_fwd.h>
 
-#include "milvus-storage/format/parquet/reader.h"
 #include "milvus-storage/common/macro.h"
 #include "milvus-storage/common/metadata.h"
 #include "milvus-storage/common/arrow_util.h"
-
+#include "milvus-storage/common/constants.h"
 #include "milvus-storage/common/macro.h"  // for UNLIKELY
 
 namespace milvus_storage::parquet {
@@ -50,16 +50,16 @@ arrow::Status ParquetChunkReader::open() {
     }
     file_readers_.emplace_back(std::move(result.ValueOrDie()));
 
+    // get the RowGroupMetadataVector
     auto metadata = file_readers_[i]->parquet_reader()->metadata();
-    auto metadata_result = PackedFileMetadata::Make(metadata);
-    if (!metadata_result.ok()) {
-      return arrow::Status::Invalid("Error making file metadata:" + metadata_result.status().ToString());
-    }
-    file_metadatas_.emplace_back(metadata_result.ValueOrDie());
+    assert(metadata);
 
-    // Calculate number of rows until each chunk for efficient binary search for get_chunk_indices
-    // TODO: lazily read row group metadata.
-    auto row_group_metadata = file_metadatas_[i]->GetRowGroupMetadataVector();
+    auto key_value_metadata = metadata->key_value_metadata();
+    auto row_group_meta = key_value_metadata->Get(ROW_GROUP_META_KEY);
+    if (!row_group_meta.ok()) {
+      return arrow::Status::Invalid("Row group metadata not found");
+    }
+    auto row_group_metadata = RowGroupMetadataVector::Deserialize(row_group_meta.ValueOrDie());
 
     size_t rows = 0;
     for (size_t j = 0; j < row_group_metadata.size(); ++j) {

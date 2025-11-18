@@ -13,10 +13,11 @@
 // limitations under the License.
 
 #include "milvus-storage/format/format.h"
+
 #include "milvus-storage/filesystem/fs.h"
 #include "milvus-storage/common/lrucache.h"
-#include "milvus-storage/format/parquet/file_writer.h"
-#include "milvus-storage/format/parquet/reader.h"
+#include "milvus-storage/format/parquet/parquet_writer.h"
+#include "milvus-storage/format/parquet/parquet_chunk_reader.h"
 #include "milvus-storage/format/parquet/key_retriever.h"
 #include "milvus-storage/format/vortex/vortex_writer.h"
 #include "milvus-storage/format/vortex/vortex_chunk_reader.h"
@@ -49,7 +50,7 @@ static inline arrow::Result<std::shared_ptr<ObjectStoreWrapper>> create_vortex_o
 
 // ==================== ColumnGroupReaderFactory Implementation ====================
 
-arrow::Result<std::unique_ptr<ColumnGroupReader>> GroupReaderFactory::create(
+arrow::Result<std::unique_ptr<ColumnGroupReader>> ColumnGroupReader::create(
     std::shared_ptr<arrow::Schema> schema,
     std::shared_ptr<milvus_storage::api::ColumnGroup> column_group,
     const std::vector<std::string>& needed_columns,
@@ -107,7 +108,7 @@ arrow::Result<std::unique_ptr<ColumnGroupReader>> GroupReaderFactory::create(
 
 // ==================== ChunkWriterFactory Implementation ====================
 
-arrow::Result<std::unique_ptr<ColumnGroupWriter>> GroupWriterFactory::create(
+arrow::Result<std::unique_ptr<ColumnGroupWriter>> ColumnGroupWriter::create(
     std::shared_ptr<milvus_storage::api::ColumnGroup> column_group,
     std::shared_ptr<arrow::Schema> schema,
     const milvus_storage::api::Properties& properties) {

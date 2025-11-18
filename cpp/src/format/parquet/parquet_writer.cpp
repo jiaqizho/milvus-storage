@@ -17,7 +17,7 @@
 #include "milvus-storage/common/macro.h"
 #include "milvus-storage/common/metadata.h"
 #include "milvus-storage/common/arrow_util.h"
-#include "milvus-storage/format/parquet/file_writer.h"
+#include "milvus-storage/format/parquet/parquet_writer.h"
 #include "milvus-storage/filesystem/s3/multi_part_upload_s3_fs.h"
 
 #include <parquet/properties.h>

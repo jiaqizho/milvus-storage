@@ -76,10 +76,5 @@ arrow::Status VortexFileWriter::Close() {
   return arrow::Status::OK();
 }
 
-arrow::Status VortexFileWriter::AppendKVMetadata(const std::string& key, const std::string& value) {
-  assert(!closed_);
-  return arrow::Status::OK();
-}
-
 }  // namespace milvus_storage::vortex
 #endif

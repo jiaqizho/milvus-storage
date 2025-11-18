@@ -191,7 +191,7 @@ arrow::Status ColumnGroups::add_column_group(std::shared_ptr<ColumnGroup> column
   }
 
   // Add the column group
-  column_groups_.push_back(std::move(column_group));
+  column_groups_.emplace_back(std::move(column_group));
 
   // Update column mapping
   for (const auto& column_name : column_groups_.back()->columns) {

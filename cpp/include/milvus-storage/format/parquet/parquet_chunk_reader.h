@@ -84,7 +84,6 @@ class ParquetChunkReader : public internal::api::ColumnGroupReader {
 
   std::vector<int> needed_column_indices_;
   std::vector<std::shared_ptr<::parquet::arrow::FileReader>> file_readers_;
-  std::vector<std::shared_ptr<PackedFileMetadata>> file_metadatas_;
   std::vector<RowGroupIndex> row_group_indices_;
 };
 
