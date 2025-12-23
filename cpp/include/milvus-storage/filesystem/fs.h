@@ -118,10 +118,7 @@ struct ArrowFileSystemConfig {
    * @return String in format "address/bucket_name"
    */
   [[nodiscard]] std::string GetCacheKey() const {
-    if (alias.empty()) {
-      return "";
-    }
-    return address + "/" + bucket_name;
+    return storage_type == "local" ? root_path : address + "/" + bucket_name;
   }
 
   [[nodiscard]] std::string ToString() const {
