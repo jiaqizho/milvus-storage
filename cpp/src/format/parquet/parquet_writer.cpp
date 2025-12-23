@@ -165,9 +165,9 @@ arrow::Status ParquetFileWriter::init() {
   // Although the DIR is created in `column_group_writer`,
   // the current logic cannot be removed. It is still dependent
   // by `packed/`.
-  bool is_local_fs = fs_->type_name() == "local" ||
-                     (fs_->type_name() == "subtree" &&
-                      std::dynamic_pointer_cast<arrow::fs::SubTreeFileSystem>(fs_)->base_fs()->type_name() == "local");
+  bool is_local_fs = IsLocalFileSystem(fs_)
+    || (IsSubTreeFileSystem(fs_) && IsLocalFileSystem(SubTreeFileSystemGetBase(fs_)));
+
   if (is_local_fs) {
     boost::filesystem::path dir_path(file_path_);
     auto parent_dir_path = dir_path.parent_path();
@@ -178,10 +178,10 @@ arrow::Status ParquetFileWriter::init() {
   }
 
   if (storage_config_.part_size > 0 && ExtendFileSystem::IsExtendFileSystem(fs_)) {
-    assert(fs_->type_name() == MULTI_PART_UPLOAD_S3_FILESYSTEM_NAME);
-    auto s3fs = std::dynamic_pointer_cast<milvus_storage::ExtendFileSystem>(fs_);
+    auto [s3fs, normalized_path] = ExtendFileSystem::GetExtendFileSystem(fs_, file_path_);
+    assert(s3fs);
     // azure does not support custom part upload size output stream
-    auto sink_result = s3fs->OpenOutputStreamWithUploadSize(file_path_, storage_config_.part_size);
+    auto sink_result = s3fs->OpenOutputStreamWithUploadSize(normalized_path, storage_config_.part_size);
     if (!sink_result.ok()) {
       return arrow::Status::IOError("Failed to open output stream: " + sink_result.status().ToString());
     }

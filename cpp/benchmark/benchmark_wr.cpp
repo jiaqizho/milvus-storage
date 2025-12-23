@@ -70,7 +70,7 @@ class StorageFixture : public benchmark::Fixture {
   void SetUp(::benchmark::State& state) override {
     GBENCH_ASSERT_STATUS_OK(InitTestProperties(properties_), state);
     GBENCH_ASSERT_AND_ASSIGN(fs_, GetFileSystem(properties_), state);
-    base_path_ = GetTestBasePath("googlebench");
+    base_path_ = "googlebench";
     GBENCH_ASSERT_STATUS_OK(DeleteTestDir(fs_, base_path_), state);
     GBENCH_ASSERT_STATUS_OK(CreateTestDir(fs_, base_path_), state);
   }

@@ -42,7 +42,7 @@ class TransactionTest : public ::testing::Test {
     // Clean up test directory
     ASSERT_STATUS_OK(milvus_storage::InitTestProperties(properties_));
     ASSERT_AND_ASSIGN(fs_, GetFileSystem(properties_));
-    base_path_ = GetTestBasePath("transaction-test");
+    base_path_ = "transaction-test";
     ASSERT_STATUS_OK(DeleteTestDir(fs_, base_path_));
     ASSERT_STATUS_OK(CreateTestDir(fs_, base_path_));
 
@@ -92,7 +92,7 @@ class TransactionAtomicHandlerTest : public ::testing::TestWithParam<std::string
   void SetUp() override {
     ASSERT_STATUS_OK(milvus_storage::InitTestProperties(properties_));
     ASSERT_AND_ASSIGN(fs_, GetFileSystem(properties_));
-    base_path_ = GetTestBasePath("transaction-test-atomic-handler");
+    base_path_ = "transaction-test-atomic-handler";
     ASSERT_STATUS_OK(DeleteTestDir(fs_, base_path_));
     ASSERT_STATUS_OK(CreateTestDir(fs_, base_path_));
   }

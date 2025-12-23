@@ -43,7 +43,7 @@ class S3ClientMetricsTest : public ::testing::Test {
     s3fs_ = std::dynamic_pointer_cast<MultiPartUploadS3FS>(s3fs);
     ASSERT_NE(s3fs_, nullptr);
 
-    base_path_ = GetTestBasePath("s3client-metrics/");
+    base_path_ = "s3client-metrics";
     ASSERT_STATUS_OK(CreateTestDir(s3fs_, base_path_));
   }
 

@@ -72,8 +72,9 @@ arrow::Status conditional_write(const std::shared_ptr<arrow::fs::FileSystem>& fs
   }
 
   // do the conditional write
-  auto fs_ext = std::dynamic_pointer_cast<milvus_storage::ExtendFileSystem>(fs);
-  ARROW_ASSIGN_OR_RAISE(auto output_stream, fs_ext->OpenConditionalOutputStream(path));
+  auto [fs_ext, normalized_path] = milvus_storage::ExtendFileSystem::GetExtendFileSystem(fs, path);
+  assert(fs_ext);
+  ARROW_ASSIGN_OR_RAISE(auto output_stream, fs_ext->OpenConditionalOutputStream(normalized_path));
   ARROW_RETURN_NOT_OK(output_stream->Write(data.data(), data.size()));
   auto result = output_stream->Close();
   if (!result.ok()) {

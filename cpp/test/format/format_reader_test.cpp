@@ -36,7 +36,7 @@ class FormatReaderTest : public ::testing::TestWithParam<std::string> {
     ASSERT_STATUS_OK(InitTestProperties(properties_));
     ASSERT_AND_ASSIGN(fs_, GetFileSystem(properties_));
 
-    base_path_ = GetTestBasePath("format-reader-test");
+    base_path_ = "format-reader-test";
     ASSERT_STATUS_OK(DeleteTestDir(fs_, base_path_));
     ASSERT_STATUS_OK(CreateTestDir(fs_, base_path_));
 

@@ -49,7 +49,7 @@ class PackedTestBase : public ::testing::Test {
     api::Properties properties;
     ASSERT_STATUS_OK(milvus_storage::InitTestProperties(properties));
     ASSERT_AND_ASSIGN(fs_, GetFileSystem(properties));
-    path_ = GetTestBasePath("packed-test");
+    path_ = "packed-test";
     ASSERT_STATUS_OK(DeleteTestDir(fs_, path_));
     ASSERT_STATUS_OK(CreateTestDir(fs_, path_));
 

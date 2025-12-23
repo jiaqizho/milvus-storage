@@ -67,18 +67,17 @@ TEST_F(S3FsTest, TestExtend) {
 }
 
 TEST_F(S3FsTest, ConditionalWrite) {
-  std::string bucket_name = GetEnvVar(ENV_VAR_BUCKET_NAME).ValueOr("");
-  std::string file_to = bucket_name + "/test_conditional_write.txt";
+  std::string file_path = "test_conditional_write.txt";
 
   // Ensure source file does not exist
-  (void)fs_->DeleteFile(file_to);
+  (void)fs_->DeleteFile(file_path);
 
   std::string content1 = "This is a test file for conditional write.";
   std::string content2 = "This is a test file for conditional write 2.";
 
   ASSERT_TRUE(milvus_storage::ExtendFileSystem::IsExtendFileSystem(fs_));
-
-  auto fs_ext = std::dynamic_pointer_cast<milvus_storage::ExtendFileSystem>(fs_);
+  auto [fs_ext, file_to] = milvus_storage::ExtendFileSystem::GetExtendFileSystem(fs_, file_path);
+  ASSERT_TRUE(fs_ext != nullptr);
 
   // Create source file
   {

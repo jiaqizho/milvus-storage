@@ -30,6 +30,7 @@
 #include "milvus-storage/common/constants.h"
 #include "milvus-storage/filesystem/s3/s3_options.h"
 #include "milvus-storage/filesystem/s3/s3_client.h"
+#include "milvus-storage/filesystem/fs.h"
 
 using ::arrow::fs::FileInfo;
 using ::arrow::fs::FileInfoGenerator;
@@ -51,7 +52,38 @@ class ExtendFileSystem {
   virtual arrow::Result<std::shared_ptr<arrow::io::OutputStream>> OpenConditionalOutputStream(const std::string& s) = 0;
 
   static bool IsExtendFileSystem(const std::shared_ptr<arrow::fs::FileSystem>& fs) {
-    return std::dynamic_pointer_cast<ExtendFileSystem>(fs) != nullptr;
+    if (IsSubTreeFileSystem(fs)) {
+      auto basefs = SubTreeFileSystemGetBase(fs);
+      return basefs && std::dynamic_pointer_cast<ExtendFileSystem>(basefs) != nullptr;
+    } else {
+      return std::dynamic_pointer_cast<ExtendFileSystem>(fs) != nullptr;
+    }
+  }
+
+  static std::pair<std::shared_ptr<ExtendFileSystem>, std::string> GetExtendFileSystem(
+    const std::shared_ptr<arrow::fs::FileSystem>& fs, const std::string &base_path) {
+    if (!IsExtendFileSystem(fs)) {
+      return {nullptr, base_path};
+    }
+
+    if (IsSubTreeFileSystem(fs)) {
+      std::string normalized_path;
+      auto subtree_fs = std::dynamic_pointer_cast<arrow::fs::SubTreeFileSystem>(fs);
+      auto subtree_path = subtree_fs->base_path();
+      if (!subtree_path.empty()) {
+        auto normalized_path_result = arrow::fs::internal::ConcatAbstractPath(subtree_path, base_path);
+        if (!normalized_path_result.ok()) {
+          return {nullptr, base_path};
+        }
+        normalized_path = normalized_path_result.value();
+      }
+
+      auto basefs = SubTreeFileSystemGetBase(fs);
+      assert(basefs);
+      return {std::dynamic_pointer_cast<ExtendFileSystem>(basefs), normalized_path};
+    } else {
+      return {std::dynamic_pointer_cast<ExtendFileSystem>(fs), base_path};
+    }
   }
 
 };  // ExtendFileSystem

@@ -32,13 +32,40 @@
 
 namespace milvus_storage {
 
+// ==================== Global functions ====================
 static constexpr auto local_uri_scheme = "file://";
+
+enum class StorageType : int8_t{
+  UNKNOWN = 0,
+  LOCAL,
+  REMOTE,
+};
+
+enum class CloudProviderType : int8_t {
+  UNKNOWN = 0,
+  AWS,
+  GCP,
+  ALIYUN,
+  AZURE,
+  TENCENTCLOUD,
+  HUAWEICLOUD,
+};
+
+static std::map<std::string, StorageType> StorageType_Map = {{"local", StorageType::LOCAL},
+                                                             {"remote", StorageType::REMOTE}};
+
+static std::map<std::string, CloudProviderType> CloudProviderType_Map = {{"aws", CloudProviderType::AWS},
+                                                                         {"gcp", CloudProviderType::GCP},
+                                                                         {"aliyun", CloudProviderType::ALIYUN},
+                                                                         {"azure", CloudProviderType::AZURE},
+                                                                         {"tencent", CloudProviderType::TENCENTCLOUD},
+                                                                         {"huawei", CloudProviderType::HUAWEICLOUD}};
 
 arrow::Result<ArrowFileSystemPtr> CreateArrowFileSystem(const ArrowFileSystemConfig& config) {
   std::string out_path;
   auto storage_type = StorageType_Map[config.storage_type];
   switch (storage_type) {
-    case StorageType::Local: {
+    case StorageType::LOCAL: {
       auto path = boost::filesystem::path(config.root_path);
       if (path.is_relative()) {
         path = boost::filesystem::absolute(path);
@@ -60,13 +87,15 @@ arrow::Result<ArrowFileSystemPtr> CreateArrowFileSystem(const ArrowFileSystemCon
       return std::make_shared<arrow::fs::SubTreeFileSystem>(out_path,
                                                             std::make_shared<arrow::fs::LocalFileSystem>(option));
     }
-    case StorageType::Remote: {
+    case StorageType::REMOTE: {
       auto cloud_provider = CloudProviderType_Map[config.cloud_provider];
       switch (cloud_provider) {
 #ifdef MILVUS_AZURE_FS
         case CloudProviderType::AZURE: {
           auto producer = std::make_shared<AzureFileSystemProducer>(config);
-          return producer->Make();
+          ARROW_ASSIGN_OR_RAISE(auto s3fs, producer->Make());
+          return std::make_shared<arrow::fs::SubTreeFileSystem>(config.bucket_name,
+                                                                std::move(s3fs));
         }
 #endif
         case CloudProviderType::AWS:
@@ -75,7 +104,9 @@ arrow::Result<ArrowFileSystemPtr> CreateArrowFileSystem(const ArrowFileSystemCon
         case CloudProviderType::TENCENTCLOUD:
         case CloudProviderType::HUAWEICLOUD: {
           auto producer = std::make_shared<S3FileSystemProducer>(config);
-          return producer->Make();
+          ARROW_ASSIGN_OR_RAISE(auto s3fs, producer->Make());
+          return std::make_shared<arrow::fs::SubTreeFileSystem>(config.bucket_name,
+                                                                std::move(s3fs));
         }
         default: {
           return arrow::Status::Invalid("Unsupported cloud provider: " + config.cloud_provider);
@@ -87,6 +118,56 @@ arrow::Result<ArrowFileSystemPtr> CreateArrowFileSystem(const ArrowFileSystemCon
     }
   }
 }
+
+bool IsSubTreeFileSystem(const ArrowFileSystemPtr& fsptr) 
+{
+  if (!fsptr) {
+    return false;
+  }
+
+  return fsptr->type_name() == "subtree";
+}
+
+bool IsLocalFileSystem(const ArrowFileSystemPtr& fsptr)
+{
+  if (!fsptr) {
+    return false;
+  }
+
+  return fsptr->type_name() == "local";
+}
+
+ArrowFileSystemPtr SubTreeFileSystemGetBase(const ArrowFileSystemPtr& fsptr)
+{
+  if (!fsptr || !IsSubTreeFileSystem(fsptr)) {
+    return nullptr;
+  }
+
+  auto subtree_fs = std::dynamic_pointer_cast<arrow::fs::SubTreeFileSystem>(fsptr);
+  return subtree_fs ? subtree_fs->base_fs() : nullptr;
+}
+
+// ==================== ArrowFileSystemConfig Implementation ====================
+
+std::string ArrowFileSystemConfig::GetCacheKey() const {
+    return storage_type == "local" ? root_path : address + "/" + bucket_name;
+  }
+
+std::string ArrowFileSystemConfig::ToString() const {
+    std::stringstream ss;
+    ss << "[address=" << address << ", bucket_name=" << bucket_name << ", root_path=" << root_path
+       << ", storage_type=" << storage_type << ", cloud_provider=" << cloud_provider << ", log_level=" << log_level
+       << ", region=" << region << ", use_ssl=" << std::boolalpha << use_ssl
+       << ", ssl_ca_cert_length=" << ssl_ca_cert.size()  // only print cert length
+       << ", use_iam=" << std::boolalpha << use_iam << ", use_virtual_host=" << std::boolalpha << use_virtual_host
+       << ", request_timeout_ms=" << request_timeout_ms << ", max_connections=" << max_connections;
+    if (!alias.empty()) {
+      ss << ", alias=" << alias;
+    }
+    ss << "]";
+
+    return ss.str();
+  }
 
 // ==================== FilesystemCache Implementation ====================
 
@@ -330,5 +411,18 @@ void ArrowFileSystemSingleton::Init(const ArrowFileSystemConfig& config) {
     afs_ = result.ValueOrDie();
   }
 }
+
+void ArrowFileSystemSingleton::Release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (afs_ != nullptr) {
+      afs_.reset();
+      afs_ = nullptr;
+    }
+  }
+
+  ArrowFileSystemPtr ArrowFileSystemSingleton::GetArrowFileSystem() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return afs_;
+  }
 
 };  // namespace milvus_storage

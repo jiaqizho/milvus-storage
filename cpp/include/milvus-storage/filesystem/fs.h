@@ -33,6 +33,8 @@
 
 namespace milvus_storage {
 
+using ArrowFileSystemPtr = std::shared_ptr<arrow::fs::FileSystem>;
+
 /**
  * @brief Parsed storage URI components
  *
@@ -71,8 +73,6 @@ struct StorageUri {
    */
   static arrow::Result<StorageUri> Parse(const std::string& uri);
 };
-
-using ArrowFileSystemPtr = std::shared_ptr<arrow::fs::FileSystem>;
 
 // TODO: it's not `arrow` namespace, we should change this struct name.
 // TODO: after chunkmanager(in milvus) removed, we can remove the used key in storage
@@ -117,28 +117,17 @@ struct ArrowFileSystemConfig {
    *
    * @return String in format "address/bucket_name"
    */
-  [[nodiscard]] std::string GetCacheKey() const {
-    return storage_type == "local" ? root_path : address + "/" + bucket_name;
-  }
+  [[nodiscard]] std::string GetCacheKey() const;
 
-  [[nodiscard]] std::string ToString() const {
-    std::stringstream ss;
-    ss << "[address=" << address << ", bucket_name=" << bucket_name << ", root_path=" << root_path
-       << ", storage_type=" << storage_type << ", cloud_provider=" << cloud_provider << ", log_level=" << log_level
-       << ", region=" << region << ", use_ssl=" << std::boolalpha << use_ssl
-       << ", ssl_ca_cert_length=" << ssl_ca_cert.size()  // only print cert length
-       << ", use_iam=" << std::boolalpha << use_iam << ", use_virtual_host=" << std::boolalpha << use_virtual_host
-       << ", request_timeout_ms=" << request_timeout_ms << ", max_connections=" << max_connections;
-    if (!alias.empty()) {
-      ss << ", alias=" << alias;
-    }
-    ss << "]";
-
-    return ss.str();
-  }
+  [[nodiscard]] std::string ToString() const;
 };
 
 arrow::Result<ArrowFileSystemPtr> CreateArrowFileSystem(const ArrowFileSystemConfig& config);
+
+bool IsSubTreeFileSystem(const ArrowFileSystemPtr& fsptr);
+bool IsLocalFileSystem(const ArrowFileSystemPtr& fsptr);
+ArrowFileSystemPtr SubTreeFileSystemGetBase(const ArrowFileSystemPtr& fsptr);
+
 
 class FileSystemProducer {
   public:
@@ -208,9 +197,6 @@ class FilesystemCache {
 
 // ArrowFileSystemSingleton used on milvus which won't change filesystem config
 class ArrowFileSystemSingleton {
-  private:
-  ArrowFileSystemSingleton(){};
-
   public:
   ArrowFileSystemSingleton(const ArrowFileSystemSingleton&) = delete;
   ArrowFileSystemSingleton& operator=(const ArrowFileSystemSingleton&) = delete;
@@ -222,49 +208,17 @@ class ArrowFileSystemSingleton {
 
   void Init(const ArrowFileSystemConfig& config);
 
-  void Release() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (afs_ != nullptr) {
-      afs_.reset();
-      afs_ = nullptr;
-    }
-  }
+  void Release();
 
-  ArrowFileSystemPtr GetArrowFileSystem() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return afs_;
-  }
+  ArrowFileSystemPtr GetArrowFileSystem();
+
+  private:
+  ArrowFileSystemSingleton() = default;
 
   private:
   ArrowFileSystemPtr afs_ = nullptr;
   std::mutex mutex_;
 };
 
-enum class StorageType {
-  None = 0,
-  Local = 1,
-  Minio = 2,
-  Remote = 3,
-};
-
-enum class CloudProviderType : int8_t {
-  UNKNOWN = 0,
-  AWS = 1,
-  GCP = 2,
-  ALIYUN = 3,
-  AZURE = 4,
-  TENCENTCLOUD = 5,
-  HUAWEICLOUD = 7,
-};
-
-static std::map<std::string, StorageType> StorageType_Map = {{"local", StorageType::Local},
-                                                             {"remote", StorageType::Remote}};
-
-static std::map<std::string, CloudProviderType> CloudProviderType_Map = {{"aws", CloudProviderType::AWS},
-                                                                         {"gcp", CloudProviderType::GCP},
-                                                                         {"aliyun", CloudProviderType::ALIYUN},
-                                                                         {"azure", CloudProviderType::AZURE},
-                                                                         {"tencent", CloudProviderType::TENCENTCLOUD},
-                                                                         {"huawei", CloudProviderType::HUAWEICLOUD}};
 
 }  // namespace milvus_storage

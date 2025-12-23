@@ -56,10 +56,9 @@ arrow::Result<std::unique_ptr<ColumnGroupWriter>> ColumnGroupWriter::create(
   // If current file system is local, create the parent directory if not exist
   // If current file system is remote, putobject will auto
   // create the parent directory if not exist
-  bool is_local_fs =
-      file_system->type_name() == "local" ||
-      (file_system->type_name() == "subtree" &&
-       std::dynamic_pointer_cast<arrow::fs::SubTreeFileSystem>(file_system)->base_fs()->type_name() == "local");
+  bool is_local_fs = IsLocalFileSystem(file_system)
+    || (IsSubTreeFileSystem(file_system) && IsLocalFileSystem(SubTreeFileSystemGetBase(file_system)));
+
   // create parent dir if not exist only for local file system
   if (is_local_fs) {
     boost::filesystem::path dir_path(path);
