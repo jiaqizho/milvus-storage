@@ -4,16 +4,20 @@ on:
   push:
    paths:
     - 'cpp/**'
-    - '!go/**'
+    - '.github/workflows/cpp-ci.yml'
   pull_request:
    paths:
     - 'cpp/**'
-    - '!go/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  unittest:
+  build:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Install dependencies
         uses: aminya/setup-cpp@v1
@@ -21,35 +25,163 @@ jobs:
           conan: 1.61.0
           cmake: true
 
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "cpp/src/format/bridge/rust -> target"
+
+      - name: sccache
+        uses: mozilla-actions/sccache-action@v0.0.3
+
       - name: setup conan
         run: 
           conan remote add default-conan-local https://milvus01.jfrog.io/artifactory/api/conan/default-conan-local --insert
           && conan remote list
       
       - name: conan package cache
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: ~/.conan
-          key: conan-${{ hashFiles('./cpp/conanfile.py') }}
-          restore-keys: conan-
+          key: conan-cpp-${{ hashFiles('./cpp/conanfile.py') }}
+          restore-keys: conan-cpp-
 
       - name: Build
         working-directory: ./cpp
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
         run: |
-          make build USE_ASAN=True WITH_VORTEX=True BUILD_TYPE=Release
-     
-      - name: check-format
+          make build USE_ASAN=True BUILD_TYPE=Release WITH_VORTEX=True
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: gtest-binary
+          path: |
+            cpp/build/Release/test/milvus_test
+            cpp/build/Release/test/Test_FFI
+            cpp/build/Release/libs/
+            cpp/build/Release/libmilvus-storage.so*
+
+  lint:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        uses: aminya/setup-cpp@v1
+        with:
+          conan: 1.61.0
+          cmake: true
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "cpp/src/format/bridge/rust -> target"
+
+      - name: sccache
+        uses: mozilla-actions/sccache-action@v0.0.3
+
+      - name: setup conan
+        run:
+          conan remote add default-conan-local https://milvus01.jfrog.io/artifactory/api/conan/default-conan-local --insert
+          && conan remote list
+
+      - name: conan package cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan
+          key: conan-cpp-${{ hashFiles('./cpp/conanfile.py') }}
+          restore-keys: conan-cpp-
+
+      - name: Build
         working-directory: ./cpp
-        run: 
-          make check-format
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
+        run: |
+          make build BUILD_TYPE=Release
 
       - name: check-tidy
         working-directory: ./cpp
-        run:
+        run: |
           make check-tidy
 
-      - name : Test
+  unittest:
+    runs-on: ubuntu-22.04
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: gtest-binary
+          path: ./cpp/build/Release
+
+      - name: Change mod of binary
         working-directory: ./cpp
         run: |
-          cd build/Release/test && ./milvus_test && ./Test_FFI
+          chmod +x ./build/Release/test/milvus_test
+          chmod +x ./build/Release/test/Test_FFI
 
+      - name: Install and run minio
+        run: |
+          docker run -d -p 9000:9000 -p 9001:9001 --name minio \
+            -e "MINIO_ACCESS_KEY=minioadmin" \
+            -e "MINIO_SECRET_KEY=minioadmin" \
+            quay.io/minio/minio server /data --console-address ":9001"
+          
+          # Wait for minio to be ready
+          sudo apt-get update && sudo apt-get install -y s3cmd
+          
+          # Configure s3cmd for minio
+          cat <<EOF > ~/.s3cfg
+          [default]
+          access_key = minioadmin
+          secret_key = minioadmin
+          host_base = localhost:9000
+          host_bucket = localhost:9000
+          use_https = False
+          EOF
+
+          # Create bucket for test
+          max_retries=10
+          count=0
+          while [ $count -lt $max_retries ]; do
+            if s3cmd mb s3://test-bucket; then
+              echo "Bucket created successfully"
+              break
+            fi
+            echo "Waiting for Minio..."
+            sleep 2
+            count=$((count + 1))
+          done
+
+      - name: Run unittest with local filesystem
+        working-directory: ./cpp
+        run: |
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$(pwd)/build/Release:$(pwd)/build/Release/libs
+          ./build/Release/test/milvus_test
+          ./build/Release/test/Test_FFI
+
+      - name: Run unittest with minio
+        working-directory: ./cpp
+        run: |
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$(pwd)/build/Release:$(pwd)/build/Release/libs
+          export STORAGE_TYPE="remote"
+          export CLOUD_PROVIDER="aws"
+          export ADDRESS="http://localhost:9000"
+          export BUCKET_NAME="test-bucket"
+          export ACCESS_KEY="minioadmin"
+          export SECRET_KEY="minioadmin"
+          export REGION=""
+          ./build/Release/test/milvus_test
+          ./build/Release/test/Test_FFI
+          
