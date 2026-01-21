@@ -1960,6 +1960,7 @@ bool S3FileSystem::Equals(const FileSystem& other) const {
 }
 
 arrow::Result<std::string> S3FileSystem::PathFromUri(const std::string& uri_string) const {
+  // 1
   return arrow::fs::internal::PathFromUriHelper(uri_string, {"multiPartUploadS3"}, /*accept_local_paths=*/false,
                                                 arrow::fs::internal::AuthorityHandlingBehavior::kPrepend);
 }

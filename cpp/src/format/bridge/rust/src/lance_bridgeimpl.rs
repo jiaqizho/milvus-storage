@@ -334,7 +334,8 @@ impl BlockingDataset {
 }
 
 pub fn open_dataset(uri: &str) -> Result<Box<BlockingDataset>> {
-    let ds = BlockingDataset::open(uri, None, None, 0, 0, HashMap::new(), None, None, None)?;
+    let ds = BlockingDataset::open(
+        uri, None, None, 0, 0, HashMap::new(), None, None, None)?;
     Ok(Box::new(ds))
 }
 
