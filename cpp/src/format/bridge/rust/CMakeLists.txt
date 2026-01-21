@@ -8,6 +8,9 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(Corrosion)
 
+# set(CARGO_TARGET_DIR "${CMAKE_CURRENT_SOURCE_DIR}/target" CACHE PATH "Cargo target directory")
+# set(ENV{CARGO_TARGET_DIR} "${CMAKE_CURRENT_SOURCE_DIR}/target")
+# set(CORROSION_CARGO_TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR}/target)
 
 corrosion_import_crate(
     MANIFEST_PATH ${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml
