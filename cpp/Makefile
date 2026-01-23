@@ -69,7 +69,7 @@ package: build
 python-lib:
 	@echo "Building library for Python bindings with hidden symbols..."
 	mkdir -p build && cd build && \
-	conan install .. --build=missing ${libcxx_setting} -s build_type=Release --update \
+	conan install .. --build=missing ${libcxx_setting} -s build_type=${build_type} --update \
 	-o with_ut=False -o with_benchmark=False -o with_asan=False -o with_jni=False -o with_jemalloc=False -o with_python_binding=True -o with_azure=False -o with_vortex=True -o with_lance=True && \
 	conan build .. 
 
