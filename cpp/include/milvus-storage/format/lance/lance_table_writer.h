@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifdef BUILD_LANCE_BRIDGE
 #ifdef BUILD_GTEST
 
 #pragma once
@@ -58,4 +57,3 @@ class LanceTableWriter final : public FormatWriter {
 }  // namespace milvus_storage::lance
 
 #endif  // BUILD_GTEST
-#endif  // BUILD_LANCE_BRIDGE
