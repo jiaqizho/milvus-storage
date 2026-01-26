@@ -1,4 +1,4 @@
-.PHONY: build clean test format python-lib
+.PHONY: build clean test format python-lib python-lib-fiu
 
 TEST_THREADS ?= 4
 ifneq ($(TIDY_THREADS),)
@@ -7,6 +7,7 @@ endif
 
 use_asan ?= True
 with_ut ?= True
+with_fiu ?= True
 with_benchmark ?= True
 build_type ?= Release
 use_jni ?= False
@@ -38,6 +39,9 @@ endif
 ifdef WITH_LANCE
 with_lance = $(WITH_LANCE)
 endif
+ifdef WITH_FIU
+with_fiu = $(WITH_FIU)
+endif
 
 libcxx_setting =
 uname_s := $(shell uname -s)
@@ -47,6 +51,7 @@ endif
 
 build: fix-format
 	# Example building debug mode: BUILD_TYPE=Debug WITH_UT=False make
+	# Example building with fault injection: WITH_FIU=True make
 	@echo "with_ut: ${with_ut}"
 	@echo "with_benchmark: ${with_benchmark}"
 	@echo "use_asan: ${use_asan}"
@@ -55,12 +60,13 @@ build: fix-format
 	@echo "use_python_binding: ${use_python_binding}"
 	@echo "with_vortex: ${with_vortex}"
 	@echo "with_lance: ${with_lance}"
+	@echo "with_fiu: ${with_fiu}"
 
 	mkdir -p build && cd build && \
 	conan install .. --build=missing ${libcxx_setting} -s build_type=${build_type} --update \
 	-o with_ut=${with_ut} -o with_benchmark=${with_benchmark} -o with_asan=${use_asan} \
 	-o with_jni=${use_jni} -o with_python_binding=${use_python_binding} \
-	-o with_vortex=${with_vortex} -o with_lance=${with_lance} && conan build ..
+	-o with_vortex=${with_vortex} -o with_lance=${with_lance} -o with_fiu=${with_fiu} && conan build ..
 
 package: build
 	mkdir -p build && cd build && \
@@ -68,10 +74,18 @@ package: build
 
 python-lib:
 	@echo "Building library for Python bindings with hidden symbols..."
+	@echo "with_fiu: ${with_fiu}"
 	mkdir -p build && cd build && \
 	conan install .. --build=missing ${libcxx_setting} -s build_type=${build_type} --update \
-	-o with_ut=False -o with_benchmark=False -o with_asan=False -o with_jni=False -o with_jemalloc=False -o with_python_binding=True -o with_azure=False -o with_vortex=True -o with_lance=True && \
-	conan build .. 
+	-o with_ut=False -o with_benchmark=False -o with_asan=False -o with_jni=False -o with_jemalloc=False -o with_python_binding=True -o with_azure=False -o with_vortex=True -o with_lance=True -o with_fiu=${with_fiu} && \
+	conan build ..
+
+python-lib-fiu:
+	@echo "Building library for Python bindings with fault injection enabled..."
+	mkdir -p build && cd build && \
+	conan install .. --build=missing ${libcxx_setting} -s build_type=${build_type} --update \
+	-o with_ut=False -o with_benchmark=False -o with_asan=False -o with_jni=False -o with_jemalloc=False -o with_python_binding=True -o with_azure=False -o with_vortex=True -o with_lance=True -o with_fiu=True && \
+	conan build ..
 
 java-lib:
 	@echo "Building library for Java/Scala dependencies..."

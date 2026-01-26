@@ -14,6 +14,7 @@ option(WITH_VORTEX "Build with vortex." OFF)
 option(WITH_LANCE "Build with lance." OFF)
 option(WITH_JNI "Build with JNI library." OFF)
 option(WITH_PYTHON_BINDING "Build for Python bindings with hidden symbols." OFF)
+option(WITH_FIU "Build with fault injection support (libfiu)." OFF)
 
 # Disable Azure FS on macOS since the Arrow library is built without Azure support
 if(APPLE)
@@ -38,6 +39,33 @@ include_directories(${Arrow_INCLUDE_DIRS})
 find_package(Protobuf REQUIRED)
 find_package(google-cloud-cpp REQUIRED)
 find_package(libavrocpp REQUIRED)
+
+# Fault injection support using libfiu
+if (WITH_FIU)
+  # no conan package for libfiu
+  include(FetchContent)
+  FetchContent_Declare(
+    libfiu
+    GIT_REPOSITORY https://github.com/albertito/libfiu.git
+    GIT_TAG        1.1
+  )
+  FetchContent_GetProperties(libfiu)
+  if(NOT libfiu_POPULATED)
+    FetchContent_Populate(libfiu)
+    # Build libfiu as a static library
+    set(FIU_SOURCE_DIR ${libfiu_SOURCE_DIR}/libfiu)
+    file(GLOB FIU_SOURCES ${FIU_SOURCE_DIR}/*.c)
+    add_library(fiu STATIC ${FIU_SOURCES})
+    target_include_directories(fiu PUBLIC ${FIU_SOURCE_DIR})
+    target_compile_definitions(fiu
+      PRIVATE DUMMY_BACKTRACE
+      PUBLIC FIU_ENABLE=1
+    )
+  endif()
+  add_definitions(-DBUILD_WITH_FIU)
+  list(APPEND LINK_LIBS fiu)
+  message(STATUS "Fault injection enabled with libfiu")
+endif()
 
 set(BUILD_RUST_BRIDGE OFF)
 if(WITH_VORTEX OR WITH_LANCE)
