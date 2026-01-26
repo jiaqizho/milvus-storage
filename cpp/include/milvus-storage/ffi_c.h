@@ -226,6 +226,14 @@ typedef struct LoonManifest {
 FFI_EXPORT void loon_manifest_destroy(LoonManifest* manifest);
 
 /**
+ * @brief Get a debug string representation of the manifest
+ *
+ * @param manifest LoonManifest to format
+ * @return Allocated string containing debug info (caller must call loon_free_cstr to free)
+ */
+FFI_EXPORT char* loon_manifest_debug_string(const LoonManifest* manifest);
+
+/**
  * @brief Generate column groups from external files
  *
  * @param columns Array of column names
@@ -238,6 +246,9 @@ FFI_EXPORT void loon_manifest_destroy(LoonManifest* manifest);
  * @param out_column_groups Output parameter for generated LoonColumnGroups (function allocates and returns pointer)
  *                          Caller must call `loon_column_groups_destroy` to free allocated memory
  * @return 0 on success, others is error code
+ *
+ * Notice that: The current method may no longer be used.
+ * Please construct LoonColumnGroups directly using the C Struct.
  */
 FFI_EXPORT LoonFFIResult loon_column_groups_create(const char** columns,
                                                    size_t col_lens,
@@ -254,6 +265,14 @@ FFI_EXPORT LoonFFIResult loon_column_groups_create(const char** columns,
  * @param cgroups LoonColumnGroups to destroy (can be null)
  */
 FFI_EXPORT void loon_column_groups_destroy(LoonColumnGroups* cgroups);
+
+/**
+ * @brief Get a debug string representation of the column groups
+ *
+ * @param cgroups LoonColumnGroups to format
+ * @return Allocated string containing debug info (caller must call loon_free_cstr to free)
+ */
+FFI_EXPORT char* loon_column_groups_debug_string(const LoonColumnGroups* cgroups);
 
 // ==================== End of ColumnGroups C Interface ====================
 

@@ -108,8 +108,7 @@ class Properties:
 
     def __del__(self):
         """Clean up C resources."""
-        if hasattr(self, "_props") and hasattr(self, "_lib"):
-            self._lib.loon_properties_free(self._props)
+        self._lib.loon_properties_free(self._props)
 
     def __repr__(self) -> str:
         """String representation."""
