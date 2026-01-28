@@ -32,7 +32,7 @@ use vortex::io::runtime::BlockingRuntime;
 use vortex::error::{VortexError};
 
 use crate::filesystem_c::*;
-use crate::RUNTIME;
+use crate::VORTEX_RT;
 use crate::vortex_ffi as ffi;
 
 /*
@@ -401,7 +401,7 @@ pub(crate) unsafe fn open_file(
     fswrapper_ptr: *mut u8,
     path: &str) -> Result<Box<VortexFile>> {
 
-    let file = RUNTIME.block_on(|h| async move {
+    let file = VORTEX_RT.block_on(|h| async move {
         let read_source = ObjectStoreReadSourceCpp::new(fswrapper_ptr as *mut c_void, path)
             .map_err(VortexError::from)?;
         VortexOpenOptions::new()
@@ -479,7 +479,7 @@ pub(crate) unsafe fn scan_builder_into_stream(
             Arc::new(arrow_schema)
         }
     };
-    let reader = builder.inner.into_record_batch_reader(schema, &*RUNTIME)?;
+    let reader = builder.inner.into_record_batch_reader(schema, &*VORTEX_RT)?;
     let stream = FFI_ArrowArrayStream::new(Box::new(reader));
     let out_stream = out_stream as *mut FFI_ArrowArrayStream;
     // # Safety
@@ -520,7 +520,7 @@ pub(crate) fn scan_builder_into_threadsafe_cloneable_reader(
 
     let stream = builder
         .inner
-        .with_handle(RUNTIME.handle())
+        .with_handle(VORTEX_RT.handle())
         .map(move |b| {
             b.into_arrow(&data_type)
                 .map(|struct_array| RecordBatch::from(struct_array.as_struct()))
@@ -528,7 +528,7 @@ pub(crate) fn scan_builder_into_threadsafe_cloneable_reader(
         .into_stream()?
         .map_err(|e| ArrowError::ExternalError(Box::new(e)));
 
-    let iter = RUNTIME.block_on_stream_thread_safe(|_h| stream);
+    let iter = VORTEX_RT.block_on_stream_thread_safe(|_h| stream);
     let rbr = RecordBatchIteratorAdapter::new(iter, schema);
 
     Ok(Box::new(ThreadsafeCloneableReader {
