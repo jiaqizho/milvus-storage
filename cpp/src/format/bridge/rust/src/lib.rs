@@ -54,9 +54,16 @@ pub mod lance_ffi {
         Stable = 1,
     }
 
+    /// IO statistics returned by io_stats_incremental (read-and-reset)
+    struct LanceIOStats {
+        read_iops: u64,
+        read_bytes: u64,
+    }
+
     extern "Rust" {
 
         type BlockingDataset;
+        pub fn io_stats_incremental(self: &BlockingDataset) -> LanceIOStats;
         pub fn open_dataset(
             uri: &str,
             storage_options_keys: Vec<String>,

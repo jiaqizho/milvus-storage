@@ -41,6 +41,7 @@
 
 #include "milvus-storage/properties.h"
 #include "milvus-storage/filesystem/fs.h"
+#include "milvus-storage/filesystem/observable.h"
 #include "milvus-storage/common/config.h"
 #include "milvus-storage/common/macro.h"
 #include "milvus-storage/common/arrow_util.h"
@@ -162,13 +163,6 @@ struct MemoryConfig {
   static MemoryConfig Low() { return {"Low", 16ULL * 1024 * 1024, 1024}; }
   static MemoryConfig Default() { return {"Default", 128ULL * 1024 * 1024, 16384}; }
   static MemoryConfig High() { return {"High", 256ULL * 1024 * 1024, 32768}; }
-
-  static std::vector<MemoryConfig> All() { return {Low(), Default(), High()}; }
-
-  static MemoryConfig FromIndex(size_t idx) {
-    auto all = All();
-    return idx < all.size() ? all[idx] : Default();
-  }
 };
 
 //=============================================================================
@@ -509,10 +503,11 @@ class FormatBenchFixtureBase : public ::benchmark::Fixture {
     return CreateTestData(schema, start_offset, random_data, config.num_rows, config.vector_dim, config.string_length);
   }
 
-  // Create policy for specific format
+  // Create policy based on format:
+  // Both use SchemaBase policy (multiple column groups)
   arrow::Result<std::unique_ptr<api::ColumnGroupPolicy>> CreatePolicyForFormat(
-      const std::string& format, const std::shared_ptr<arrow::Schema>& schema) {
-    return CreateSinglePolicy(format, schema);
+      const std::string& patterns, const std::string& format, const std::shared_ptr<arrow::Schema>& schema) {
+    return CreateSchemaBasePolicy(patterns, format, schema);
   }
 
   // Get unique path for this benchmark iteration
@@ -559,6 +554,52 @@ class FormatBenchFixtureBase : public ::benchmark::Fixture {
       }
     }
     return size;
+  }
+
+  //-----------------------------------------------------------------------
+  // Filesystem Metrics Helpers
+  //-----------------------------------------------------------------------
+
+  // Get filesystem metrics (returns nullptr for local filesystem)
+  std::shared_ptr<FilesystemMetrics> GetFsMetrics() const {
+    auto proxy = std::dynamic_pointer_cast<FileSystemProxy>(fs_);
+    if (proxy) {
+      return proxy->GetMetrics();
+    }
+    return nullptr;
+  }
+
+  // Reset filesystem metrics before benchmark iteration
+  void ResetFsMetrics() {
+    auto metrics = GetFsMetrics();
+    if (metrics) {
+      metrics->Reset();
+    }
+  }
+
+  // Report IO metrics to benchmark state (raw values)
+  void ReportIOMetrics(::benchmark::State& st,
+                       int64_t read_count,
+                       int64_t read_bytes,
+                       int64_t write_count = 0,
+                       int64_t write_bytes = 0) {
+    st.counters["s3_read_count"] =
+        ::benchmark::Counter(static_cast<double>(read_count), ::benchmark::Counter::kAvgIterations);
+    st.counters["s3_read_bytes(MB)"] =
+        ::benchmark::Counter(static_cast<double>(read_bytes) / (1024 * 1024), ::benchmark::Counter::kAvgIterations);
+    st.counters["s3_write_count"] =
+        ::benchmark::Counter(static_cast<double>(write_count), ::benchmark::Counter::kAvgIterations);
+    st.counters["s3_write_bytes(MB)"] =
+        ::benchmark::Counter(static_cast<double>(write_bytes) / (1024 * 1024), ::benchmark::Counter::kAvgIterations);
+  }
+
+  // Report filesystem metrics from observable FS to benchmark state
+  void ReportFsMetrics(::benchmark::State& st) {
+    auto metrics = GetFsMetrics();
+    if (metrics) {
+      ReportIOMetrics(st, metrics->GetReadCount(), metrics->GetReadBytes(), metrics->GetWriteCount(),
+                      metrics->GetWriteBytes());
+    }
   }
 
   protected:

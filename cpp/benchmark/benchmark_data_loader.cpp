@@ -101,7 +101,8 @@ std::shared_ptr<std::vector<std::string>> SyntheticDataLoader::GetVectorProjecti
 }
 
 std::string SyntheticDataLoader::GetDescription() const {
-  return "synthetic/" + std::to_string(config_.num_rows) + "rows/" + std::to_string(config_.vector_dim) + "dim";
+  return "synthetic/" + std::to_string(config_.num_rows) + "rows/" + std::to_string(config_.vector_dim) + "dim/" +
+         (config_.random_data ? "random" : "deterministic");
 }
 
 //=============================================================================
@@ -293,7 +294,13 @@ std::unique_ptr<BenchmarkDataLoader> CreateDataLoaderFromEnv(const SyntheticData
   if (segment_path && segment_path[0] != '\0') {
     return std::make_unique<MilvusSegmentLoader>(segment_path);
   }
-  return std::make_unique<SyntheticDataLoader>(fallback_config);
+  // BENCH_USE_RANDOM_DATA=0 uses deterministic synthetic data (default: random)
+  auto config = fallback_config;
+  const char* use_random = std::getenv("BENCH_USE_RANDOM_DATA");
+  if (use_random && std::string(use_random) == "0") {
+    config.random_data = false;
+  }
+  return std::make_unique<SyntheticDataLoader>(config);
 }
 
 }  // namespace benchmark

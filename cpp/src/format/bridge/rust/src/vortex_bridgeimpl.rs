@@ -441,9 +441,9 @@ pub(crate) struct VortexWriter {
     pub enable_stats: bool,
 }
 
-pub(crate) unsafe fn open_writer(fswrapper_ptr: *mut u8, path: &str, enable_stats: bool) 
+pub(crate) unsafe fn open_writer(fswrapper_ptr: *mut u8, path: &str, enable_stats: bool)
     -> Result<Box<VortexWriter>, Box<dyn std::error::Error>> {
-    Ok(Box::new(VortexWriter { 
+    Ok(Box::new(VortexWriter {
         fswrapper_ptr: fswrapper_ptr,
         path: path.to_string(),
         inner_writer : None,
@@ -482,7 +482,6 @@ pub(crate) unsafe fn write(&mut self, in_schema: *mut u8, in_array: *mut u8) -> 
         } else {
             VORTEX_NON_STATS.to_vec()
         };
-
         let blocking_writer = vortex::file::VortexWriteOptions::new(VORTEX_SESSION.clone())
             .with_file_statistics(stats_options)
             .blocking(&*VORTEX_RT)
@@ -501,7 +500,7 @@ pub(crate) unsafe fn write(&mut self, in_schema: *mut u8, in_array: *mut u8) -> 
 
 pub(crate) unsafe fn close(&mut self) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(w) = self.inner_writer.take() {
-        w.finish().map_err(|e| Box::new(VortexError::from(e)))?;
+        w.finish().map_err(|e| Box::new(VortexError::from(e)) as Box<dyn std::error::Error>)?;
     }
     Ok(())
 }

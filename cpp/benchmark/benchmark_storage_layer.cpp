@@ -18,6 +18,7 @@
 
 #include "benchmark_format_common.h"
 
+#include <filesystem>
 #include <arrow/table.h>
 #include <arrow/record_batch.h>
 
@@ -80,29 +81,15 @@ class StorageLayerFixture : public FormatBenchFixtureBase<> {
     // Get schema from data loader
     schema_ = GetLoaderSchema();
 
-    // Pre-load all batches for write benchmarks (measure pure write performance)
-    auto reader_result = GetLoaderBatchReader();
-    if (!reader_result.ok()) {
-      st.SkipWithError(("Failed to get batch reader: " + reader_result.status().ToString()).c_str());
-      return;
-    }
-    auto batch_reader = *reader_result;
-
-    std::shared_ptr<arrow::RecordBatch> batch;
-    while (true) {
-      auto status = batch_reader->ReadNext(&batch);
-      if (!status.ok()) {
-        st.SkipWithError(("Failed to read batch: " + status.ToString()).c_str());
-        return;
-      }
-      if (!batch)
-        break;
-      batches_.push_back(batch);
-      total_bytes_ += CalculateRawDataSize(batch);
-      total_rows_ += batch->num_rows();
+    // Read optional Vortex row_block_size from env and set in properties
+    vortex_row_block_size_ = 0;
+    if (auto* env = std::getenv("BENCH_VORTEX_ROW_BLOCK_SIZE")) {
+      vortex_row_block_size_ = static_cast<uint64_t>(std::atoll(env));
+      api::SetValue(properties_, PROPERTY_WRITER_VORTEX_ROW_BLOCK_SIZE, env);
     }
 
-    // Thread pool will be configured per-benchmark
+    // Batches are loaded lazily via EnsureBatchesLoaded() — only needed by write benchmarks
+    // and cache-miss paths. This avoids re-reading source data for every read benchmark.
   }
 
   void TearDown(::benchmark::State& st) override {
@@ -118,14 +105,35 @@ class StorageLayerFixture : public FormatBenchFixtureBase<> {
 
   protected:
   //-----------------------------------------------------------------------
+  // Lazy batch loading: only load source data when actually needed for writing
+  //-----------------------------------------------------------------------
+  arrow::Status EnsureBatchesLoaded() {
+    if (!batches_.empty()) {
+      return arrow::Status::OK();
+    }
+    ARROW_ASSIGN_OR_RAISE(auto batch_reader, GetLoaderBatchReader());
+    std::shared_ptr<arrow::RecordBatch> batch;
+    while (true) {
+      ARROW_RETURN_NOT_OK(batch_reader->ReadNext(&batch));
+      if (!batch)
+        break;
+      batches_.push_back(batch);
+      total_bytes_ += CalculateRawDataSize(batch);
+      total_rows_ += batch->num_rows();
+    }
+    return arrow::Status::OK();
+  }
+
+  //-----------------------------------------------------------------------
   // MilvusStorage: Write + Transaction Commit (using pre-loaded batches)
   //-----------------------------------------------------------------------
   arrow::Status WriteMilvusStorage(StorageFormatType format_type, const std::string& path) {
+    ARROW_RETURN_NOT_OK(EnsureBatchesLoaded());
     std::string format = (format_type == StorageFormatType::PARQUET) ? LOON_FORMAT_PARQUET : LOON_FORMAT_VORTEX;
 
-    // Use schema-based policy
+    // Use format-specific policy: Vortex=Single, Parquet=SchemaBase
     std::string patterns = GetSchemaBasePatterns();
-    ARROW_ASSIGN_OR_RAISE(auto policy, CreateSchemaBasePolicy(patterns, format, schema_));
+    ARROW_ASSIGN_OR_RAISE(auto policy, CreatePolicyForFormat(patterns, format, schema_));
 
     auto writer = Writer::create(path, schema_, std::move(policy), properties_);
     if (!writer)
@@ -140,30 +148,6 @@ class StorageLayerFixture : public FormatBenchFixtureBase<> {
     ARROW_ASSIGN_OR_RAISE(auto txn, Transaction::Open(fs_, path));
     txn->AppendFiles(*cgs);
     ARROW_ASSIGN_OR_RAISE(auto version, txn->Commit());
-
-    return arrow::Status::OK();
-  }
-
-  //-----------------------------------------------------------------------
-  // MilvusStorage: Write Only (No Transaction, using pre-loaded batches)
-  //-----------------------------------------------------------------------
-  arrow::Status WriteMilvusStorageNoTxn(StorageFormatType format_type, const std::string& path) {
-    std::string format = (format_type == StorageFormatType::PARQUET) ? LOON_FORMAT_PARQUET : LOON_FORMAT_VORTEX;
-
-    // Use schema-based policy
-    std::string patterns = GetSchemaBasePatterns();
-    ARROW_ASSIGN_OR_RAISE(auto policy, CreateSchemaBasePolicy(patterns, format, schema_));
-
-    auto writer = Writer::create(path, schema_, std::move(policy), properties_);
-    if (!writer)
-      return arrow::Status::Invalid("Failed to create writer");
-
-    // Write all pre-loaded batches
-    for (const auto& batch : batches_) {
-      ARROW_RETURN_NOT_OK(writer->write(batch));
-    }
-    ARROW_ASSIGN_OR_RAISE(auto cgs, writer->close());
-    // No transaction commit
 
     return arrow::Status::OK();
   }
@@ -234,13 +218,10 @@ class StorageLayerFixture : public FormatBenchFixtureBase<> {
 
     ARROW_ASSIGN_OR_RAISE(auto table, reader->take(indices));
     out_rows += table->num_rows();
-    for (int i = 0; i < table->num_columns(); ++i) {
-      for (const auto& chunk : table->column(i)->chunks()) {
-        for (const auto& buffer : chunk->data()->buffers) {
-          if (buffer)
-            out_bytes += buffer->size();
-        }
-      }
+    for (const auto& batch : arrow::TableBatchReader(*table)) {
+      if (!batch.ok())
+        return batch.status();
+      out_bytes += CalculateRawDataSize(*batch);
     }
     return arrow::Status::OK();
   }
@@ -263,6 +244,32 @@ class StorageLayerFixture : public FormatBenchFixtureBase<> {
   }
 
   //-----------------------------------------------------------------------
+  // MilvusStorage: Take with pre-cached ColumnGroups (no transaction in hot path)
+  //-----------------------------------------------------------------------
+  arrow::Result<std::shared_ptr<ColumnGroups>> LoadColumnGroups(const std::string& path) {
+    ARROW_ASSIGN_OR_RAISE(auto txn, Transaction::Open(fs_, path));
+    ARROW_ASSIGN_OR_RAISE(auto manifest, txn->GetManifest());
+    return std::make_shared<ColumnGroups>(manifest->columnGroups());
+  }
+
+  //-----------------------------------------------------------------------
+  // Verify Take results: check row count and schema match expectations
+  //-----------------------------------------------------------------------
+  arrow::Status VerifyTakeResult(const std::string& label,
+                                 int64_t actual_rows,
+                                 int64_t expected_rows,
+                                 int64_t actual_bytes) {
+    if (actual_rows != expected_rows) {
+      return arrow::Status::Invalid(label, " take verification failed: expected ", expected_rows, " rows but got ",
+                                    actual_rows);
+    }
+    if (actual_bytes <= 0) {
+      return arrow::Status::Invalid(label, " take verification failed: got ", actual_bytes, " bytes (expected > 0)");
+    }
+    return arrow::Status::OK();
+  }
+
+  //-----------------------------------------------------------------------
   // Format availability check
   //-----------------------------------------------------------------------
   bool CheckStorageFormatAvailable(::benchmark::State& st, StorageFormatType format_type) {
@@ -273,6 +280,51 @@ class StorageLayerFixture : public FormatBenchFixtureBase<> {
       }
     }
     return true;
+  }
+
+  //-----------------------------------------------------------------------
+  // Cached data path: deterministic, survives across runs (outside base_path_)
+  //-----------------------------------------------------------------------
+  std::string GetCachedDataPath(const std::string& format_name) const {
+    namespace fs = std::filesystem;
+    std::string actual_name = format_name;
+    if (format_name.rfind("vortex", 0) == 0 && vortex_row_block_size_ > 0) {
+      actual_name += "_rb" + std::to_string(vortex_row_block_size_);
+    }
+    return (fs::path("bench_cache") / GetDataDescription() / actual_name).lexically_normal().string();
+  }
+
+  // Ensure MilvusStorage data exists at path, write only if missing
+  arrow::Status EnsureMilvusStorageData(StorageFormatType format_type, const std::string& path) {
+    auto txn_result = Transaction::Open(fs_, path);
+    if (txn_result.ok()) {
+      // Validate that manifest has non-empty column groups
+      auto manifest_result = (*txn_result)->GetManifest();
+      if (manifest_result.ok() && !(*manifest_result)->columnGroups().empty()) {
+        return arrow::Status::OK();
+      }
+    }
+    // Data missing or invalid: (re-)create
+    ARROW_RETURN_NOT_OK(DeleteTestDir(fs_, path));
+    ARROW_RETURN_NOT_OK(CreateTestDir(fs_, path));
+    return WriteMilvusStorage(format_type, path);
+  }
+
+  // Ensure Lance dataset exists at URI, write only if missing
+  arrow::Status EnsureLanceData(const std::string& lance_uri,
+                                const lance::LanceStorageOptions& storage_options,
+                                const std::string& path) {
+    try {
+      auto dataset = lance::BlockingDataset::Open(lance_uri, storage_options);
+      if (!dataset->GetAllFragmentIds().empty()) {
+        return arrow::Status::OK();
+      }
+    } catch (...) {
+    }
+    // Data missing or invalid: (re-)create
+    ARROW_RETURN_NOT_OK(DeleteTestDir(fs_, path));
+    ARROW_RETURN_NOT_OK(CreateTestDir(fs_, path));
+    return WriteLanceDataset(lance_uri, storage_options);
   }
 
   //-----------------------------------------------------------------------
@@ -295,6 +347,7 @@ class StorageLayerFixture : public FormatBenchFixtureBase<> {
 
   // Write test data to a lance dataset using pre-loaded batches
   arrow::Status WriteLanceDataset(const std::string& lance_uri, const lance::LanceStorageOptions& storage_options) {
+    ARROW_RETURN_NOT_OK(EnsureBatchesLoaded());
     // Create a RecordBatchReader from pre-loaded batches
     ARROW_ASSIGN_OR_RAISE(auto batch_reader, arrow::RecordBatchReader::Make(batches_, schema_));
 
@@ -309,10 +362,117 @@ class StorageLayerFixture : public FormatBenchFixtureBase<> {
     return arrow::Status::OK();
   }
 
+  //-----------------------------------------------------------------------
+  // Scalar-only data: filter out FixedSizeBinary/LIST vector columns
+  //-----------------------------------------------------------------------
+  arrow::Result<std::pair<std::shared_ptr<arrow::Schema>, std::vector<std::shared_ptr<arrow::RecordBatch>>>>
+  GetScalarOnlyData() {
+    ARROW_RETURN_NOT_OK(EnsureBatchesLoaded());
+    auto scalar_cols = GetScalarProjection();
+
+    std::vector<std::shared_ptr<arrow::Field>> fields;
+    std::vector<int> col_indices;
+    for (const auto& name : *scalar_cols) {
+      auto idx = schema_->GetFieldIndex(name);
+      if (idx >= 0) {
+        fields.push_back(schema_->field(idx));
+        col_indices.push_back(idx);
+      }
+    }
+    auto scalar_schema = arrow::schema(fields);
+
+    std::vector<std::shared_ptr<arrow::RecordBatch>> scalar_batches;
+    for (const auto& batch : batches_) {
+      std::vector<std::shared_ptr<arrow::Array>> arrays;
+      for (int idx : col_indices) {
+        arrays.push_back(batch->column(idx));
+      }
+      scalar_batches.push_back(arrow::RecordBatch::Make(scalar_schema, batch->num_rows(), arrays));
+    }
+    return std::make_pair(scalar_schema, std::move(scalar_batches));
+  }
+
+  arrow::Status WriteMilvusStorageScalarOnly(StorageFormatType format_type, const std::string& path) {
+    ARROW_ASSIGN_OR_RAISE(auto scalar_data, GetScalarOnlyData());
+    auto& scalar_schema = scalar_data.first;
+    auto& scalar_batches = scalar_data.second;
+    std::string format = (format_type == StorageFormatType::PARQUET) ? LOON_FORMAT_PARQUET : LOON_FORMAT_VORTEX;
+
+    // All scalar columns in one group (use regex OR '|' so they match a single pattern = one file)
+    std::string patterns;
+    for (int i = 0; i < scalar_schema->num_fields(); ++i) {
+      if (i > 0)
+        patterns += "|";
+      patterns += scalar_schema->field(i)->name();
+    }
+    ARROW_ASSIGN_OR_RAISE(auto policy, CreatePolicyForFormat(patterns, format, scalar_schema));
+
+    auto writer = Writer::create(path, scalar_schema, std::move(policy), properties_);
+    if (!writer)
+      return arrow::Status::Invalid("Failed to create writer");
+
+    for (const auto& batch : scalar_batches) {
+      ARROW_RETURN_NOT_OK(writer->write(batch));
+    }
+    ARROW_ASSIGN_OR_RAISE(auto cgs, writer->close());
+
+    ARROW_ASSIGN_OR_RAISE(auto txn, Transaction::Open(fs_, path));
+    txn->AppendFiles(*cgs);
+    ARROW_ASSIGN_OR_RAISE(auto version, txn->Commit());
+    return arrow::Status::OK();
+  }
+
+  arrow::Status EnsureMilvusStorageScalarOnlyData(StorageFormatType format_type, const std::string& path) {
+    auto txn_result = Transaction::Open(fs_, path);
+    if (txn_result.ok()) {
+      auto manifest_result = (*txn_result)->GetManifest();
+      if (manifest_result.ok() && !(*manifest_result)->columnGroups().empty()) {
+        return arrow::Status::OK();
+      }
+    }
+    ARROW_RETURN_NOT_OK(DeleteTestDir(fs_, path));
+    ARROW_RETURN_NOT_OK(CreateTestDir(fs_, path));
+    return WriteMilvusStorageScalarOnly(format_type, path);
+  }
+
+  arrow::Status WriteLanceDatasetScalarOnly(const std::string& lance_uri,
+                                            const lance::LanceStorageOptions& storage_options) {
+    ARROW_ASSIGN_OR_RAISE(auto scalar_data, GetScalarOnlyData());
+    auto& scalar_schema = scalar_data.first;
+    auto& scalar_batches = scalar_data.second;
+    ARROW_ASSIGN_OR_RAISE(auto batch_reader, arrow::RecordBatchReader::Make(scalar_batches, scalar_schema));
+
+    ArrowArrayStream stream;
+    ARROW_RETURN_NOT_OK(arrow::ExportRecordBatchReader(batch_reader, &stream));
+
+    try {
+      auto dataset = lance::BlockingDataset::WriteDataset(lance_uri, &stream, storage_options);
+    } catch (const lance::LanceException& e) {
+      return arrow::Status::IOError("Lance write failed: ", e.what());
+    }
+    return arrow::Status::OK();
+  }
+
+  arrow::Status EnsureLanceScalarOnlyData(const std::string& lance_uri,
+                                          const lance::LanceStorageOptions& storage_options,
+                                          const std::string& path) {
+    try {
+      auto dataset = lance::BlockingDataset::Open(lance_uri, storage_options);
+      if (!dataset->GetAllFragmentIds().empty()) {
+        return arrow::Status::OK();
+      }
+    } catch (...) {
+    }
+    ARROW_RETURN_NOT_OK(DeleteTestDir(fs_, path));
+    ARROW_RETURN_NOT_OK(CreateTestDir(fs_, path));
+    return WriteLanceDatasetScalarOnly(lance_uri, storage_options);
+  }
+
   std::shared_ptr<arrow::Schema> schema_;
   std::vector<std::shared_ptr<arrow::RecordBatch>> batches_;
   int64_t total_bytes_ = 0;
   int64_t total_rows_ = 0;
+  uint64_t vortex_row_block_size_ = 0;
 };
 
 //=============================================================================
@@ -332,6 +492,8 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_WriteCommit)(::benchmark::
   BENCH_ASSERT_STATUS_OK(DeleteTestDir(fs_, path), st);
   BENCH_ASSERT_STATUS_OK(CreateTestDir(fs_, path), st);
 
+  ResetFsMetrics();
+
   for (auto _ : st) {
     BENCH_ASSERT_STATUS_OK(WriteMilvusStorage(format_type, path), st);
   }
@@ -339,45 +501,11 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_WriteCommit)(::benchmark::
   int64_t total_bytes = total_bytes_ * static_cast<int64_t>(st.iterations());
   int64_t total_rows = total_rows_ * static_cast<int64_t>(st.iterations());
   ReportThroughput(st, total_bytes, total_rows);
+  ReportFsMetrics(st);
   st.SetLabel(std::string(StorageFormatTypeName(format_type)) + "/" + GetDataDescription());
 }
 
 BENCHMARK_REGISTER_F(StorageLayerFixture, MilvusStorage_WriteCommit)
-    ->ArgsProduct({
-        {0, 1}  // FormatType: parquet(0), vortex(1)
-    })
-    ->Unit(::benchmark::kMillisecond)
-    ->UseRealTime();
-
-//=============================================================================
-// MilvusStorage Write Only (No Transaction) Benchmark
-//=============================================================================
-
-// Args: [format_type]
-BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_WriteOnly)(::benchmark::State& st) {
-  auto format_type = static_cast<StorageFormatType>(st.range(0));
-
-  if (!CheckStorageFormatAvailable(st, format_type))
-    return;
-
-  ConfigureThreadPool(1);
-
-  std::string path = GetUniquePath("ms_write_only");
-
-  BENCH_ASSERT_STATUS_OK(DeleteTestDir(fs_, path), st);
-  BENCH_ASSERT_STATUS_OK(CreateTestDir(fs_, path), st);
-
-  for (auto _ : st) {
-    BENCH_ASSERT_STATUS_OK(WriteMilvusStorageNoTxn(format_type, path), st);
-  }
-
-  int64_t total_bytes = total_bytes_ * static_cast<int64_t>(st.iterations());
-  int64_t total_rows = total_rows_ * static_cast<int64_t>(st.iterations());
-  ReportThroughput(st, total_bytes, total_rows);
-  st.SetLabel(std::string(StorageFormatTypeName(format_type)) + "/" + GetDataDescription() + "/no-txn");
-}
-
-BENCHMARK_REGISTER_F(StorageLayerFixture, MilvusStorage_WriteOnly)
     ->ArgsProduct({
         {0, 1}  // FormatType: parquet(0), vortex(1)
     })
@@ -398,14 +526,15 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_OpenRead)(::benchmark::Sta
 
   ConfigureThreadPool(num_threads);
 
-  std::string path = GetUniquePath("ms_read");
-  BENCH_ASSERT_STATUS_OK(CreateTestDir(fs_, path), st);
-  BENCH_ASSERT_STATUS_OK(WriteMilvusStorage(format_type, path), st);
+  std::string path = GetCachedDataPath(StorageFormatTypeName(format_type));
+  BENCH_ASSERT_STATUS_OK(EnsureMilvusStorageData(format_type, path), st);
 
   // Collect stats once before benchmark loop
   int64_t rows_per_iter = 0;
   int64_t bytes_per_iter = 0;
   BENCH_ASSERT_STATUS_OK(ReadMilvusStorageWithStats(path, rows_per_iter, bytes_per_iter), st);
+
+  ResetFsMetrics();
 
   for (auto _ : st) {
     BENCH_ASSERT_STATUS_OK(ReadMilvusStorage(path), st);
@@ -415,6 +544,7 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_OpenRead)(::benchmark::Sta
   int64_t total_rows = rows_per_iter * static_cast<int64_t>(st.iterations());
   int64_t total_bytes = bytes_per_iter * static_cast<int64_t>(st.iterations());
   ReportThroughput(st, total_bytes, total_rows);
+  ReportFsMetrics(st);
   st.counters["threads"] = ::benchmark::Counter(static_cast<double>(num_threads), ::benchmark::Counter::kDefaults);
   st.SetLabel(std::string(StorageFormatTypeName(format_type)) + "/" + GetDataDescription() + "/" +
               std::to_string(num_threads) + "T");
@@ -443,16 +573,19 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_Take)(::benchmark::State& 
 
   ConfigureThreadPool(num_threads);
 
-  std::string path = GetUniquePath("ms_take");
-  BENCH_ASSERT_STATUS_OK(CreateTestDir(fs_, path), st);
-  BENCH_ASSERT_STATUS_OK(WriteMilvusStorage(format_type, path), st);
+  std::string path = GetCachedDataPath(StorageFormatTypeName(format_type));
+  BENCH_ASSERT_STATUS_OK(EnsureMilvusStorageData(format_type, path), st);
 
   auto indices = GenerateRandomIndices(take_count, GetLoaderNumRows());
 
-  // Collect stats once before benchmark loop
+  // Collect stats once and verify before benchmark loop
   int64_t rows_per_iter = 0;
   int64_t bytes_per_iter = 0;
   BENCH_ASSERT_STATUS_OK(TakeMilvusStorageWithStats(path, indices, rows_per_iter, bytes_per_iter), st);
+  BENCH_ASSERT_STATUS_OK(
+      VerifyTakeResult("MilvusStorage", rows_per_iter, static_cast<int64_t>(take_count), bytes_per_iter), st);
+
+  ResetFsMetrics();
 
   for (auto _ : st) {
     BENCH_ASSERT_STATUS_OK(TakeMilvusStorage(path, indices), st);
@@ -463,6 +596,7 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_Take)(::benchmark::State& 
   int64_t total_bytes = bytes_per_iter * static_cast<int64_t>(st.iterations());
 
   ReportThroughput(st, total_bytes, total_rows);
+  ReportFsMetrics(st);
   st.counters["rows_taken"] = ::benchmark::Counter(static_cast<double>(take_count), ::benchmark::Counter::kDefaults);
   st.counters["threads"] = ::benchmark::Counter(static_cast<double>(num_threads), ::benchmark::Counter::kDefaults);
   st.SetLabel(std::string(StorageFormatTypeName(format_type)) + "/" + std::to_string(take_count) + "rows/" +
@@ -471,9 +605,89 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_Take)(::benchmark::State& 
 
 BENCHMARK_REGISTER_F(StorageLayerFixture, MilvusStorage_Take)
     ->ArgsProduct({
-        {0, 1},                 // FormatType: parquet(0), vortex(1)
-        {100, 200, 500, 1000},  // Take count
-        {1, 4, 8, 16}           // Threads: 1, 4, 8, 16
+        {0, 1},           // FormatType: parquet(0), vortex(1)
+        {1, 5, 10, 100},  // Take count
+        {1, 4, 8, 16}     // Threads: 1, 4, 8, 16
+    })
+    ->Unit(::benchmark::kMillisecond)
+    ->UseRealTime();
+
+//=============================================================================
+// MilvusStorage Take (No Transaction, Single Column Projection) Benchmark
+// Projects single column by BENCH_PROJ_COL_INDEX env var (default 0)
+//=============================================================================
+
+// Args: [format_type]
+BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_TakeScalarOnly)(::benchmark::State& st) {
+  auto format_type = static_cast<StorageFormatType>(st.range(0));
+  size_t take_count = 1;
+  if (auto* env = std::getenv("BENCH_TAKE_COUNT")) {
+    take_count = static_cast<size_t>(std::atoi(env));
+  }
+  constexpr int num_threads = 1;
+
+  if (!CheckStorageFormatAvailable(st, format_type))
+    return;
+
+  ConfigureThreadPool(num_threads);
+
+  // Write scalar-only data (excludes FixedSizeBinary/LIST vector columns)
+  std::string format_suffix = std::string(StorageFormatTypeName(format_type)) + "_scalar";
+  std::string path = GetCachedDataPath(format_suffix);
+  BENCH_ASSERT_STATUS_OK(EnsureMilvusStorageScalarOnlyData(format_type, path), st);
+
+  // Pre-cache ColumnGroups (transaction happens here, outside benchmark loop)
+  BENCH_ASSERT_AND_ASSIGN(auto cgs, LoadColumnGroups(path), st);
+
+  auto indices = GenerateRandomIndices(take_count, GetLoaderNumRows());
+
+  // Get scalar-only columns (excludes FixedSizeBinary/LIST vector columns)
+  auto scalar_cols = GetScalarProjection();
+  if (scalar_cols->empty()) {
+    st.SkipWithError("No scalar columns available");
+    return;
+  }
+
+  // Get projection column index from env (indexes into scalar columns)
+  int col_index = 0;
+  if (auto* env = std::getenv("BENCH_PROJ_COL_INDEX")) {
+    col_index = std::atoi(env);
+  }
+  if (col_index < 0 || col_index >= static_cast<int>(scalar_cols->size())) {
+    st.SkipWithError(("BENCH_PROJ_COL_INDEX=" + std::to_string(col_index) + " out of range [0," +
+                      std::to_string(scalar_cols->size()) + ")")
+                         .c_str());
+    return;
+  }
+  auto col_name = (*scalar_cols)[col_index];
+  auto proj_field = schema_->GetFieldByName(col_name);
+  auto proj_schema = arrow::schema({proj_field});
+  auto proj_columns = std::make_shared<std::vector<std::string>>(std::vector<std::string>{col_name});
+
+  ResetFsMetrics();
+
+  for (auto _ : st) {
+    auto reader = Reader::create(cgs, proj_schema, proj_columns, properties_);
+    if (!reader) {
+      st.SkipWithError("Failed to create reader");
+      return;
+    }
+    auto table_result = reader->take(indices);
+    if (!table_result.ok()) {
+      st.SkipWithError(table_result.status().ToString().c_str());
+      return;
+    }
+  }
+
+  ReportFsMetrics(st);
+  st.counters["rows_taken"] = ::benchmark::Counter(static_cast<double>(take_count), ::benchmark::Counter::kDefaults);
+  st.SetLabel(std::string(StorageFormatTypeName(format_type)) + "/col=" + col_name + "/" + std::to_string(take_count) +
+              "rows/1T");
+}
+
+BENCHMARK_REGISTER_F(StorageLayerFixture, MilvusStorage_TakeScalarOnly)
+    ->ArgsProduct({
+        {0, 1}  // FormatType: parquet(0), vortex(1)
     })
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
@@ -493,6 +707,8 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_WriteCommit)(::benchmark::St
   BENCH_ASSERT_AND_ASSIGN(auto lance_uri, BuildLanceUri(path), st);
   auto storage_options = GetLanceStorageOptions();
 
+  ResetFsMetrics();
+
   for (auto _ : st) {
     BENCH_ASSERT_STATUS_OK(WriteLanceDataset(lance_uri, storage_options), st);
   }
@@ -500,6 +716,7 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_WriteCommit)(::benchmark::St
   int64_t total_bytes = total_bytes_ * static_cast<int64_t>(st.iterations());
   int64_t total_rows = total_rows_ * static_cast<int64_t>(st.iterations());
   ReportThroughput(st, total_bytes, total_rows);
+  ReportFsMetrics(st);
   st.SetLabel("lance/" + GetDataDescription());
 }
 
@@ -515,19 +732,19 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_OpenRead)(::benchmark::State
 
   lance::ReplaceLanceRuntime(static_cast<uint32_t>(num_threads));
 
-  std::string path = GetUniquePath("lance_read");
-  BENCH_ASSERT_STATUS_OK(CreateTestDir(fs_, path), st);
+  std::string path = GetCachedDataPath("lance");
 
   // Build Lance URI and get storage options for cloud storage support
   BENCH_ASSERT_AND_ASSIGN(auto lance_uri, BuildLanceUri(path), st);
   auto storage_options = GetLanceStorageOptions();
 
-  BENCH_ASSERT_STATUS_OK(WriteLanceDataset(lance_uri, storage_options), st);
+  BENCH_ASSERT_STATUS_OK(EnsureLanceData(lance_uri, storage_options, path), st);
 
-  // Lambda to read lance dataset
+  // Open dataset once and reuse across iterations
+  auto dataset = lance::BlockingDataset::Open(lance_uri, storage_options);
+
+  // Lambda to read lance dataset using pre-opened dataset
   auto read_lance = [&](bool collect_stats, int64_t& out_rows, int64_t& out_bytes) -> arrow::Status {
-    auto dataset = lance::BlockingDataset::Open(lance_uri, storage_options);
-
     ArrowSchema c_schema;
     ARROW_RETURN_NOT_OK(arrow::ExportSchema(*schema_, &c_schema));
 
@@ -554,15 +771,21 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_OpenRead)(::benchmark::State
   int64_t bytes_per_iter = 0;
   BENCH_ASSERT_STATUS_OK(read_lance(true, rows_per_iter, bytes_per_iter), st);
 
+  ResetFsMetrics();
+  dataset->IOStatsIncremental();  // reset Lance IO counters
+
   for (auto _ : st) {
     int64_t dummy_rows = 0, dummy_bytes = 0;
     BENCH_ASSERT_STATUS_OK(read_lance(false, dummy_rows, dummy_bytes), st);
   }
 
+  auto lance_io = dataset->IOStatsIncremental();
+
   // Calculate totals using iteration count
   int64_t total_rows = rows_per_iter * static_cast<int64_t>(st.iterations());
   int64_t total_bytes = bytes_per_iter * static_cast<int64_t>(st.iterations());
   ReportThroughput(st, total_bytes, total_rows);
+  ReportIOMetrics(st, lance_io.read_iops, lance_io.read_bytes);
   st.counters["threads"] = ::benchmark::Counter(static_cast<double>(num_threads), ::benchmark::Counter::kDefaults);
   st.SetLabel("lance/" + GetDataDescription() + "/" + std::to_string(num_threads) + "T");
 }
@@ -585,21 +808,21 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_Take)(::benchmark::State& st
 
   lance::ReplaceLanceRuntime(static_cast<uint32_t>(num_threads));
 
-  std::string path = GetUniquePath("lance_take");
-  BENCH_ASSERT_STATUS_OK(CreateTestDir(fs_, path), st);
+  std::string path = GetCachedDataPath("lance");
 
   // Build Lance URI and get storage options for cloud storage support
   BENCH_ASSERT_AND_ASSIGN(auto lance_uri, BuildLanceUri(path), st);
   auto storage_options = GetLanceStorageOptions();
 
-  BENCH_ASSERT_STATUS_OK(WriteLanceDataset(lance_uri, storage_options), st);
+  BENCH_ASSERT_STATUS_OK(EnsureLanceData(lance_uri, storage_options, path), st);
 
   auto indices = GenerateRandomIndices(take_count, GetLoaderNumRows());
 
-  // Lambda to take from lance dataset
-  auto take_lance = [&](bool collect_stats, int64_t& out_rows, int64_t& out_bytes) -> arrow::Status {
-    auto dataset = lance::BlockingDataset::Open(lance_uri, storage_options);
+  // Open dataset once and reuse across iterations
+  auto dataset = lance::BlockingDataset::Open(lance_uri, storage_options);
 
+  // Lambda to take from pre-opened dataset
+  auto take_lance = [&](bool collect_stats, int64_t& out_rows, int64_t& out_bytes) -> arrow::Status {
     ArrowSchema c_schema;
     ARROW_RETURN_NOT_OK(arrow::ExportSchema(*schema_, &c_schema));
 
@@ -620,20 +843,28 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_Take)(::benchmark::State& st
     return arrow::Status::OK();
   };
 
-  // Collect stats once before benchmark loop
+  // Collect stats once and verify before benchmark loop
   int64_t rows_per_iter = 0;
   int64_t bytes_per_iter = 0;
   BENCH_ASSERT_STATUS_OK(take_lance(true, rows_per_iter, bytes_per_iter), st);
+  BENCH_ASSERT_STATUS_OK(VerifyTakeResult("Lance", rows_per_iter, static_cast<int64_t>(take_count), bytes_per_iter),
+                         st);
+
+  ResetFsMetrics();
+  dataset->IOStatsIncremental();  // reset Lance IO counters
 
   for (auto _ : st) {
     int64_t dummy_rows = 0, dummy_bytes = 0;
     BENCH_ASSERT_STATUS_OK(take_lance(false, dummy_rows, dummy_bytes), st);
   }
 
+  auto lance_io = dataset->IOStatsIncremental();
+
   // Calculate totals using iteration count
   int64_t total_rows = rows_per_iter * static_cast<int64_t>(st.iterations());
   int64_t total_bytes = bytes_per_iter * static_cast<int64_t>(st.iterations());
   ReportThroughput(st, total_bytes, total_rows);
+  ReportIOMetrics(st, lance_io.read_iops, lance_io.read_bytes);
   st.counters["rows_taken"] = ::benchmark::Counter(static_cast<double>(take_count), ::benchmark::Counter::kDefaults);
   st.counters["threads"] = ::benchmark::Counter(static_cast<double>(num_threads), ::benchmark::Counter::kDefaults);
   st.SetLabel("lance/" + std::to_string(take_count) + "rows/" + std::to_string(num_threads) + "T");
@@ -641,11 +872,108 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_Take)(::benchmark::State& st
 
 BENCHMARK_REGISTER_F(StorageLayerFixture, LanceNative_Take)
     ->ArgsProduct({
-        {100, 200, 500, 1000},  // Take count
-        {1, 4, 8, 16}           // Threads: 1, 4, 8, 16
+        {1, 5, 10, 100},  // Take count
+        {1, 4, 8, 16}     // Threads: 1, 4, 8, 16
     })
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
+
+//=============================================================================
+// Lance Native Take (Single Column Projection) Benchmark
+// Projects single column by BENCH_PROJ_COL_INDEX env var (default 0)
+//=============================================================================
+
+BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_TakeScalarOnly)(::benchmark::State& st) {
+  size_t take_count = 1;
+  if (auto* env = std::getenv("BENCH_TAKE_COUNT")) {
+    take_count = static_cast<size_t>(std::atoi(env));
+  }
+  constexpr int num_threads = 1;
+
+  lance::ReplaceLanceRuntime(static_cast<uint32_t>(num_threads));
+
+  // Write scalar-only data (excludes FixedSizeBinary/LIST vector columns)
+  std::string path = GetCachedDataPath("lance_scalar");
+
+  BENCH_ASSERT_AND_ASSIGN(auto lance_uri, BuildLanceUri(path), st);
+  auto storage_options = GetLanceStorageOptions();
+
+  BENCH_ASSERT_STATUS_OK(EnsureLanceScalarOnlyData(lance_uri, storage_options, path), st);
+
+  auto indices = GenerateRandomIndices(take_count, GetLoaderNumRows());
+
+  // Get scalar-only columns (excludes FixedSizeBinary/LIST vector columns)
+  auto scalar_cols = GetScalarProjection();
+  if (scalar_cols->empty()) {
+    st.SkipWithError("No scalar columns available");
+    return;
+  }
+
+  // Get projection column index from env (indexes into scalar columns)
+  int col_index = 0;
+  if (auto* env = std::getenv("BENCH_PROJ_COL_INDEX")) {
+    col_index = std::atoi(env);
+  }
+  if (col_index < 0 || col_index >= static_cast<int>(scalar_cols->size())) {
+    st.SkipWithError(("BENCH_PROJ_COL_INDEX=" + std::to_string(col_index) + " out of range [0," +
+                      std::to_string(scalar_cols->size()) + ")")
+                         .c_str());
+    return;
+  }
+  auto col_name = (*scalar_cols)[col_index];
+  auto proj_field = schema_->GetFieldByName(col_name);
+  auto proj_schema = arrow::schema({proj_field});
+
+  // Open dataset once and reuse across iterations
+  auto dataset = lance::BlockingDataset::Open(lance_uri, storage_options);
+
+  auto take_lance = [&](bool collect_stats, int64_t& out_rows, int64_t& out_bytes) -> arrow::Status {
+    ArrowSchema c_schema;
+    ARROW_RETURN_NOT_OK(arrow::ExportSchema(*proj_schema, &c_schema));
+
+    auto stream = dataset->Take(indices, c_schema);
+
+    ARROW_ASSIGN_OR_RAISE(auto reader, arrow::ImportRecordBatchReader(&stream));
+
+    std::shared_ptr<arrow::RecordBatch> rb;
+    while (true) {
+      ARROW_RETURN_NOT_OK(reader->ReadNext(&rb));
+      if (!rb)
+        break;
+      if (collect_stats) {
+        out_rows += rb->num_rows();
+        out_bytes += CalculateRawDataSize(rb);
+      }
+    }
+    return arrow::Status::OK();
+  };
+
+  // Verify before benchmark loop
+  int64_t rows_per_iter = 0;
+  int64_t bytes_per_iter = 0;
+  BENCH_ASSERT_STATUS_OK(take_lance(true, rows_per_iter, bytes_per_iter), st);
+  BENCH_ASSERT_STATUS_OK(
+      VerifyTakeResult("Lance(proj)", rows_per_iter, static_cast<int64_t>(take_count), bytes_per_iter), st);
+
+  ResetFsMetrics();
+  dataset->IOStatsIncremental();  // reset Lance IO counters
+
+  for (auto _ : st) {
+    int64_t dummy_rows = 0, dummy_bytes = 0;
+    BENCH_ASSERT_STATUS_OK(take_lance(false, dummy_rows, dummy_bytes), st);
+  }
+
+  auto lance_io = dataset->IOStatsIncremental();
+
+  int64_t total_rows = rows_per_iter * static_cast<int64_t>(st.iterations());
+  int64_t total_bytes = bytes_per_iter * static_cast<int64_t>(st.iterations());
+  ReportThroughput(st, total_bytes, total_rows);
+  ReportIOMetrics(st, lance_io.read_iops, lance_io.read_bytes);
+  st.counters["rows_taken"] = ::benchmark::Counter(static_cast<double>(take_count), ::benchmark::Counter::kDefaults);
+  st.SetLabel("lance/col=" + col_name + "/" + std::to_string(take_count) + "rows/1T");
+}
+
+BENCHMARK_REGISTER_F(StorageLayerFixture, LanceNative_TakeScalarOnly)->Unit(::benchmark::kMillisecond)->UseRealTime();
 
 // Typical: Lance benchmarks
 BENCHMARK_REGISTER_F(StorageLayerFixture, LanceNative_WriteCommit)
@@ -661,7 +989,7 @@ BENCHMARK_REGISTER_F(StorageLayerFixture, LanceNative_OpenRead)
 
 BENCHMARK_REGISTER_F(StorageLayerFixture, LanceNative_Take)
     ->Name("Typical/Lance_Take")
-    ->Args({1000, 8})  // 1000 rows + 8 threads
+    ->Args({10, 8})  // 10 rows + 8 threads
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
 
@@ -676,14 +1004,13 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_MultiReader)(::benchmark::St
 
   lance::ReplaceLanceRuntime(static_cast<uint32_t>(thread_pool_size));
 
-  std::string path = GetUniquePath("lance_multi_reader");
-  BENCH_ASSERT_STATUS_OK(CreateTestDir(fs_, path), st);
+  std::string path = GetCachedDataPath("lance");
 
   // Build Lance URI and get storage options for cloud storage support
   BENCH_ASSERT_AND_ASSIGN(auto lance_uri, BuildLanceUri(path), st);
   auto storage_options = GetLanceStorageOptions();
 
-  BENCH_ASSERT_STATUS_OK(WriteLanceDataset(lance_uri, storage_options), st);
+  BENCH_ASSERT_STATUS_OK(EnsureLanceData(lance_uri, storage_options, path), st);
 
   // Start thread tracker
   ThreadTracker thread_tracker;
@@ -691,6 +1018,8 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_MultiReader)(::benchmark::St
 
   int64_t total_rows = 0;
   int64_t total_bytes = 0;
+
+  ResetFsMetrics();
 
   for (auto _ : st) {
     std::vector<std::thread> reader_threads;
@@ -746,6 +1075,7 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_MultiReader)(::benchmark::St
   thread_tracker.Stop();
 
   ReportThroughput(st, total_bytes, total_rows);
+  ReportFsMetrics(st);
   thread_tracker.ReportToState(st);
   st.counters["num_readers"] = ::benchmark::Counter(static_cast<double>(num_readers), ::benchmark::Counter::kDefaults);
   st.counters["pool_size"] =
@@ -777,9 +1107,8 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_MultiReader)(::benchmark::
 
   ConfigureThreadPool(thread_pool_size);
 
-  std::string path = GetUniquePath("ms_multi_reader");
-  BENCH_ASSERT_STATUS_OK(CreateTestDir(fs_, path), st);
-  BENCH_ASSERT_STATUS_OK(WriteMilvusStorage(format_type, path), st);
+  std::string path = GetCachedDataPath(StorageFormatTypeName(format_type));
+  BENCH_ASSERT_STATUS_OK(EnsureMilvusStorageData(format_type, path), st);
 
   // Start thread tracker
   ThreadTracker thread_tracker;
@@ -787,6 +1116,8 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_MultiReader)(::benchmark::
 
   int64_t total_rows = 0;
   int64_t total_bytes = 0;
+
+  ResetFsMetrics();
 
   for (auto _ : st) {
     std::vector<std::thread> reader_threads;
@@ -842,6 +1173,7 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_MultiReader)(::benchmark::
   thread_tracker.Stop();
 
   ReportThroughput(st, total_bytes, total_rows);
+  ReportFsMetrics(st);
   thread_tracker.ReportToState(st);
   st.counters["num_readers"] = ::benchmark::Counter(static_cast<double>(num_readers), ::benchmark::Counter::kDefaults);
   st.counters["pool_size"] =
@@ -885,13 +1217,13 @@ BENCHMARK_REGISTER_F(StorageLayerFixture, MilvusStorage_OpenRead)
 
 BENCHMARK_REGISTER_F(StorageLayerFixture, MilvusStorage_Take)
     ->Name("Typical/MilvusStorage_Take_Parquet_1T")
-    ->Args({0, 1000, 1})  // Parquet + 1000 rows + 1 thread
+    ->Args({0, 10, 1})  // Parquet + 10 rows + 1 thread
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
 
 BENCHMARK_REGISTER_F(StorageLayerFixture, MilvusStorage_Take)
     ->Name("Typical/MilvusStorage_Take_Parquet")
-    ->Args({0, 1000, 8})  // Parquet + 1000 rows + 8 threads
+    ->Args({0, 10, 8})  // Parquet + 10 rows + 8 threads
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
 
@@ -916,13 +1248,13 @@ BENCHMARK_REGISTER_F(StorageLayerFixture, MilvusStorage_OpenRead)
 
 BENCHMARK_REGISTER_F(StorageLayerFixture, MilvusStorage_Take)
     ->Name("Typical/MilvusStorage_Take_Vortex_1T")
-    ->Args({1, 1000, 1})  // Vortex + 1000 rows + 1 thread
+    ->Args({1, 10, 1})  // Vortex + 10 rows + 1 thread
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
 
 BENCHMARK_REGISTER_F(StorageLayerFixture, MilvusStorage_Take)
     ->Name("Typical/MilvusStorage_Take_Vortex_8T")
-    ->Args({1, 1000, 8})  // Vortex + 1000 rows + 8 threads
+    ->Args({1, 10, 8})  // Vortex + 10 rows + 8 threads
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
 
