@@ -41,6 +41,7 @@
 
 #include "milvus-storage/properties.h"
 #include "milvus-storage/filesystem/fs.h"
+#include "milvus-storage/filesystem/observable.h"
 #include "milvus-storage/common/config.h"
 #include "milvus-storage/common/macro.h"
 #include "milvus-storage/common/arrow_util.h"
@@ -162,13 +163,6 @@ struct MemoryConfig {
   static MemoryConfig Low() { return {"Low", 16ULL * 1024 * 1024, 1024}; }
   static MemoryConfig Default() { return {"Default", 128ULL * 1024 * 1024, 16384}; }
   static MemoryConfig High() { return {"High", 256ULL * 1024 * 1024, 32768}; }
-
-  static std::vector<MemoryConfig> All() { return {Low(), Default(), High()}; }
-
-  static MemoryConfig FromIndex(size_t idx) {
-    auto all = All();
-    return idx < all.size() ? all[idx] : Default();
-  }
 };
 
 //=============================================================================
@@ -436,7 +430,11 @@ class FormatBenchFixtureBase : public ::benchmark::Fixture {
       memory_tracker_.ReportToState(st);
     }
 
-    // Release data loader to free loaded data
+    // Release pre-loaded batches and data loader to free memory
+    batches_.clear();
+    batches_.shrink_to_fit();
+    total_bytes_ = 0;
+    total_rows_ = 0;
     data_loader_.reset();
 
     // Clean up test directory
@@ -492,6 +490,26 @@ class FormatBenchFixtureBase : public ::benchmark::Fixture {
   std::string GetDataDescription() const { return data_loader_->GetDescription(); }
 
   //-----------------------------------------------------------------------
+  // Lazy batch loading: only load source data when actually needed for writing
+  //-----------------------------------------------------------------------
+  arrow::Status EnsureBatchesLoaded() {
+    if (!batches_.empty()) {
+      return arrow::Status::OK();
+    }
+    ARROW_ASSIGN_OR_RAISE(auto batch_reader, GetLoaderBatchReader());
+    std::shared_ptr<arrow::RecordBatch> batch;
+    while (true) {
+      ARROW_RETURN_NOT_OK(batch_reader->ReadNext(&batch));
+      if (!batch)
+        break;
+      batches_.push_back(batch);
+      total_bytes_ += CalculateRawDataSize(batch);
+      total_rows_ += batch->num_rows();
+    }
+    return arrow::Status::OK();
+  }
+
+  //-----------------------------------------------------------------------
   // Legacy Methods - For backward compatibility (uses synthetic data)
   //-----------------------------------------------------------------------
 
@@ -509,10 +527,14 @@ class FormatBenchFixtureBase : public ::benchmark::Fixture {
     return CreateTestData(schema, start_offset, random_data, config.num_rows, config.vector_dim, config.string_length);
   }
 
-  // Create policy for specific format
+  // Create policy based on format:
+  // Vortex=Single (one file, reduce IOPS), Parquet=SchemaBase (multiple column groups)
   arrow::Result<std::unique_ptr<api::ColumnGroupPolicy>> CreatePolicyForFormat(
-      const std::string& format, const std::shared_ptr<arrow::Schema>& schema) {
-    return CreateSinglePolicy(format, schema);
+      const std::string& patterns, const std::string& format, const std::shared_ptr<arrow::Schema>& schema) {
+    if (format == LOON_FORMAT_VORTEX) {
+      return CreateSinglePolicy(format, schema);
+    }
+    return CreateSchemaBasePolicy(patterns, format, schema);
   }
 
   // Get unique path for this benchmark iteration
@@ -561,12 +583,61 @@ class FormatBenchFixtureBase : public ::benchmark::Fixture {
     return size;
   }
 
+  //-----------------------------------------------------------------------
+  // Filesystem Metrics Helpers
+  //-----------------------------------------------------------------------
+
+  // Get filesystem metrics (returns nullptr for local filesystem)
+  std::shared_ptr<FilesystemMetrics> GetFsMetrics() const {
+    auto proxy = std::dynamic_pointer_cast<FileSystemProxy>(fs_);
+    if (proxy) {
+      return proxy->GetMetrics();
+    }
+    return nullptr;
+  }
+
+  // Reset filesystem metrics before benchmark iteration
+  void ResetFsMetrics() {
+    auto metrics = GetFsMetrics();
+    if (metrics) {
+      metrics->Reset();
+    }
+  }
+
+  // Report IO metrics to benchmark state (raw values)
+  void ReportIOMetrics(::benchmark::State& st,
+                       int64_t read_count,
+                       int64_t read_bytes,
+                       int64_t write_count = 0,
+                       int64_t write_bytes = 0) {
+    st.counters["s3_read_count"] =
+        ::benchmark::Counter(static_cast<double>(read_count), ::benchmark::Counter::kAvgIterations);
+    st.counters["s3_read_bytes(MB)"] =
+        ::benchmark::Counter(static_cast<double>(read_bytes) / (1024 * 1024), ::benchmark::Counter::kAvgIterations);
+    st.counters["s3_write_count"] =
+        ::benchmark::Counter(static_cast<double>(write_count), ::benchmark::Counter::kAvgIterations);
+    st.counters["s3_write_bytes(MB)"] =
+        ::benchmark::Counter(static_cast<double>(write_bytes) / (1024 * 1024), ::benchmark::Counter::kAvgIterations);
+  }
+
+  // Report filesystem metrics from observable FS to benchmark state
+  void ReportFsMetrics(::benchmark::State& st) {
+    auto metrics = GetFsMetrics();
+    if (metrics) {
+      ReportIOMetrics(st, metrics->GetReadCount(), metrics->GetReadBytes(), metrics->GetWriteCount(),
+                      metrics->GetWriteBytes());
+    }
+  }
+
   protected:
   api::Properties properties_;
   std::shared_ptr<arrow::fs::FileSystem> fs_;
   std::string base_path_;
   std::vector<std::string> available_formats_;
   std::unique_ptr<BenchmarkDataLoader> data_loader_;
+  std::vector<std::shared_ptr<arrow::RecordBatch>> batches_;
+  int64_t total_bytes_ = 0;
+  int64_t total_rows_ = 0;
   MemoryTracker memory_tracker_;
   ThreadTracker thread_tracker_;
 };

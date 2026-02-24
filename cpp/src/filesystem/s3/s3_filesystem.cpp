@@ -23,6 +23,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <thread>
+#include <unordered_map>
 
 #include <arrow/util/async_generator.h>
 #include <arrow/util/logging.h>
@@ -1178,6 +1179,10 @@ class S3FileSystem::Impl : public std::enable_shared_from_this<S3FileSystem::Imp
   std::shared_ptr<S3ClientHolder> holder_;
   std::optional<S3Backend> backend_;
 
+  // Cache file sizes to avoid repeated HEAD requests on the same path
+  std::mutex file_size_cache_mutex_;
+  std::unordered_map<std::string, int64_t> file_size_cache_;
+
   static constexpr int32_t kListObjectsMaxKeys = 1000;
   // At most 1000 keys per multiple-delete request
   static constexpr int32_t kMultipleDeleteMaxKeys = 1000;
@@ -1921,8 +1926,26 @@ class S3FileSystem::Impl : public std::enable_shared_from_this<S3FileSystem::Imp
 
     ARROW_RETURN_NOT_OK(CheckS3Initialized());
 
-    auto ptr = std::make_shared<ObjectInputFile>(holder_, fs->io_context(), path);
+    // Check file size cache to skip HEAD request
+    int64_t cached_size = kNoSize;
+    {
+      std::lock_guard<std::mutex> lock(file_size_cache_mutex_);
+      auto it = file_size_cache_.find(s);
+      if (it != file_size_cache_.end()) {
+        cached_size = it->second;
+      }
+    }
+
+    auto ptr = std::make_shared<ObjectInputFile>(holder_, fs->io_context(), path, cached_size);
     ARROW_RETURN_NOT_OK(ptr->Init());
+
+    // Cache the file size after Init (which may have done a HEAD request)
+    if (cached_size == kNoSize) {
+      ARROW_ASSIGN_OR_RAISE(auto size, ptr->GetSize());
+      std::lock_guard<std::mutex> lock(file_size_cache_mutex_);
+      file_size_cache_[s] = size;
+    }
+
     return ptr;
   }
 

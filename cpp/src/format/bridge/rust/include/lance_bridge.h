@@ -46,6 +46,12 @@ class LanceException : public std::runtime_error {
 class BlockingFragmentReader;
 class BlockingScanner;
 
+/// Lance IO statistics (read-and-reset semantics)
+struct LanceIOStats {
+  uint64_t read_iops = 0;
+  uint64_t read_bytes = 0;
+};
+
 /// Storage options for S3/cloud access
 /// Keys correspond to Lance/object_store options:
 ///   - "aws_access_key_id" or "access_key_id"
@@ -58,7 +64,7 @@ using LanceStorageOptions = std::unordered_map<std::string, std::string>;
 /// Lance data storage format (file version)
 enum class LanceDataStorageFormat : uint8_t {
   Legacy = 0,  // Lance 0.1 format, data in data/
-  Stable = 1,  // Lance 2.0 format, data in _data/
+  Stable = 1,  // Lance 2.1 format, data in _data/
 };
 
 class BlockingDataset {
@@ -92,6 +98,9 @@ class BlockingDataset {
 
   // Dataset-level take: random access by global row indices
   ArrowArrayStream Take(const std::vector<int64_t>& indices, ArrowSchema& schema);
+
+  /// Read and reset IO statistics for this dataset's object store.
+  LanceIOStats IOStatsIncremental();
 
   const ffi::BlockingDataset& Impl() const { return *impl_; }
 
@@ -144,5 +153,29 @@ class BlockingScanner {
   private:
   rust::Box<ffi::BlockingScanner> impl_;
 };
+
+/// IO/decode time breakdown metrics for Lance
+struct LanceDecodeMetrics {
+  uint64_t io_wait_ns = 0;
+  uint64_t decode_ns = 0;
+};
+
+/// Reset the global Lance decode metrics counters to zero.
+inline void ResetLanceDecodeMetrics() { ffi::reset_lance_decode_metrics_ffi(); }
+
+/// Get the accumulated Lance decode metrics (IO wait and decode time in nanoseconds).
+inline LanceDecodeMetrics GetLanceDecodeMetrics() {
+  auto m = ffi::get_lance_decode_metrics_ffi();
+  return LanceDecodeMetrics{m.io_wait_ns, m.decode_ns};
+}
+
+/// IO trace: enable tracing and reset state
+inline void ResetIOTrace() { ffi::reset_lance_io_trace_ffi(); }
+
+/// IO trace: print collected trace to stderr
+inline void PrintIOTrace() { ffi::print_lance_io_trace_ffi(); }
+
+/// IO trace: disable and clear
+inline void DisableIOTrace() { ffi::disable_lance_io_trace_ffi(); }
 
 }  // namespace milvus_storage::lance

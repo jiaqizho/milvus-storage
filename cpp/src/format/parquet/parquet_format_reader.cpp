@@ -14,6 +14,8 @@
 
 #include "milvus-storage/format/parquet/parquet_format_reader.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -39,7 +41,25 @@
 #include "milvus-storage/common/constants.h"
 #include "milvus-storage/common/macro.h"  // for UNLIKELY
 
+// Declared in Arrow's patched reader.cc (extern "C")
+extern "C" {
+uint64_t arrow_parquet_get_decode_ns();
+void arrow_parquet_reset_decode_ns();
+}
+
 namespace milvus_storage::parquet {
+
+// Global atomic counters for Parquet IO+decode timing (nanoseconds)
+static std::atomic<uint64_t> g_parquet_read_decode_ns{0};
+
+void ResetParquetDecodeMetrics() {
+  g_parquet_read_decode_ns.store(0, std::memory_order_relaxed);
+  arrow_parquet_reset_decode_ns();
+}
+
+ParquetDecodeMetrics GetParquetDecodeMetrics() {
+  return ParquetDecodeMetrics{g_parquet_read_decode_ns.load(std::memory_order_relaxed), arrow_parquet_get_decode_ns()};
+}
 
 static arrow::Result<std::vector<RowGroupInfo>> try_build_row_group_infos(
     const std::shared_ptr<::parquet::FileMetaData>& metadata) {
@@ -330,7 +350,11 @@ arrow::Result<std::shared_ptr<arrow::Table>> ParquetFormatReader::take(const std
                              unique_chunk_indices.end());
 
   // The input row_indices must be sorted and unique
+  auto read_start = std::chrono::steady_clock::now();
   ARROW_ASSIGN_OR_RAISE(auto table, get_chunks_internal(unique_chunk_indices));
+  auto read_elapsed_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - read_start).count();
+  g_parquet_read_decode_ns.fetch_add(static_cast<uint64_t>(read_elapsed_ns), std::memory_order_relaxed);
 
   // Build a map of chunk_id -> offset in the result table
   std::unordered_map<int, int64_t> chunk_base_offsets;

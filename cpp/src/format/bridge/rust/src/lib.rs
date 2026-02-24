@@ -19,20 +19,27 @@ mod filesystem_c;
 use lance_bridgeimpl::*;
 use vortex_bridgeimpl::*;
 
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Once};
+
 use vortex::VortexSessionDefault;
-use vortex::io::runtime::current::CurrentThreadRuntime;
+use vortex::io::runtime::tokio::TokioRuntime;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 
-/// By default, the C++ API uses a current-thread runtime, providing control of the threading
-/// model to the C++ side.
-///
-// TODO(ngates): in the future, we could expose an API for C++ to spawn threads that can drive
-//  this runtime.
-static VORTEX_RT: LazyLock<CurrentThreadRuntime> =
-    LazyLock::new(CurrentThreadRuntime::new);
+/// Use a multi-thread Tokio runtime so that Vortex IO operations can run concurrently.
+/// max_blocking_threads is set to 64 to match Lance's thread pool size,
+/// preventing excessive thread creation under concurrent reader load.
+static VORTEX_TOKIO_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(64)
+        .enable_all()
+        .build()
+        .expect("Failed to create Vortex tokio runtime")
+});
+
+static VORTEX_RT: LazyLock<TokioRuntime> =
+    LazyLock::new(|| TokioRuntime::new(VORTEX_TOKIO_RT.handle().clone()));
 
 static VORTEX_SESSION: LazyLock<VortexSession> =
     LazyLock::new(|| VortexSession::default().with_handle(VORTEX_RT.handle()));
@@ -54,9 +61,16 @@ pub mod lance_ffi {
         Stable = 1,
     }
 
+    /// IO statistics returned by io_stats_incremental (read-and-reset)
+    struct LanceIOStats {
+        read_iops: u64,
+        read_bytes: u64,
+    }
+
     extern "Rust" {
 
         type BlockingDataset;
+        pub fn io_stats_incremental(self: &BlockingDataset) -> LanceIOStats;
         pub fn open_dataset(
             uri: &str,
             storage_options_keys: Vec<String>,
@@ -132,6 +146,21 @@ pub mod lance_ffi {
             schema_ptr: *mut u8,
             out_stream: *mut u8,
         ) -> Result<()>;
+
+        // Decode metrics
+        fn reset_lance_decode_metrics_ffi();
+        fn get_lance_decode_metrics_ffi() -> LanceDecodeMetrics;
+
+        // IO trace
+        fn reset_lance_io_trace_ffi();
+        fn print_lance_io_trace_ffi();
+        fn disable_lance_io_trace_ffi();
+    }
+
+    /// IO/decode time breakdown metrics for Lance
+    struct LanceDecodeMetrics {
+        io_wait_ns: u64,
+        decode_ns: u64,
     }
 }  // mod lance_ffi
 
@@ -223,6 +252,21 @@ pub mod vortex_ffi {
             builder: Box<VortexScanBuilder>,
             out_stream: *mut u8,
         ) -> Result<()>;
+
+        // Decode metrics
+        fn reset_vortex_decode_metrics_ffi();
+        fn get_vortex_decode_metrics_ffi() -> VortexDecodeMetrics;
+
+        // IO trace
+        fn reset_io_trace_ffi();
+        fn print_io_trace_ffi();
+        fn disable_io_trace_ffi();
+    }
+
+    /// IO/decode time breakdown metrics for Vortex
+    struct VortexDecodeMetrics {
+        io_wait_ns: u64,
+        decode_ns: u64,
     }
 
     #[repr(u8)]

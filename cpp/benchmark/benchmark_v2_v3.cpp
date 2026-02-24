@@ -117,7 +117,7 @@ class V2V3BenchFixture : public FormatBenchFixtureBase<> {
   arrow::Status PrepareV3Data(std::shared_ptr<ColumnGroups>& out_cgs) {
     std::string path = GetUniquePath("v3_test");
 
-    // Use schema-based policy
+    // Use schema-based policy (each column in separate ColumnGroup for projection pushdown)
     std::string patterns = GetSchemaBasePatterns();
     ARROW_ASSIGN_OR_RAISE(auto policy, CreateSchemaBasePolicy(patterns, LOON_FORMAT_PARQUET, schema_));
 
@@ -136,9 +136,6 @@ class V2V3BenchFixture : public FormatBenchFixtureBase<> {
   }
 
   std::shared_ptr<arrow::Schema> schema_;
-  std::vector<std::shared_ptr<arrow::RecordBatch>> batches_;
-  int64_t total_bytes_ = 0;
-  int64_t total_rows_ = 0;
 };
 
 //=============================================================================
@@ -155,6 +152,8 @@ BENCHMARK_DEFINE_F(V2V3BenchFixture, V2_PackedRecordBatchReader)(::benchmark::St
   int64_t total_rows_read = 0;
   int64_t total_bytes_read = 0;
 
+  ResetFsMetrics();
+
   for (auto _ : st) {
     PackedRecordBatchReader reader(fs_, paths, schema_, DEFAULT_READ_BUFFER_SIZE);
 
@@ -170,6 +169,7 @@ BENCHMARK_DEFINE_F(V2V3BenchFixture, V2_PackedRecordBatchReader)(::benchmark::St
   }
 
   ReportThroughput(st, total_bytes_read, total_rows_read);
+  ReportFsMetrics(st);
   st.SetLabel("v2/" + GetDataDescription());
 }
 
@@ -186,6 +186,8 @@ BENCHMARK_DEFINE_F(V2V3BenchFixture, V3_RecordBatchReader)(::benchmark::State& s
 
   int64_t total_rows_read = 0;
   int64_t total_bytes_read = 0;
+
+  ResetFsMetrics();
 
   for (auto _ : st) {
     auto reader = Reader::create(cgs, schema_, nullptr, properties_);
@@ -205,6 +207,7 @@ BENCHMARK_DEFINE_F(V2V3BenchFixture, V3_RecordBatchReader)(::benchmark::State& s
   }
 
   ReportThroughput(st, total_bytes_read, total_rows_read);
+  ReportFsMetrics(st);
   st.SetLabel("v3-rb/" + GetDataDescription());
 }
 
@@ -223,6 +226,8 @@ BENCHMARK_DEFINE_F(V2V3BenchFixture, V3_ChunkReader)(::benchmark::State& st) {
   int64_t total_rows_read = 0;
   int64_t total_bytes_read = 0;
 
+  ResetFsMetrics();
+
   for (auto _ : st) {
     auto reader = Reader::create(cgs, schema_, nullptr, properties_);
     BENCH_ASSERT_NOT_NULL(reader, st);
@@ -238,6 +243,7 @@ BENCHMARK_DEFINE_F(V2V3BenchFixture, V3_ChunkReader)(::benchmark::State& st) {
   }
 
   ReportThroughput(st, total_bytes_read, total_rows_read);
+  ReportFsMetrics(st);
   st.SetLabel("v3-chunk/" + GetDataDescription());
 }
 
@@ -257,6 +263,8 @@ BENCHMARK_DEFINE_F(V2V3BenchFixture, V2_PackedRecordBatchWriter)(::benchmark::St
     all_cols.push_back(i);
   }
   column_groups.push_back(all_cols);
+
+  ResetFsMetrics();
 
   for (auto _ : st) {
     std::string path = base_path + "/data.parquet";
@@ -282,6 +290,7 @@ BENCHMARK_DEFINE_F(V2V3BenchFixture, V2_PackedRecordBatchWriter)(::benchmark::St
   int64_t total_bytes = total_bytes_ * static_cast<int64_t>(st.iterations());
   int64_t total_rows = total_rows_ * static_cast<int64_t>(st.iterations());
   ReportThroughput(st, total_bytes, total_rows);
+  ReportFsMetrics(st);
   st.SetLabel("v2-writer/" + GetDataDescription());
 }
 
@@ -293,6 +302,8 @@ BENCHMARK_REGISTER_F(V2V3BenchFixture, V2_PackedRecordBatchWriter)->Unit(::bench
 
 BENCHMARK_DEFINE_F(V2V3BenchFixture, V3_Writer)(::benchmark::State& st) {
   std::string base_path = GetUniquePath("v3_write_bench");
+
+  ResetFsMetrics();
 
   for (auto _ : st) {
     // Use schema-based policy
@@ -315,6 +326,7 @@ BENCHMARK_DEFINE_F(V2V3BenchFixture, V3_Writer)(::benchmark::State& st) {
   int64_t total_bytes = total_bytes_ * static_cast<int64_t>(st.iterations());
   int64_t total_rows = total_rows_ * static_cast<int64_t>(st.iterations());
   ReportThroughput(st, total_bytes, total_rows);
+  ReportFsMetrics(st);
   st.SetLabel("v3-writer/" + GetDataDescription());
 }
 

@@ -1,8 +1,9 @@
 
 use std::ffi::{c_void};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::io::Write;
 use std::marker::PhantomData;
+use std::time::Instant;
 
 use async_compat::Compat;
 use futures::future::BoxFuture;
@@ -13,6 +14,130 @@ use vortex::buffer::ByteBufferMut;
 use vortex::error::{VortexError, VortexResult, vortex_err};
 use vortex::io::runtime::Handle;
 use vortex::io::file::{CoalesceWindow, IntoReadSource, ReadSource, ReadSourceRef, IoRequest};
+
+//=============================================================================
+// IO Trace Collector
+//=============================================================================
+
+#[derive(Clone)]
+struct IoTraceEntry {
+    seq: u32,
+    start_us: u64,   // microseconds since trace reset
+    end_us: u64,
+    offset: u64,
+    size: u64,
+}
+
+struct IoTraceState {
+    enabled: bool,
+    epoch: Instant,
+    entries: Vec<IoTraceEntry>,
+    seq_counter: u32,
+}
+
+static IO_TRACE: once_cell::sync::Lazy<Mutex<IoTraceState>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(IoTraceState {
+        enabled: false,
+        epoch: Instant::now(),
+        entries: Vec::new(),
+        seq_counter: 0,
+    }));
+
+pub(crate) fn reset_io_trace() {
+    let mut state = IO_TRACE.lock().unwrap();
+    state.enabled = true;
+    state.epoch = Instant::now();
+    state.entries.clear();
+    state.seq_counter = 0;
+}
+
+pub(crate) fn disable_io_trace() {
+    let mut state = IO_TRACE.lock().unwrap();
+    state.enabled = false;
+    state.entries.clear();
+}
+
+fn record_io_start() -> (bool, Instant) {
+    let state = IO_TRACE.lock().unwrap();
+    (state.enabled, Instant::now())
+}
+
+fn record_io_end(enabled: bool, start_instant: Instant, offset: u64, size: u64) {
+    if !enabled { return; }
+    let mut state = IO_TRACE.lock().unwrap();
+    let epoch = state.epoch;
+    let seq = state.seq_counter;
+    state.seq_counter += 1;
+    state.entries.push(IoTraceEntry {
+        seq,
+        start_us: start_instant.duration_since(epoch).as_micros() as u64,
+        end_us: Instant::now().duration_since(epoch).as_micros() as u64,
+        offset,
+        size,
+    });
+}
+
+pub(crate) fn print_io_trace() {
+    let state = IO_TRACE.lock().unwrap();
+    if state.entries.is_empty() {
+        eprintln!("[IO Trace] No entries recorded");
+        return;
+    }
+
+    let mut entries = state.entries.clone();
+    entries.sort_by_key(|e| e.start_us);
+
+    // Group into rounds: a new round starts when a request's start_us is after
+    // the previous request's end_us (i.e., sequential dependency)
+    let mut rounds: Vec<Vec<&IoTraceEntry>> = Vec::new();
+    let mut current_round: Vec<&IoTraceEntry> = Vec::new();
+    let mut round_end_us: u64 = 0;
+
+    for entry in &entries {
+        if current_round.is_empty() || entry.start_us < round_end_us + 2000 {
+            // Same round (started within 2ms of round begin)
+            current_round.push(entry);
+            if entry.end_us > round_end_us {
+                round_end_us = entry.end_us;
+            }
+        } else {
+            rounds.push(current_round);
+            current_round = vec![entry];
+            round_end_us = entry.end_us;
+        }
+    }
+    if !current_round.is_empty() {
+        rounds.push(current_round);
+    }
+
+    eprintln!("[IO Trace] {} total requests, {} rounds", entries.len(), rounds.len());
+    let total_bytes: u64 = entries.iter().map(|e| e.size).sum();
+    let wall_us = entries.iter().map(|e| e.end_us).max().unwrap_or(0)
+                - entries.iter().map(|e| e.start_us).min().unwrap_or(0);
+    eprintln!("[IO Trace] total_bytes={:.2}MB  wall={:.1}ms",
+             total_bytes as f64 / (1024.0 * 1024.0), wall_us as f64 / 1000.0);
+
+    for (ri, round) in rounds.iter().enumerate() {
+        let r_start = round.iter().map(|e| e.start_us).min().unwrap_or(0);
+        let r_end = round.iter().map(|e| e.end_us).max().unwrap_or(0);
+        let r_wall = r_end - r_start;
+        let longest = round.iter().map(|e| e.end_us - e.start_us).max().unwrap_or(0);
+        let r_bytes: u64 = round.iter().map(|e| e.size).sum();
+        eprintln!("    R{} — {} req, wall={:.1}ms, longest={:.1}ms, bytes={:.2}MB",
+                 ri + 1, round.len(), r_wall as f64 / 1000.0,
+                 longest as f64 / 1000.0, r_bytes as f64 / (1024.0 * 1024.0));
+        for entry in round.iter() {
+            eprintln!("      seq={:<3} start={:>8.1}ms end={:>8.1}ms dur={:>6.1}ms size={:>8} range={}..{}",
+                     entry.seq,
+                     entry.start_us as f64 / 1000.0,
+                     entry.end_us as f64 / 1000.0,
+                     (entry.end_us - entry.start_us) as f64 / 1000.0,
+                     entry.size,
+                     entry.offset,
+                     entry.offset + entry.size);
+        }
+    }
+}
 
 #[repr(C)]
 pub struct LoonFFIResult {
@@ -275,6 +400,19 @@ impl ObjectStoreReadSourceCpp {
     }
 }
 
+impl Drop for ObjectStoreReadSourceCpp {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.reader.as_ptr().is_null() {
+                let mut result = loon_filesystem_reader_close(self.reader.as_ptr());
+                check_loon_ffi_result(&mut result, "Failed to close ObjectStoreReadSourceCpp reader")
+                    .unwrap_or(());
+                loon_filesystem_reader_destroy(self.reader.as_raw_ptr());
+            }
+        }
+    }
+}
+
 
 impl IntoReadSource for ObjectStoreReadSourceCpp {
     fn into_read_source(self, handle: Handle) -> VortexResult<ReadSourceRef> {
@@ -349,6 +487,7 @@ impl ReadSource for ObjectStoreIoSourceCpp {
 
                 // Offload sync FFI to blocking pool, reuse the pre-opened reader handle
                 let blocking = self.handle.spawn_blocking(move || -> VortexResult<Vec<u8>> {
+                    let (trace_enabled, trace_start) = record_io_start();
                     let mut owned: Vec<u8> = Vec::with_capacity(len as usize);
 
                     unsafe {
@@ -367,6 +506,7 @@ impl ReadSource for ObjectStoreIoSourceCpp {
                         owned.set_len(len as usize);
                     }
 
+                    record_io_end(trace_enabled, trace_start, start, len);
                     Ok(owned)
                 });
 

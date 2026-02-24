@@ -25,7 +25,7 @@ use vortex::scan::ScanBuilder;
 use vortex::dtype::{DType as RustDType, DecimalDType, Nullability, PType as RustPType, FieldName};
 use vortex::dtype::arrow::FromArrowType;
 use vortex::expr::Expression;
-use vortex::io::runtime::current::CurrentThreadRuntime;
+use vortex::io::runtime::tokio::TokioRuntime;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::error::VortexError;
 
@@ -437,13 +437,13 @@ pub const VORTEX_NON_STATS: &[Stat] = &[
 pub(crate) struct VortexWriter {
     pub fswrapper_ptr: *mut u8,
     pub path: String,
-    pub inner_writer: Option<BlockingWriter<'static, 'static, CurrentThreadRuntime>>,
+    pub inner_writer: Option<BlockingWriter<'static, 'static, TokioRuntime>>,
     pub enable_stats: bool,
 }
 
-pub(crate) unsafe fn open_writer(fswrapper_ptr: *mut u8, path: &str, enable_stats: bool) 
+pub(crate) unsafe fn open_writer(fswrapper_ptr: *mut u8, path: &str, enable_stats: bool)
     -> Result<Box<VortexWriter>, Box<dyn std::error::Error>> {
-    Ok(Box::new(VortexWriter { 
+    Ok(Box::new(VortexWriter {
         fswrapper_ptr: fswrapper_ptr,
         path: path.to_string(),
         inner_writer : None,
@@ -482,7 +482,6 @@ pub(crate) unsafe fn write(&mut self, in_schema: *mut u8, in_array: *mut u8) -> 
         } else {
             VORTEX_NON_STATS.to_vec()
         };
-
         let blocking_writer = vortex::file::VortexWriteOptions::new(VORTEX_SESSION.clone())
             .with_file_statistics(stats_options)
             .blocking(&*VORTEX_RT)
@@ -505,16 +504,6 @@ pub(crate) unsafe fn close(&mut self) -> Result<crate::vortex_ffi::VortexWriteSu
         let file_size = summary.size();
 
         // Re-serialize the footer to compute the exact footer region size on disk.
-        // This size is used as `with_initial_read_size()` when opening the file,
-        // so the reader can fetch the entire footer in a single IO.
-        //
-        // serialize() produces all buffers that make up the footer region:
-        //   [dtype fb] [layout fb] [statistics fb] [footer fb] [postscript] [EOF 8B]
-        //
-        // Why re-serialization is accurate:
-        // - with_offset() only affects the absolute offsets stored inside the postscript,
-        //   not the buffer sizes (see FooterSerializer::write_flatbuffer), so offset=0 is safe.
-        // - exclude_dtype defaults to false, matching our writer which never excludes dtype.
         let footer_size: u64 = summary.footer().clone()
             .into_serializer()
             .serialize()
@@ -665,7 +654,17 @@ impl VortexScanBuilder {
     pub(crate) fn with_include_by_index(&mut self, include_by_index: &[u64]) {
         let selection =
             vortex::scan::Selection::IncludeByIndex(Buffer::copy_from(include_by_index));
-        take_mut::take(&mut self.inner, |inner| inner.with_selection(selection));
+        take_mut::take(&mut self.inner, |inner| {
+            inner
+                .with_selection(selection)
+                // For point queries, increase concurrency so that all natural splits
+                // fit within the buffered() window. This ensures all IO requests are
+                // visible to the IO driver at once, reducing from ~5 IO rounds to 2.
+                // Default is 4 per-thread; with 16 cores this gives buffered(64) which
+                // is too small for files with many chunks (e.g. 370 embedding chunks).
+                // Setting 128 gives buffered(128*16=2048), covering any realistic file.
+                .with_concurrency(128)
+        });
     }
 
     pub(crate) fn with_limit(&mut self, limit: usize) {
@@ -748,5 +747,29 @@ pub(crate) unsafe fn scan_builder_into_stream(
     // Arrow C stream interface
     unsafe { std::ptr::write(out_stream, stream) };
     Ok(())
+}
+
+pub fn reset_vortex_decode_metrics_ffi() {
+    vortex_layout::reset_vortex_decode_metrics();
+}
+
+pub fn get_vortex_decode_metrics_ffi() -> crate::vortex_ffi::VortexDecodeMetrics {
+    let (io_ns, decode_ns) = vortex_layout::get_vortex_decode_metrics();
+    crate::vortex_ffi::VortexDecodeMetrics {
+        io_wait_ns: io_ns,
+        decode_ns,
+    }
+}
+
+pub fn reset_io_trace_ffi() {
+    crate::filesystem_c::reset_io_trace();
+}
+
+pub fn print_io_trace_ffi() {
+    crate::filesystem_c::print_io_trace();
+}
+
+pub fn disable_io_trace_ffi() {
+    crate::filesystem_c::disable_io_trace();
 }
 

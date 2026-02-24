@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -26,6 +27,18 @@
 #include "milvus-storage/format/format_reader.h"
 
 namespace milvus_storage::parquet {
+
+/// Parquet decode timing metrics
+struct ParquetDecodeMetrics {
+  uint64_t read_decode_ns = 0;  // IO+decode combined (measured in our code)
+  uint64_t decode_only_ns = 0;  // decode-only (measured inside Arrow's ReadRowGroups)
+};
+
+/// Reset the global Parquet decode metrics counters to zero.
+void ResetParquetDecodeMetrics();
+
+/// Get the accumulated Parquet decode metrics (IO+decode time in nanoseconds).
+ParquetDecodeMetrics GetParquetDecodeMetrics();
 
 class ParquetFormatReader final : public FormatReader {
   public:

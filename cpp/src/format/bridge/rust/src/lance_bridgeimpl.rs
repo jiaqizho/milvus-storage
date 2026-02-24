@@ -314,6 +314,14 @@ impl BlockingDataset {
 }
 
 impl BlockingDataset {
+    pub fn io_stats_incremental(&self) -> crate::lance_ffi::LanceIOStats {
+        let stats = self.inner.object_store().io_stats_incremental();
+        crate::lance_ffi::LanceIOStats {
+            read_iops: stats.read_iops,
+            read_bytes: stats.read_bytes,
+        }
+    }
+
     pub unsafe fn write_stream(&mut self, stream_ptr: *mut u8) -> Result<()> {
         let stream_ptr = stream_ptr as *mut FFI_ArrowArrayStream;
         let stream = unsafe { std::ptr::replace(stream_ptr, FFI_ArrowArrayStream::empty()) };
@@ -367,7 +375,7 @@ pub unsafe fn write_dataset(
 
     let lance_file_version = match data_storage_format {
         LanceDataStorageFormat::Legacy => LanceFileVersion::Legacy,
-        LanceDataStorageFormat::Stable => LanceFileVersion::V2_0,  // Stable resolves to V2_0
+        LanceDataStorageFormat::Stable => LanceFileVersion::V2_1,  // Stable resolves to V2_1
         _ => LanceFileVersion::Legacy,
     };
 
@@ -727,4 +735,30 @@ pub unsafe fn dataset_take(
     let out_stream_ptr = out_stream as *mut FFI_ArrowArrayStream;
     unsafe { std::ptr::write(out_stream_ptr, ffi_stream) };
     Ok(())
+}
+
+pub fn reset_lance_decode_metrics_ffi() {
+    lance_io::reset_lance_io_metrics();
+    lance_encoding::reset_lance_decode_ns();
+}
+
+pub fn get_lance_decode_metrics_ffi() -> crate::lance_ffi::LanceDecodeMetrics {
+    let io_ns = lance_io::get_lance_io_wait_ns();
+    let decode_ns = lance_encoding::get_lance_decode_ns();
+    crate::lance_ffi::LanceDecodeMetrics {
+        io_wait_ns: io_ns,
+        decode_ns,
+    }
+}
+
+pub fn reset_lance_io_trace_ffi() {
+    lance_io::reset_lance_io_trace();
+}
+
+pub fn print_lance_io_trace_ffi() {
+    lance_io::print_lance_io_trace();
+}
+
+pub fn disable_lance_io_trace_ffi() {
+    lance_io::disable_lance_io_trace();
 }
