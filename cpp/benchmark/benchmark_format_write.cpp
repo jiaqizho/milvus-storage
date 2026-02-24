@@ -75,29 +75,28 @@ class FormatWriteBenchmark : public FormatBenchFixtureBase<> {
 // Args: [format_idx, data_config_idx, memory_config_idx]
 BENCHMARK_DEFINE_F(FormatWriteBenchmark, WriteComparison)(::benchmark::State& st) {
   size_t format_idx = static_cast<size_t>(st.range(0));
-  // data_config_idx is ignored - we use data from loader
-  size_t memory_config_idx = static_cast<size_t>(st.range(2));
 
   std::string format = GetFormatByIndex(format_idx);
   if (!CheckFormatAvailable(st, format)) {
     return;
   }
 
-  MemoryConfig memory_config = MemoryConfig::FromIndex(memory_config_idx);
-
   // Configure memory settings
-  ConfigureMemory(memory_config);
+  ConfigureMemory(MemoryConfig::Default());
 
   // Track total bytes and rows for throughput calculation
   int64_t total_bytes_written = 0;
   int64_t total_rows_written = 0;
 
+  // Reset filesystem metrics before benchmark
+  ResetFsMetrics();
+
   for (auto _ : st) {
     std::string path = GetUniquePath(format);
 
-    // Create policy using schema-based patterns from loader
+    // Create policy: Vortex=Single (reduce IOPS), Parquet=SchemaBase
     std::string patterns = GetSchemaBasePatterns();
-    BENCH_ASSERT_AND_ASSIGN(auto policy, CreateSchemaBasePolicy(patterns, format, schema_), st);
+    BENCH_ASSERT_AND_ASSIGN(auto policy, CreatePolicyForFormat(patterns, format, schema_), st);
 
     auto writer = Writer::create(path, schema_, std::move(policy), properties_);
     BENCH_ASSERT_NOT_NULL(writer, st);
@@ -116,6 +115,7 @@ BENCHMARK_DEFINE_F(FormatWriteBenchmark, WriteComparison)(::benchmark::State& st
 
   // Report metrics
   ReportThroughput(st, total_bytes_written, total_rows_written);
+  ReportFsMetrics(st);
 
   // Add labels for better output readability
   st.SetLabel(format + "/" + GetDataDescription());
@@ -126,7 +126,6 @@ BENCHMARK_REGISTER_F(FormatWriteBenchmark, WriteComparison)
     ->ArgsProduct({
         {0, 1},     // Format: parquet(0), vortex(1)
         {0, 1, 2},  // DataConfig: Small(0), Medium(1), Large(2)
-        {1}         // MemoryConfig: Default(1) only for basic tests
     })
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
@@ -148,7 +147,6 @@ BENCHMARK_REGISTER_F(FormatWriteBenchmark, WriteComparison)
     ->ArgsProduct({
         {0, 1},  // Format: parquet(0), vortex(1)
         {3},     // DataConfig: HighDim(3)
-        {1}      // MemoryConfig: Default(1)
     })
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
@@ -159,7 +157,6 @@ BENCHMARK_REGISTER_F(FormatWriteBenchmark, WriteComparison)
     ->ArgsProduct({
         {0, 1},  // Format: parquet(0), vortex(1)
         {4},     // DataConfig: LongString(4)
-        {1}      // MemoryConfig: Default(1)
     })
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
@@ -205,8 +202,8 @@ BENCHMARK_DEFINE_F(FormatWriteBenchmark, CompressionAnalysis)(::benchmark::State
   for (auto _ : st) {
     std::string path = GetUniquePath(format);
 
-    // Create policy and writer with target format (uses default zstd compression for parquet)
-    BENCH_ASSERT_AND_ASSIGN(auto policy, CreateSchemaBasePolicy(patterns, format, schema_), st);
+    // Create policy: Vortex=Single (reduce IOPS), Parquet=SchemaBase
+    BENCH_ASSERT_AND_ASSIGN(auto policy, CreatePolicyForFormat(patterns, format, schema_), st);
     auto writer = Writer::create(path, schema_, std::move(policy), properties_);
     BENCH_ASSERT_NOT_NULL(writer, st);
 
