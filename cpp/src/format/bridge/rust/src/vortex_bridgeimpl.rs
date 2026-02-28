@@ -25,7 +25,7 @@ use vortex::scan::ScanBuilder;
 use vortex::dtype::{DType as RustDType, DecimalDType, Nullability, PType as RustPType, FieldName};
 use vortex::dtype::arrow::FromArrowType;
 use vortex::expr::Expression;
-use vortex::io::runtime::current::CurrentThreadRuntime;
+use vortex::io::runtime::tokio::TokioRuntime;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::error::VortexError;
 
@@ -437,7 +437,7 @@ pub const VORTEX_NON_STATS: &[Stat] = &[
 pub(crate) struct VortexWriter {
     pub fswrapper_ptr: *mut u8,
     pub path: String,
-    pub inner_writer: Option<BlockingWriter<'static, 'static, CurrentThreadRuntime>>,
+    pub inner_writer: Option<BlockingWriter<'static, 'static, TokioRuntime>>,
     pub enable_stats: bool,
 }
 
@@ -632,7 +632,17 @@ impl VortexScanBuilder {
     pub(crate) fn with_include_by_index(&mut self, include_by_index: &[u64]) {
         let selection =
             vortex::scan::Selection::IncludeByIndex(Buffer::copy_from(include_by_index));
-        take_mut::take(&mut self.inner, |inner| inner.with_selection(selection));
+        take_mut::take(&mut self.inner, |inner| {
+            inner
+                .with_selection(selection)
+                // For point queries, increase concurrency so that all natural splits
+                // fit within the buffered() window. This ensures all IO requests are
+                // visible to the IO driver at once, reducing from ~5 IO rounds to 2.
+                // Default is 4 per-thread; with 16 cores this gives buffered(64) which
+                // is too small for files with many chunks (e.g. 370 embedding chunks).
+                // Setting 128 gives buffered(128*16=2048), covering any realistic file.
+                .with_concurrency(128)
+        });
     }
 
     pub(crate) fn with_limit(&mut self, limit: usize) {

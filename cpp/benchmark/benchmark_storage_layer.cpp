@@ -81,13 +81,6 @@ class StorageLayerFixture : public FormatBenchFixtureBase<> {
     // Get schema from data loader
     schema_ = GetLoaderSchema();
 
-    // Read optional Vortex row_block_size from env and set in properties
-    vortex_row_block_size_ = 0;
-    if (auto* env = std::getenv("BENCH_VORTEX_ROW_BLOCK_SIZE")) {
-      vortex_row_block_size_ = static_cast<uint64_t>(std::atoll(env));
-      api::SetValue(properties_, PROPERTY_WRITER_VORTEX_ROW_BLOCK_SIZE, env);
-    }
-
     // Batches are loaded lazily via EnsureBatchesLoaded() — only needed by write benchmarks
     // and cache-miss paths. This avoids re-reading source data for every read benchmark.
   }
@@ -287,11 +280,7 @@ class StorageLayerFixture : public FormatBenchFixtureBase<> {
   //-----------------------------------------------------------------------
   std::string GetCachedDataPath(const std::string& format_name) const {
     namespace fs = std::filesystem;
-    std::string actual_name = format_name;
-    if (format_name.rfind("vortex", 0) == 0 && vortex_row_block_size_ > 0) {
-      actual_name += "_rb" + std::to_string(vortex_row_block_size_);
-    }
-    return (fs::path("bench_cache") / GetDataDescription() / actual_name).lexically_normal().string();
+    return (fs::path("bench_cache") / GetDataDescription() / format_name).lexically_normal().string();
   }
 
   // Ensure MilvusStorage data exists at path, write only if missing
@@ -472,7 +461,6 @@ class StorageLayerFixture : public FormatBenchFixtureBase<> {
   std::vector<std::shared_ptr<arrow::RecordBatch>> batches_;
   int64_t total_bytes_ = 0;
   int64_t total_rows_ = 0;
-  uint64_t vortex_row_block_size_ = 0;
 };
 
 //=============================================================================
@@ -578,24 +566,28 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_Take)(::benchmark::State& 
 
   auto indices = GenerateRandomIndices(take_count, GetLoaderNumRows());
 
-  // Collect stats once and verify before benchmark loop
-  int64_t rows_per_iter = 0;
-  int64_t bytes_per_iter = 0;
-  BENCH_ASSERT_STATUS_OK(TakeMilvusStorageWithStats(path, indices, rows_per_iter, bytes_per_iter), st);
-  BENCH_ASSERT_STATUS_OK(
-      VerifyTakeResult("MilvusStorage", rows_per_iter, static_cast<int64_t>(take_count), bytes_per_iter), st);
+  // Open transaction once and reuse across iterations
+  BENCH_ASSERT_AND_ASSIGN(auto txn, Transaction::Open(fs_, path), st);
+  BENCH_ASSERT_AND_ASSIGN(auto manifest, txn->GetManifest(), st);
+  auto cgs = std::make_shared<ColumnGroups>(manifest->columnGroups());
+
+  // Create reader once outside benchmark loop
+  auto reader = Reader::create(cgs, schema_, nullptr, properties_);
+  if (!reader) {
+    st.SkipWithError("Failed to create reader");
+    return;
+  }
 
   ResetFsMetrics();
 
   for (auto _ : st) {
-    BENCH_ASSERT_STATUS_OK(TakeMilvusStorage(path, indices), st);
+    auto result = reader->take(indices);
+    if (!result.ok()) {
+      st.SkipWithError(result.status().message());
+      return;
+    }
   }
 
-  // Calculate totals using iteration count
-  int64_t total_rows = rows_per_iter * static_cast<int64_t>(st.iterations());
-  int64_t total_bytes = bytes_per_iter * static_cast<int64_t>(st.iterations());
-
-  ReportThroughput(st, total_bytes, total_rows);
   ReportFsMetrics(st);
   st.counters["rows_taken"] = ::benchmark::Counter(static_cast<double>(take_count), ::benchmark::Counter::kDefaults);
   st.counters["threads"] = ::benchmark::Counter(static_cast<double>(num_threads), ::benchmark::Counter::kDefaults);
@@ -666,12 +658,13 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_TakeScalarOnly)(::benchmar
 
   ResetFsMetrics();
 
+  auto reader = Reader::create(cgs, proj_schema, proj_columns, properties_);
+  if (!reader) {
+    st.SkipWithError("Failed to create reader");
+    return;
+  }
+
   for (auto _ : st) {
-    auto reader = Reader::create(cgs, proj_schema, proj_columns, properties_);
-    if (!reader) {
-      st.SkipWithError("Failed to create reader");
-      return;
-    }
     auto table_result = reader->take(indices);
     if (!table_result.ok()) {
       st.SkipWithError(table_result.status().ToString().c_str());

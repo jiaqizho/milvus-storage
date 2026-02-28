@@ -90,7 +90,7 @@ struct SyntheticDataConfig {
   bool random_data = true;
 
   static SyntheticDataConfig Small() { return {4096, 128, 128, true}; }
-  static SyntheticDataConfig Medium() { return {40960, 128, 128, true}; }
+  static SyntheticDataConfig Medium() { return {200000, 128, 128, true}; }
   static SyntheticDataConfig Large() { return {409600, 128, 128, true}; }
 };
 
