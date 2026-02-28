@@ -73,10 +73,10 @@ inline std::shared_ptr<arrow::RecordBatch> ProjectColumns(const std::shared_ptr<
 // Storage Layer Benchmark Fixture
 //=============================================================================
 
-class StorageLayerFixture : public FormatBenchFixtureBase<> {
+class StorageLayerFixture : public FormatBenchFixtureBase<false> {
   public:
   void SetUp(::benchmark::State& st) override {
-    FormatBenchFixtureBase<>::SetUp(st);
+    FormatBenchFixtureBase<false>::SetUp(st);
 
     // Get schema from data loader
     schema_ = GetLoaderSchema();
@@ -91,7 +91,7 @@ class StorageLayerFixture : public FormatBenchFixtureBase<> {
     batches_.shrink_to_fit();
     schema_.reset();
     ThreadPoolHolder::Release();
-    FormatBenchFixtureBase<>::TearDown(st);
+    FormatBenchFixtureBase<false>::TearDown(st);
   }
 
   void ConfigureThreadPool(int num_threads) { ThreadPoolHolder::WithSingleton(num_threads); }
@@ -124,9 +124,8 @@ class StorageLayerFixture : public FormatBenchFixtureBase<> {
     ARROW_RETURN_NOT_OK(EnsureBatchesLoaded());
     std::string format = (format_type == StorageFormatType::PARQUET) ? LOON_FORMAT_PARQUET : LOON_FORMAT_VORTEX;
 
-    // Use format-specific policy: Vortex=Single, Parquet=SchemaBase
-    std::string patterns = GetSchemaBasePatterns();
-    ARROW_ASSIGN_OR_RAISE(auto policy, CreatePolicyForFormat(patterns, format, schema_));
+    // Use Single policy for all formats (one column group per file)
+    ARROW_ASSIGN_OR_RAISE(auto policy, CreateSinglePolicy(format, schema_));
 
     auto writer = Writer::create(path, schema_, std::move(policy), properties_);
     if (!writer)
@@ -191,48 +190,6 @@ class StorageLayerFixture : public FormatBenchFixtureBase<> {
         break;
       // No stats collection in benchmark loop
     }
-    return arrow::Status::OK();
-  }
-
-  //-----------------------------------------------------------------------
-  // MilvusStorage: Open Transaction + Take (with stats collection)
-  //-----------------------------------------------------------------------
-  arrow::Status TakeMilvusStorageWithStats(const std::string& path,
-                                           const std::vector<int64_t>& indices,
-                                           int64_t& out_rows,
-                                           int64_t& out_bytes) {
-    ARROW_ASSIGN_OR_RAISE(auto txn, Transaction::Open(fs_, path));
-    ARROW_ASSIGN_OR_RAISE(auto manifest, txn->GetManifest());
-    auto cgs = std::make_shared<ColumnGroups>(manifest->columnGroups());
-
-    auto reader = Reader::create(cgs, schema_, nullptr, properties_);
-    if (!reader)
-      return arrow::Status::Invalid("Failed to create reader");
-
-    ARROW_ASSIGN_OR_RAISE(auto table, reader->take(indices));
-    out_rows += table->num_rows();
-    for (const auto& batch : arrow::TableBatchReader(*table)) {
-      if (!batch.ok())
-        return batch.status();
-      out_bytes += CalculateRawDataSize(*batch);
-    }
-    return arrow::Status::OK();
-  }
-
-  //-----------------------------------------------------------------------
-  // MilvusStorage: Open Transaction + Take (no stats, for benchmark loop)
-  //-----------------------------------------------------------------------
-  arrow::Status TakeMilvusStorage(const std::string& path, const std::vector<int64_t>& indices) {
-    ARROW_ASSIGN_OR_RAISE(auto txn, Transaction::Open(fs_, path));
-    ARROW_ASSIGN_OR_RAISE(auto manifest, txn->GetManifest());
-    auto cgs = std::make_shared<ColumnGroups>(manifest->columnGroups());
-
-    auto reader = Reader::create(cgs, schema_, nullptr, properties_);
-    if (!reader)
-      return arrow::Status::Invalid("Failed to create reader");
-
-    ARROW_ASSIGN_OR_RAISE(auto table, reader->take(indices));
-    // No stats collection in benchmark loop
     return arrow::Status::OK();
   }
 
@@ -581,7 +538,7 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_Take)(::benchmark::State& 
   ResetFsMetrics();
 
   for (auto _ : st) {
-    auto result = reader->take(indices);
+    auto result = reader->take(indices, num_threads);
     if (!result.ok()) {
       st.SkipWithError(result.status().message());
       return;
@@ -665,7 +622,7 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_TakeScalarOnly)(::benchmar
   }
 
   for (auto _ : st) {
-    auto table_result = reader->take(indices);
+    auto table_result = reader->take(indices, num_threads);
     if (!table_result.ok()) {
       st.SkipWithError(table_result.status().ToString().c_str());
       return;
@@ -987,50 +944,56 @@ BENCHMARK_REGISTER_F(StorageLayerFixture, LanceNative_Take)
     ->UseRealTime();
 
 //=============================================================================
-// Lance Multi-Reader Concurrency Benchmark
+// Lance Multi-Take Concurrency Benchmark
+// Measures concurrent take performance to find throughput upper limit
 //=============================================================================
 
-// Args: [num_readers, thread_pool_size]
-BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_MultiReader)(::benchmark::State& st) {
-  int num_readers = static_cast<int>(st.range(0));
-  int thread_pool_size = static_cast<int>(st.range(1));
+// Args: [take_count, num_readers, skip_vector]
+BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_MultiTake)(::benchmark::State& st) {
+  size_t take_count = static_cast<size_t>(st.range(0));
+  int num_readers = static_cast<int>(st.range(1));
+  bool skip_vector = static_cast<bool>(st.range(2));
 
-  lance::ReplaceLanceRuntime(static_cast<uint32_t>(thread_pool_size));
+  // Build projection schema: optionally exclude vector (fixed_size_list) columns
+  auto proj_schema = schema_;
+  if (skip_vector) {
+    std::vector<std::shared_ptr<arrow::Field>> scalar_fields;
+    for (const auto& field : schema_->fields()) {
+      if (field->type()->id() != arrow::Type::FIXED_SIZE_LIST &&
+          field->type()->id() != arrow::Type::FIXED_SIZE_BINARY) {
+        scalar_fields.push_back(field);
+      }
+    }
+    proj_schema = arrow::schema(scalar_fields);
+  }
 
   std::string path = GetCachedDataPath("lance");
 
-  // Build Lance URI and get storage options for cloud storage support
   BENCH_ASSERT_AND_ASSIGN(auto lance_uri, BuildLanceUri(path), st);
   auto storage_options = GetLanceStorageOptions();
 
   BENCH_ASSERT_STATUS_OK(EnsureLanceData(lance_uri, storage_options, path), st);
 
-  // Start thread tracker
-  ThreadTracker thread_tracker;
-  thread_tracker.Start(std::chrono::milliseconds(1));
+  std::vector<std::vector<int64_t>> per_reader_indices(num_readers);
+  for (int i = 0; i < num_readers; ++i) {
+    per_reader_indices[i] = GenerateRandomIndices(take_count, GetLoaderNumRows(), 42 + i);
+  }
 
-  int64_t total_rows = 0;
-  int64_t total_bytes = 0;
+  auto dataset = lance::BlockingDataset::Open(lance_uri, storage_options);
 
-  ResetFsMetrics();
+  dataset->IOStatsIncremental();  // reset Lance IO counters
 
   for (auto _ : st) {
     std::vector<std::thread> reader_threads;
-    std::atomic<int64_t> rows_read{0};
-    std::atomic<int64_t> bytes_read{0};
     std::atomic<bool> has_error{false};
 
-    // Launch N reader threads
     for (int i = 0; i < num_readers; ++i) {
       reader_threads.emplace_back([&, i]() {
-        auto read_all = [&]() -> arrow::Status {
-          auto dataset = lance::BlockingDataset::Open(lance_uri, storage_options);
-
+        auto take_fn = [&]() -> arrow::Status {
           ArrowSchema c_schema;
-          ARROW_RETURN_NOT_OK(arrow::ExportSchema(*schema_, &c_schema));
+          ARROW_RETURN_NOT_OK(arrow::ExportSchema(*proj_schema, &c_schema));
 
-          auto scanner = dataset->Scan(c_schema, 8192);
-          auto stream = scanner->OpenStream();
+          auto stream = dataset->Take(per_reader_indices[i], c_schema);
 
           ARROW_ASSIGN_OR_RAISE(auto reader, arrow::ImportRecordBatchReader(&stream));
 
@@ -1039,147 +1002,137 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_MultiReader)(::benchmark::St
             ARROW_RETURN_NOT_OK(reader->ReadNext(&rb));
             if (!rb)
               break;
-            rows_read += rb->num_rows();
-            bytes_read += CalculateRawDataSize(rb);
           }
           return arrow::Status::OK();
         };
 
-        if (!read_all().ok()) {
+        if (!take_fn().ok()) {
           has_error = true;
         }
       });
     }
 
-    // Wait for all readers to complete
     for (auto& t : reader_threads) {
       t.join();
     }
 
     if (has_error) {
-      st.SkipWithError("Reader error in concurrent read");
+      st.SkipWithError("Take error in concurrent take");
       return;
     }
-
-    total_rows += rows_read.load();
-    total_bytes += bytes_read.load();
   }
+  auto lance_io = dataset->IOStatsIncremental();
+  ReportIOMetrics(st, lance_io.read_iops, lance_io.read_bytes);
 
-  thread_tracker.Stop();
-
-  ReportThroughput(st, total_bytes, total_rows);
-  ReportFsMetrics(st);
-  thread_tracker.ReportToState(st);
-  st.counters["num_readers"] = ::benchmark::Counter(static_cast<double>(num_readers), ::benchmark::Counter::kDefaults);
-  st.counters["pool_size"] =
-      ::benchmark::Counter(static_cast<double>(thread_pool_size), ::benchmark::Counter::kDefaults);
-  st.SetLabel("lance/" + std::to_string(num_readers) + "readers/" + std::to_string(thread_pool_size) + "pool");
+  int64_t total_takes = static_cast<int64_t>(num_readers) * static_cast<int64_t>(st.iterations());
+  st.counters["takes/s"] = ::benchmark::Counter(static_cast<double>(total_takes), ::benchmark::Counter::kIsRate);
+  std::string vec_label = skip_vector ? "/no_vec" : "";
+  st.SetLabel("lance/" + std::to_string(take_count) + "rows/" + std::to_string(num_readers) + "readers" + vec_label);
 }
 
-BENCHMARK_REGISTER_F(StorageLayerFixture, LanceNative_MultiReader)
+BENCHMARK_REGISTER_F(StorageLayerFixture, LanceNative_MultiTake)
     ->ArgsProduct({
-        {1, 16, 64, 256},  // NumReaders: 1, 16, 64, 256
-        {1, 8, 16, 32}     // ThreadPoolSize: 1, 8, 16, 32
+        {10},                        // TakeCount
+        {1, 16, 64, 128, 256, 512},  // NumReaders: 1, 16, 64, 128, 256, 512
+        {0, 1}                       // SkipVector: 0=all columns, 1=skip vector columns
     })
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
 
 //=============================================================================
-// Multi-Reader Concurrency Benchmark
-// Measures memory usage and thread count with N concurrent readers
+// Multi-Take Concurrency Benchmark
+// Measures concurrent take performance to find throughput upper limit
 //=============================================================================
 
-// Args: [format_type, num_readers, thread_pool_size]
-BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_MultiReader)(::benchmark::State& st) {
+// Args: [format_type, take_count, num_readers, num_threads, skip_vector]
+BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_MultiTake)(::benchmark::State& st) {
   auto format_type = static_cast<StorageFormatType>(st.range(0));
-  int num_readers = static_cast<int>(st.range(1));
-  int thread_pool_size = static_cast<int>(st.range(2));
+  size_t take_count = static_cast<size_t>(st.range(1));
+  int num_readers = static_cast<int>(st.range(2));
+  int num_threads = static_cast<int>(st.range(3));
+  bool skip_vector = static_cast<bool>(st.range(4));
 
   if (!CheckStorageFormatAvailable(st, format_type))
     return;
 
-  ConfigureThreadPool(thread_pool_size);
+  // Build needed_columns: optionally exclude vector (fixed_size_list) columns
+  std::shared_ptr<std::vector<std::string>> needed_columns;
+  if (skip_vector) {
+    needed_columns = std::make_shared<std::vector<std::string>>();
+    for (const auto& field : schema_->fields()) {
+      if (field->type()->id() != arrow::Type::FIXED_SIZE_LIST &&
+          field->type()->id() != arrow::Type::FIXED_SIZE_BINARY) {
+        needed_columns->push_back(field->name());
+      }
+    }
+  }
+
+  ConfigureThreadPool(num_threads);
+  ResetFsMetrics();
 
   std::string path = GetCachedDataPath(StorageFormatTypeName(format_type));
   BENCH_ASSERT_STATUS_OK(EnsureMilvusStorageData(format_type, path), st);
 
-  // Start thread tracker
-  ThreadTracker thread_tracker;
-  thread_tracker.Start(std::chrono::milliseconds(1));
+  // Each reader gets its own random indices (different seed per reader)
+  std::vector<std::vector<int64_t>> per_reader_indices(num_readers);
+  for (int i = 0; i < num_readers; ++i) {
+    per_reader_indices[i] = GenerateRandomIndices(take_count, GetLoaderNumRows(), 42 + i);
+  }
 
-  int64_t total_rows = 0;
-  int64_t total_bytes = 0;
-
-  ResetFsMetrics();
+  BENCH_ASSERT_AND_ASSIGN(auto txn, Transaction::Open(fs_, path), st);
+  BENCH_ASSERT_AND_ASSIGN(auto manifest, txn->GetManifest(), st);
+  auto cgs = std::make_shared<ColumnGroups>(manifest->columnGroups());
+  auto reader = Reader::create(cgs, schema_, needed_columns, properties_);
+  if (!reader) {
+    st.SkipWithError("Failed to create reader");
+    return;
+  }
 
   for (auto _ : st) {
     std::vector<std::thread> reader_threads;
-    std::atomic<int64_t> rows_read{0};
-    std::atomic<int64_t> bytes_read{0};
     std::atomic<bool> has_error{false};
 
-    // Launch N reader threads, each opens its own transaction
     for (int i = 0; i < num_readers; ++i) {
       reader_threads.emplace_back([&, i]() {
-        auto read_all = [&]() -> arrow::Status {
-          ARROW_ASSIGN_OR_RAISE(auto txn, Transaction::Open(fs_, path));
-          ARROW_ASSIGN_OR_RAISE(auto manifest, txn->GetManifest());
-          auto cgs = std::make_shared<ColumnGroups>(manifest->columnGroups());
-
-          auto reader = Reader::create(cgs, schema_, nullptr, properties_);
-          if (!reader)
-            return arrow::Status::Invalid("Failed to create reader");
-
-          ARROW_ASSIGN_OR_RAISE(auto batch_reader, reader->get_record_batch_reader());
-
-          std::shared_ptr<arrow::RecordBatch> rb;
-          while (true) {
-            ARROW_RETURN_NOT_OK(batch_reader->ReadNext(&rb));
-            if (!rb)
-              break;
-            rows_read += rb->num_rows();
-            bytes_read += CalculateRawDataSize(rb);
+        auto take_fn = [&]() -> arrow::Status {
+          auto result = reader->take(per_reader_indices[i], num_threads);
+          if (!result.ok()) {
+            return result.status();
           }
           return arrow::Status::OK();
         };
 
-        if (!read_all().ok()) {
+        if (!take_fn().ok()) {
           has_error = true;
         }
       });
     }
 
-    // Wait for all readers to complete
     for (auto& t : reader_threads) {
       t.join();
     }
 
     if (has_error) {
-      st.SkipWithError("Reader error in concurrent read");
+      st.SkipWithError("Take error in concurrent take");
       return;
     }
-
-    total_rows += rows_read.load();
-    total_bytes += bytes_read.load();
   }
 
-  thread_tracker.Stop();
-
-  ReportThroughput(st, total_bytes, total_rows);
+  int64_t total_takes = static_cast<int64_t>(num_readers) * static_cast<int64_t>(st.iterations());
+  st.counters["takes/s"] = ::benchmark::Counter(static_cast<double>(total_takes), ::benchmark::Counter::kIsRate);
   ReportFsMetrics(st);
-  thread_tracker.ReportToState(st);
-  st.counters["num_readers"] = ::benchmark::Counter(static_cast<double>(num_readers), ::benchmark::Counter::kDefaults);
-  st.counters["pool_size"] =
-      ::benchmark::Counter(static_cast<double>(thread_pool_size), ::benchmark::Counter::kDefaults);
-  st.SetLabel(std::string(StorageFormatTypeName(format_type)) + "/" + std::to_string(num_readers) + "readers/" +
-              std::to_string(thread_pool_size) + "pool");
+  std::string vec_label = skip_vector ? "/no_vec" : "";
+  st.SetLabel(std::string(StorageFormatTypeName(format_type)) + "/" + std::to_string(take_count) + "rows/" +
+              std::to_string(num_readers) + "readers/" + std::to_string(num_threads) + "pool" + vec_label);
 }
 
-BENCHMARK_REGISTER_F(StorageLayerFixture, MilvusStorage_MultiReader)
+BENCHMARK_REGISTER_F(StorageLayerFixture, MilvusStorage_MultiTake)
     ->ArgsProduct({
-        {0, 1},            // FormatType: parquet(0), vortex(1)
-        {1, 16, 64, 256},  // NumReaders: 1, 16, 64, 256
-        {1, 8, 16, 32}     // ThreadPoolSize: 1, 8, 16, 32
+        {0, 1},                      // FormatType: parquet(0), vortex(1)
+        {10},                        // TakeCount
+        {1, 16, 64, 128, 256, 512},  // NumReaders: 1, 16, 64, 128, 256, 512
+        {1, 16},                     // NumThreads: 1, 16
+        {0, 1}                       // SkipVector: 0=all columns, 1=skip vector columns
     })
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
