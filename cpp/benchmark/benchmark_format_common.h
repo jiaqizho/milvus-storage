@@ -504,9 +504,12 @@ class FormatBenchFixtureBase : public ::benchmark::Fixture {
   }
 
   // Create policy based on format:
-  // Both use SchemaBase policy (multiple column groups)
+  // Vortex=Single (one file, reduce IOPS), Parquet=SchemaBase (multiple column groups)
   arrow::Result<std::unique_ptr<api::ColumnGroupPolicy>> CreatePolicyForFormat(
       const std::string& patterns, const std::string& format, const std::shared_ptr<arrow::Schema>& schema) {
+    if (format == LOON_FORMAT_VORTEX) {
+      return CreateSinglePolicy(format, schema);
+    }
     return CreateSchemaBasePolicy(patterns, format, schema);
   }
 
