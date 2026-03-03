@@ -736,3 +736,17 @@ pub unsafe fn dataset_take(
     unsafe { std::ptr::write(out_stream_ptr, ffi_stream) };
     Ok(())
 }
+
+pub fn reset_lance_decode_metrics_ffi() {
+    lance_io::reset_lance_io_metrics();
+    lance_encoding::reset_lance_decode_ns();
+}
+
+pub fn get_lance_decode_metrics_ffi() -> crate::lance_ffi::LanceDecodeMetrics {
+    let io_ns = lance_io::get_lance_io_wait_ns();
+    let decode_ns = lance_encoding::get_lance_decode_ns();
+    crate::lance_ffi::LanceDecodeMetrics {
+        io_wait_ns: io_ns,
+        decode_ns,
+    }
+}

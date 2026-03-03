@@ -27,7 +27,9 @@
 
 #include <arrow/c/bridge.h>
 #include "format/bridge/rust/include/lance_bridge.h"
+#include "format/bridge/rust/include/vortex_bridge.h"
 #include "milvus-storage/format/lance/lance_common.h"
+#include "milvus-storage/format/parquet/parquet_format_reader.h"
 
 namespace milvus_storage {
 namespace benchmark {
@@ -124,8 +126,9 @@ class StorageLayerFixture : public FormatBenchFixtureBase<false> {
     ARROW_RETURN_NOT_OK(EnsureBatchesLoaded());
     std::string format = (format_type == StorageFormatType::PARQUET) ? LOON_FORMAT_PARQUET : LOON_FORMAT_VORTEX;
 
-    // Use Single policy for all formats (one column group per file)
-    ARROW_ASSIGN_OR_RAISE(auto policy, CreateSinglePolicy(format, schema_));
+    // Use format-specific policy: Vortex=Single, Parquet=SchemaBase
+    std::string patterns = "id|RowID|Timestamp,rcId|ccId|rbId|cbId,embedding";
+    ARROW_ASSIGN_OR_RAISE(auto policy, CreatePolicyForFormat(patterns, format, schema_));
 
     auto writer = Writer::create(path, schema_, std::move(policy), properties_);
     if (!writer)
@@ -537,11 +540,23 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_Take)(::benchmark::State& 
 
   ResetFsMetrics();
 
+  bool io_trace_printed = false;
   for (auto _ : st) {
+    // Enable IO trace for first iteration only (Vortex format)
+    if (!io_trace_printed && format_type == StorageFormatType::VORTEX) {
+      vortex::ResetIOTrace();
+    }
+
     auto result = reader->take(indices, num_threads);
     if (!result.ok()) {
       st.SkipWithError(result.status().message());
       return;
+    }
+
+    if (!io_trace_printed && format_type == StorageFormatType::VORTEX) {
+      vortex::PrintIOTrace();
+      vortex::DisableIOTrace();
+      io_trace_printed = true;
     }
   }
 
@@ -557,6 +572,86 @@ BENCHMARK_REGISTER_F(StorageLayerFixture, MilvusStorage_Take)
         {0, 1},           // FormatType: parquet(0), vortex(1)
         {1, 5, 10, 100},  // Take count
         {1, 4, 8, 16}     // Threads: 1, 4, 8, 16
+    })
+    ->Unit(::benchmark::kMillisecond)
+    ->UseRealTime();
+
+//=============================================================================
+// MilvusStorage Take Time Breakdown Benchmark
+// Reports total decode time summed across all threads for each format.
+//=============================================================================
+
+// Args: [format_type, take_count, num_threads]
+BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_TakeTimeBreakdown)(::benchmark::State& st) {
+  auto format_type = static_cast<StorageFormatType>(st.range(0));
+  size_t take_count = static_cast<size_t>(st.range(1));
+  int num_threads = static_cast<int>(st.range(2));
+
+  if (!CheckStorageFormatAvailable(st, format_type))
+    return;
+
+  ConfigureThreadPool(num_threads);
+
+  std::string path = GetCachedDataPath(StorageFormatTypeName(format_type));
+  BENCH_ASSERT_STATUS_OK(EnsureMilvusStorageData(format_type, path), st);
+
+  auto indices = GenerateRandomIndices(take_count, GetLoaderNumRows());
+
+  // Open transaction once and reuse across iterations
+  BENCH_ASSERT_AND_ASSIGN(auto txn, Transaction::Open(fs_, path), st);
+  BENCH_ASSERT_AND_ASSIGN(auto manifest, txn->GetManifest(), st);
+  auto cgs = std::make_shared<ColumnGroups>(manifest->columnGroups());
+
+  auto reader = Reader::create(cgs, schema_, nullptr, properties_);
+  if (!reader) {
+    st.SkipWithError("Failed to create reader");
+    return;
+  }
+
+  ResetFsMetrics();
+  if (format_type == StorageFormatType::VORTEX) {
+    vortex::ResetVortexDecodeMetrics();
+  } else if (format_type == StorageFormatType::PARQUET) {
+    parquet::ResetParquetDecodeMetrics();
+  }
+
+  for (auto _ : st) {
+    auto result = reader->take(indices, num_threads);
+    if (!result.ok()) {
+      st.SkipWithError(result.status().message());
+      return;
+    }
+  }
+
+  double iters = static_cast<double>(st.iterations());
+
+  // Report total decode time summed across all threads
+  if (format_type == StorageFormatType::VORTEX) {
+    auto vortex_metrics = vortex::GetVortexDecodeMetrics();
+    double decode_ms = static_cast<double>(vortex_metrics.decode_ns) / 1e6;
+    st.counters["decode_ms/iter"] = ::benchmark::Counter(decode_ms / iters, ::benchmark::Counter::kDefaults);
+    st.counters["decode_ms_total"] = ::benchmark::Counter(decode_ms, ::benchmark::Counter::kDefaults);
+  } else if (format_type == StorageFormatType::PARQUET) {
+    auto pq_metrics = parquet::GetParquetDecodeMetrics();
+    double io_decode_ms = static_cast<double>(pq_metrics.read_decode_ns) / 1e6;
+    double decode_ms = static_cast<double>(pq_metrics.decode_only_ns) / 1e6;
+    st.counters["io+decode_ms/iter"] = ::benchmark::Counter(io_decode_ms / iters, ::benchmark::Counter::kDefaults);
+    st.counters["decode_ms/iter"] = ::benchmark::Counter(decode_ms / iters, ::benchmark::Counter::kDefaults);
+    st.counters["decode_ms_total"] = ::benchmark::Counter(decode_ms, ::benchmark::Counter::kDefaults);
+  }
+
+  ReportFsMetrics(st);
+  st.counters["rows_taken"] = ::benchmark::Counter(static_cast<double>(take_count), ::benchmark::Counter::kDefaults);
+  st.counters["threads"] = ::benchmark::Counter(static_cast<double>(num_threads), ::benchmark::Counter::kDefaults);
+  st.SetLabel(std::string(StorageFormatTypeName(format_type)) + "/" + std::to_string(take_count) + "rows/" +
+              std::to_string(num_threads) + "T/breakdown");
+}
+
+BENCHMARK_REGISTER_F(StorageLayerFixture, MilvusStorage_TakeTimeBreakdown)
+    ->ArgsProduct({
+        {0, 1},   // FormatType: parquet(0), vortex(1)
+        {1, 10},  // Take count
+        {1}       // Threads: single thread only
     })
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
@@ -824,6 +919,89 @@ BENCHMARK_REGISTER_F(StorageLayerFixture, LanceNative_Take)
     ->ArgsProduct({
         {1, 5, 10, 100},  // Take count
         {1, 4, 8, 16}     // Threads: 1, 4, 8, 16
+    })
+    ->Unit(::benchmark::kMillisecond)
+    ->UseRealTime();
+
+//=============================================================================
+// Lance Native Take Time Breakdown Benchmark
+// Reports total decode time summed across all threads.
+//=============================================================================
+
+// Args: [take_count, num_threads]
+BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_TakeTimeBreakdown)(::benchmark::State& st) {
+  size_t take_count = static_cast<size_t>(st.range(0));
+  int num_threads = static_cast<int>(st.range(1));
+
+  lance::ReplaceLanceRuntime(static_cast<uint32_t>(num_threads));
+
+  std::string path = GetCachedDataPath("lance");
+
+  BENCH_ASSERT_AND_ASSIGN(auto lance_uri, BuildLanceUri(path), st);
+  auto storage_options = GetLanceStorageOptions();
+
+  BENCH_ASSERT_STATUS_OK(EnsureLanceData(lance_uri, storage_options, path), st);
+
+  auto indices = GenerateRandomIndices(take_count, GetLoaderNumRows());
+
+  auto dataset = lance::BlockingDataset::Open(lance_uri, storage_options);
+
+  auto take_lance = [&](bool collect_stats, int64_t& out_rows, int64_t& out_bytes) -> arrow::Status {
+    ArrowSchema c_schema;
+    ARROW_RETURN_NOT_OK(arrow::ExportSchema(*schema_, &c_schema));
+
+    auto stream = dataset->Take(indices, c_schema);
+
+    ARROW_ASSIGN_OR_RAISE(auto reader, arrow::ImportRecordBatchReader(&stream));
+
+    std::shared_ptr<arrow::RecordBatch> rb;
+    while (true) {
+      ARROW_RETURN_NOT_OK(reader->ReadNext(&rb));
+      if (!rb)
+        break;
+      if (collect_stats) {
+        out_rows += rb->num_rows();
+        out_bytes += CalculateRawDataSize(rb);
+      }
+    }
+    return arrow::Status::OK();
+  };
+
+  // Verify before benchmark loop
+  int64_t rows_per_iter = 0;
+  int64_t bytes_per_iter = 0;
+  BENCH_ASSERT_STATUS_OK(take_lance(true, rows_per_iter, bytes_per_iter), st);
+  BENCH_ASSERT_STATUS_OK(VerifyTakeResult("Lance", rows_per_iter, static_cast<int64_t>(take_count), bytes_per_iter),
+                         st);
+
+  ResetFsMetrics();
+  dataset->IOStatsIncremental();  // reset Lance IO counters
+  lance::ResetLanceDecodeMetrics();
+
+  for (auto _ : st) {
+    int64_t dummy_rows = 0, dummy_bytes = 0;
+    BENCH_ASSERT_STATUS_OK(take_lance(false, dummy_rows, dummy_bytes), st);
+  }
+
+  auto lance_io = dataset->IOStatsIncremental();
+  auto lance_decode = lance::GetLanceDecodeMetrics();
+  double iters = static_cast<double>(st.iterations());
+  double decode_ms = static_cast<double>(lance_decode.decode_ns) / 1e6;
+
+  // Report total decode time summed across all threads
+  st.counters["decode_ms/iter"] = ::benchmark::Counter(decode_ms / iters, ::benchmark::Counter::kDefaults);
+  st.counters["decode_ms_total"] = ::benchmark::Counter(decode_ms, ::benchmark::Counter::kDefaults);
+
+  ReportIOMetrics(st, lance_io.read_iops, lance_io.read_bytes);
+  st.counters["rows_taken"] = ::benchmark::Counter(static_cast<double>(take_count), ::benchmark::Counter::kDefaults);
+  st.counters["threads"] = ::benchmark::Counter(static_cast<double>(num_threads), ::benchmark::Counter::kDefaults);
+  st.SetLabel("lance/" + std::to_string(take_count) + "rows/" + std::to_string(num_threads) + "T/breakdown");
+}
+
+BENCHMARK_REGISTER_F(StorageLayerFixture, LanceNative_TakeTimeBreakdown)
+    ->ArgsProduct({
+        {1, 10},  // Take count
+        {1}       // Threads: single thread only
     })
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();

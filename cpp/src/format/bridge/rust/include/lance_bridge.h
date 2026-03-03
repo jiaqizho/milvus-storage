@@ -154,4 +154,19 @@ class BlockingScanner {
   rust::Box<ffi::BlockingScanner> impl_;
 };
 
+/// IO/decode time breakdown metrics for Lance
+struct LanceDecodeMetrics {
+  uint64_t io_wait_ns = 0;
+  uint64_t decode_ns = 0;
+};
+
+/// Reset the global Lance decode metrics counters to zero.
+inline void ResetLanceDecodeMetrics() { ffi::reset_lance_decode_metrics_ffi(); }
+
+/// Get the accumulated Lance decode metrics (IO wait and decode time in nanoseconds).
+inline LanceDecodeMetrics GetLanceDecodeMetrics() {
+  auto m = ffi::get_lance_decode_metrics_ffi();
+  return LanceDecodeMetrics{m.io_wait_ns, m.decode_ns};
+}
+
 }  // namespace milvus_storage::lance

@@ -727,3 +727,27 @@ pub(crate) unsafe fn scan_builder_into_stream(
     Ok(())
 }
 
+pub fn reset_vortex_decode_metrics_ffi() {
+    vortex_layout::reset_vortex_decode_metrics();
+}
+
+pub fn get_vortex_decode_metrics_ffi() -> crate::vortex_ffi::VortexDecodeMetrics {
+    let (io_ns, decode_ns) = vortex_layout::get_vortex_decode_metrics();
+    crate::vortex_ffi::VortexDecodeMetrics {
+        io_wait_ns: io_ns,
+        decode_ns,
+    }
+}
+
+pub fn reset_io_trace_ffi() {
+    crate::filesystem_c::reset_io_trace();
+}
+
+pub fn print_io_trace_ffi() {
+    crate::filesystem_c::print_io_trace();
+}
+
+pub fn disable_io_trace_ffi() {
+    crate::filesystem_c::disable_io_trace();
+}
+

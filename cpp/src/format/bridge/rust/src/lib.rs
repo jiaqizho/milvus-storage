@@ -146,6 +146,16 @@ pub mod lance_ffi {
             schema_ptr: *mut u8,
             out_stream: *mut u8,
         ) -> Result<()>;
+
+        // Decode metrics
+        fn reset_lance_decode_metrics_ffi();
+        fn get_lance_decode_metrics_ffi() -> LanceDecodeMetrics;
+    }
+
+    /// IO/decode time breakdown metrics for Lance
+    struct LanceDecodeMetrics {
+        io_wait_ns: u64,
+        decode_ns: u64,
     }
 }  // mod lance_ffi
 
@@ -232,6 +242,21 @@ pub mod vortex_ffi {
             builder: Box<VortexScanBuilder>,
             out_stream: *mut u8,
         ) -> Result<()>;
+
+        // Decode metrics
+        fn reset_vortex_decode_metrics_ffi();
+        fn get_vortex_decode_metrics_ffi() -> VortexDecodeMetrics;
+
+        // IO trace
+        fn reset_io_trace_ffi();
+        fn print_io_trace_ffi();
+        fn disable_io_trace_ffi();
+    }
+
+    /// IO/decode time breakdown metrics for Vortex
+    struct VortexDecodeMetrics {
+        io_wait_ns: u64,
+        decode_ns: u64,
     }
 
     #[repr(u8)]

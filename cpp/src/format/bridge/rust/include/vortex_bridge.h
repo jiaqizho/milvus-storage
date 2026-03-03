@@ -269,4 +269,28 @@ class ScanBuilder {
   rust::Box<ffi::VortexScanBuilder> impl_;
 };
 
+/// IO/decode time breakdown metrics for Vortex
+struct VortexDecodeMetrics {
+  uint64_t io_wait_ns = 0;
+  uint64_t decode_ns = 0;
+};
+
+/// Reset the global Vortex decode metrics counters to zero.
+inline void ResetVortexDecodeMetrics() { ffi::reset_vortex_decode_metrics_ffi(); }
+
+/// Get the accumulated Vortex decode metrics (IO wait and decode time in nanoseconds).
+inline VortexDecodeMetrics GetVortexDecodeMetrics() {
+  auto m = ffi::get_vortex_decode_metrics_ffi();
+  return VortexDecodeMetrics{m.io_wait_ns, m.decode_ns};
+}
+
+/// IO trace: enable tracing and reset state
+inline void ResetIOTrace() { ffi::reset_io_trace_ffi(); }
+
+/// IO trace: print collected trace to stderr
+inline void PrintIOTrace() { ffi::print_io_trace_ffi(); }
+
+/// IO trace: disable and clear
+inline void DisableIOTrace() { ffi::disable_io_trace_ffi(); }
+
 }  // namespace milvus_storage::vortex

@@ -26,6 +26,7 @@ arrow-schema = "56.2.0"
 # Vortex Ecosystem
 vortex = "0.56.0"
 vortex-io = { version = "0.56.0", features = ["tokio"] }
+vortex-layout = "0.56.0"
 
 # Lance Ecosystem
 lance = "1.0.0"
@@ -34,8 +35,63 @@ lance-index = "1.0.0"
 lance-io = "1.0.0"
 lance-table = "1.0.0"
 
+# Utility
+once_cell = "1.19"
+
 # CXX bridge
 cxx = "1.0.184"
 
 [build-dependencies]
 cxx-build = "1.0.184"
+
+[patch.crates-io]
+# Vortex (patched with IO/decode timing metrics)
+vortex = { path = "/tmp/vortex-patched/vortex" }
+vortex-alp = { path = "/tmp/vortex-patched/encodings/alp" }
+vortex-array = { path = "/tmp/vortex-patched/vortex-array" }
+vortex-btrblocks = { path = "/tmp/vortex-patched/vortex-btrblocks" }
+vortex-buffer = { path = "/tmp/vortex-patched/vortex-buffer" }
+vortex-bytebool = { path = "/tmp/vortex-patched/encodings/bytebool" }
+vortex-compute = { path = "/tmp/vortex-patched/vortex-compute" }
+vortex-datetime-parts = { path = "/tmp/vortex-patched/encodings/datetime-parts" }
+vortex-decimal-byte-parts = { path = "/tmp/vortex-patched/encodings/decimal-byte-parts" }
+vortex-dtype = { path = "/tmp/vortex-patched/vortex-dtype" }
+vortex-error = { path = "/tmp/vortex-patched/vortex-error" }
+vortex-fastlanes = { path = "/tmp/vortex-patched/encodings/fastlanes" }
+vortex-file = { path = "/tmp/vortex-patched/vortex-file" }
+vortex-flatbuffers = { path = "/tmp/vortex-patched/vortex-flatbuffers" }
+vortex-fsst = { path = "/tmp/vortex-patched/encodings/fsst" }
+vortex-gpu = { path = "/tmp/vortex-patched/vortex-gpu" }
+vortex-gpu-kernels = { path = "/tmp/vortex-patched/vortex-gpu-kernels" }
+vortex-io = { path = "/tmp/vortex-patched/vortex-io" }
+vortex-ipc = { path = "/tmp/vortex-patched/vortex-ipc" }
+vortex-layout = { path = "/tmp/vortex-patched/vortex-layout" }
+vortex-mask = { path = "/tmp/vortex-patched/vortex-mask" }
+vortex-metrics = { path = "/tmp/vortex-patched/vortex-metrics" }
+vortex-pco = { path = "/tmp/vortex-patched/encodings/pco" }
+vortex-proto = { path = "/tmp/vortex-patched/vortex-proto" }
+vortex-runend = { path = "/tmp/vortex-patched/encodings/runend" }
+vortex-scalar = { path = "/tmp/vortex-patched/vortex-scalar" }
+vortex-scan = { path = "/tmp/vortex-patched/vortex-scan" }
+vortex-sequence = { path = "/tmp/vortex-patched/encodings/sequence" }
+vortex-session = { path = "/tmp/vortex-patched/vortex-session" }
+vortex-sparse = { path = "/tmp/vortex-patched/encodings/sparse" }
+vortex-utils = { path = "/tmp/vortex-patched/vortex-utils" }
+vortex-vector = { path = "/tmp/vortex-patched/vortex-vector" }
+vortex-zigzag = { path = "/tmp/vortex-patched/encodings/zigzag" }
+vortex-zstd = { path = "/tmp/vortex-patched/encodings/zstd" }
+# Lance (patched with IO/decode timing metrics)
+lance = { path = "/tmp/lance-patched/rust/lance" }
+lance-arrow = { path = "/tmp/lance-patched/rust/lance-arrow" }
+lance-bitpacking = { path = "/tmp/lance-patched/rust/compression/bitpacking" }
+lance-core = { path = "/tmp/lance-patched/rust/lance-core" }
+lance-datafusion = { path = "/tmp/lance-patched/rust/lance-datafusion" }
+lance-datagen = { path = "/tmp/lance-patched/rust/lance-datagen" }
+lance-encoding = { path = "/tmp/lance-patched/rust/lance-encoding" }
+lance-file = { path = "/tmp/lance-patched/rust/lance-file" }
+lance-geo = { path = "/tmp/lance-patched/rust/lance-geo" }
+lance-index = { path = "/tmp/lance-patched/rust/lance-index" }
+lance-io = { path = "/tmp/lance-patched/rust/lance-io" }
+lance-linalg = { path = "/tmp/lance-patched/rust/lance-linalg" }
+lance-namespace = { path = "/tmp/lance-patched/rust/lance-namespace" }
+lance-table = { path = "/tmp/lance-patched/rust/lance-table" }
