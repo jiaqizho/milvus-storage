@@ -750,3 +750,15 @@ pub fn get_lance_decode_metrics_ffi() -> crate::lance_ffi::LanceDecodeMetrics {
         decode_ns,
     }
 }
+
+pub fn reset_lance_io_trace_ffi() {
+    lance_io::reset_lance_io_trace();
+}
+
+pub fn print_lance_io_trace_ffi() {
+    lance_io::print_lance_io_trace();
+}
+
+pub fn disable_lance_io_trace_ffi() {
+    lance_io::disable_lance_io_trace();
+}

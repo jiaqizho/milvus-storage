@@ -150,6 +150,11 @@ pub mod lance_ffi {
         // Decode metrics
         fn reset_lance_decode_metrics_ffi();
         fn get_lance_decode_metrics_ffi() -> LanceDecodeMetrics;
+
+        // IO trace
+        fn reset_lance_io_trace_ffi();
+        fn print_lance_io_trace_ffi();
+        fn disable_lance_io_trace_ffi();
     }
 
     /// IO/decode time breakdown metrics for Lance

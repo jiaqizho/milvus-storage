@@ -169,4 +169,13 @@ inline LanceDecodeMetrics GetLanceDecodeMetrics() {
   return LanceDecodeMetrics{m.io_wait_ns, m.decode_ns};
 }
 
+/// IO trace: enable tracing and reset state
+inline void ResetIOTrace() { ffi::reset_lance_io_trace_ffi(); }
+
+/// IO trace: print collected trace to stderr
+inline void PrintIOTrace() { ffi::print_lance_io_trace_ffi(); }
+
+/// IO trace: disable and clear
+inline void DisableIOTrace() { ffi::disable_lance_io_trace_ffi(); }
+
 }  // namespace milvus_storage::lance

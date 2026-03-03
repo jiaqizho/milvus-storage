@@ -37,6 +37,12 @@ namespace benchmark {
 using namespace milvus_storage::api;
 using namespace milvus_storage::api::transaction;
 
+/// Check if IO tracing is enabled via BENCH_IO_TRACE env var
+inline bool IsIOTraceEnabled() {
+  static const bool enabled = (std::getenv("BENCH_IO_TRACE") != nullptr);
+  return enabled;
+}
+
 //=============================================================================
 // Storage Format Types
 //=============================================================================
@@ -542,9 +548,13 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_Take)(::benchmark::State& 
 
   bool io_trace_printed = false;
   for (auto _ : st) {
-    // Enable IO trace for first iteration only (Vortex format)
-    if (!io_trace_printed && format_type == StorageFormatType::VORTEX) {
-      vortex::ResetIOTrace();
+    // Enable IO trace for first iteration when BENCH_IO_TRACE is set
+    if (!io_trace_printed && IsIOTraceEnabled()) {
+      if (format_type == StorageFormatType::VORTEX) {
+        vortex::ResetIOTrace();
+      } else if (format_type == StorageFormatType::PARQUET) {
+        // Parquet reads go through local filesystem metrics only (no per-request trace)
+      }
     }
 
     auto result = reader->take(indices, num_threads);
@@ -553,9 +563,11 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_Take)(::benchmark::State& 
       return;
     }
 
-    if (!io_trace_printed && format_type == StorageFormatType::VORTEX) {
-      vortex::PrintIOTrace();
-      vortex::DisableIOTrace();
+    if (!io_trace_printed && IsIOTraceEnabled()) {
+      if (format_type == StorageFormatType::VORTEX) {
+        vortex::PrintIOTrace();
+        vortex::DisableIOTrace();
+      }
       io_trace_printed = true;
     }
   }
@@ -615,11 +627,22 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_TakeTimeBreakdown)(::bench
     parquet::ResetParquetDecodeMetrics();
   }
 
+  bool io_trace_printed = false;
   for (auto _ : st) {
+    if (!io_trace_printed && IsIOTraceEnabled() && format_type == StorageFormatType::VORTEX) {
+      vortex::ResetIOTrace();
+    }
+
     auto result = reader->take(indices, num_threads);
     if (!result.ok()) {
       st.SkipWithError(result.status().message());
       return;
+    }
+
+    if (!io_trace_printed && IsIOTraceEnabled() && format_type == StorageFormatType::VORTEX) {
+      vortex::PrintIOTrace();
+      vortex::DisableIOTrace();
+      io_trace_printed = true;
     }
   }
 
@@ -716,11 +739,22 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_TakeScalarOnly)(::benchmar
     return;
   }
 
+  bool io_trace_printed = false;
   for (auto _ : st) {
+    if (!io_trace_printed && IsIOTraceEnabled() && format_type == StorageFormatType::VORTEX) {
+      vortex::ResetIOTrace();
+    }
+
     auto table_result = reader->take(indices, num_threads);
     if (!table_result.ok()) {
       st.SkipWithError(table_result.status().ToString().c_str());
       return;
+    }
+
+    if (!io_trace_printed && IsIOTraceEnabled() && format_type == StorageFormatType::VORTEX) {
+      vortex::PrintIOTrace();
+      vortex::DisableIOTrace();
+      io_trace_printed = true;
     }
   }
 
@@ -898,9 +932,21 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_Take)(::benchmark::State& st
   ResetFsMetrics();
   dataset->IOStatsIncremental();  // reset Lance IO counters
 
+  bool io_trace_printed = false;
   for (auto _ : st) {
+    // Enable IO trace for first iteration when BENCH_IO_TRACE is set
+    if (!io_trace_printed && IsIOTraceEnabled()) {
+      lance::ResetIOTrace();
+    }
+
     int64_t dummy_rows = 0, dummy_bytes = 0;
     BENCH_ASSERT_STATUS_OK(take_lance(false, dummy_rows, dummy_bytes), st);
+
+    if (!io_trace_printed && IsIOTraceEnabled()) {
+      lance::PrintIOTrace();
+      lance::DisableIOTrace();
+      io_trace_printed = true;
+    }
   }
 
   auto lance_io = dataset->IOStatsIncremental();
@@ -978,9 +1024,20 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_TakeTimeBreakdown)(::benchma
   dataset->IOStatsIncremental();  // reset Lance IO counters
   lance::ResetLanceDecodeMetrics();
 
+  bool io_trace_printed = false;
   for (auto _ : st) {
+    if (!io_trace_printed && IsIOTraceEnabled()) {
+      lance::ResetIOTrace();
+    }
+
     int64_t dummy_rows = 0, dummy_bytes = 0;
     BENCH_ASSERT_STATUS_OK(take_lance(false, dummy_rows, dummy_bytes), st);
+
+    if (!io_trace_printed && IsIOTraceEnabled()) {
+      lance::PrintIOTrace();
+      lance::DisableIOTrace();
+      io_trace_printed = true;
+    }
   }
 
   auto lance_io = dataset->IOStatsIncremental();
@@ -1086,9 +1143,20 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_TakeScalarOnly)(::benchmark:
   ResetFsMetrics();
   dataset->IOStatsIncremental();  // reset Lance IO counters
 
+  bool io_trace_printed = false;
   for (auto _ : st) {
+    if (!io_trace_printed && IsIOTraceEnabled()) {
+      lance::ResetIOTrace();
+    }
+
     int64_t dummy_rows = 0, dummy_bytes = 0;
     BENCH_ASSERT_STATUS_OK(take_lance(false, dummy_rows, dummy_bytes), st);
+
+    if (!io_trace_printed && IsIOTraceEnabled()) {
+      lance::PrintIOTrace();
+      lance::DisableIOTrace();
+      io_trace_printed = true;
+    }
   }
 
   auto lance_io = dataset->IOStatsIncremental();
