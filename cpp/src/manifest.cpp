@@ -40,6 +40,7 @@ struct codec_traits<milvus_storage::api::ColumnGroupFile> {
     avro::encode(e, file.start_index);
     avro::encode(e, file.end_index);
     avro::encode(e, file.metadata);
+    avro::encode(e, static_cast<int64_t>(file.file_size));
   }
 
   static void decode(Decoder& d, milvus_storage::api::ColumnGroupFile& file) {
@@ -47,6 +48,9 @@ struct codec_traits<milvus_storage::api::ColumnGroupFile> {
     avro::decode(d, file.start_index);
     avro::decode(d, file.end_index);
     avro::decode(d, file.metadata);
+    int64_t file_size_signed = 0;
+    avro::decode(d, file_size_signed);
+    file.file_size = static_cast<uint64_t>(file_size_signed);
   }
 };
 

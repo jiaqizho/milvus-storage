@@ -26,6 +26,7 @@ struct ColumnGroupFile {
   int64_t start_index;            ///< Start index of data in the file
   int64_t end_index;              ///< End index of data in the file
   std::vector<uint8_t> metadata;  ///< metadata for external table
+  uint64_t file_size;             ///< File size in bytes, used to skip S3 HEAD requests when opening files
 };
 
 /**

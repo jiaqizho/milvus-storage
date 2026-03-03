@@ -197,6 +197,7 @@ unsafe extern "C" {
         fs: *mut std::ffi::c_void,
         path_ptr: *const u8,
         path_len: u32,
+        file_size: u64,
         out_reader_ptr: *mut *mut std::ffi::c_void,
     ) -> LoonFFIResult;
 
@@ -348,7 +349,7 @@ pub struct ObjectStoreReadSourceCpp {
 }
 
 impl ObjectStoreReadSourceCpp {
-    pub fn new(fs_rawptr: *mut std::ffi::c_void, path: &str) -> VortexResult<Self> {
+    pub fn new(fs_rawptr: *mut std::ffi::c_void, path: &str, file_size: u64) -> VortexResult<Self> {
         let mut reader_raw: *mut c_void = std::ptr::null_mut();
         let path_bytes = path.as_bytes();
         unsafe {
@@ -356,6 +357,7 @@ impl ObjectStoreReadSourceCpp {
                 fs_rawptr,
                 path_bytes.as_ptr(),
                 path_bytes.len() as u32,
+                file_size,
                 &mut reader_raw,
             );
             check_loon_ffi_result(&mut result, "Failed to open reader in ObjectStoreReadSourceCpp")?;
