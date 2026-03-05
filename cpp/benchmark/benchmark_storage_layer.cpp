@@ -326,145 +326,56 @@ class StorageLayerFixture : public FormatBenchFixtureBase<false> {
   }
 
   //-----------------------------------------------------------------------
-  // Scalar-only data: filter out FixedSizeBinary/LIST vector columns
-  //-----------------------------------------------------------------------
-  arrow::Result<std::pair<std::shared_ptr<arrow::Schema>, std::vector<std::shared_ptr<arrow::RecordBatch>>>>
-  GetScalarOnlyData() {
-    ARROW_RETURN_NOT_OK(EnsureBatchesLoaded());
-    auto scalar_cols = GetScalarProjection();
-
-    std::vector<std::shared_ptr<arrow::Field>> fields;
-    std::vector<int> col_indices;
-    for (const auto& name : *scalar_cols) {
-      auto idx = schema_->GetFieldIndex(name);
-      if (idx >= 0) {
-        fields.push_back(schema_->field(idx));
-        col_indices.push_back(idx);
-      }
-    }
-    auto scalar_schema = arrow::schema(fields);
-
-    std::vector<std::shared_ptr<arrow::RecordBatch>> scalar_batches;
-    for (const auto& batch : batches_) {
-      std::vector<std::shared_ptr<arrow::Array>> arrays;
-      for (int idx : col_indices) {
-        arrays.push_back(batch->column(idx));
-      }
-      scalar_batches.push_back(arrow::RecordBatch::Make(scalar_schema, batch->num_rows(), arrays));
-    }
-    return std::make_pair(scalar_schema, std::move(scalar_batches));
-  }
-
-  arrow::Status WriteMilvusStorageScalarOnly(StorageFormatType format_type, const std::string& path) {
-    ARROW_ASSIGN_OR_RAISE(auto scalar_data, GetScalarOnlyData());
-    auto& scalar_schema = scalar_data.first;
-    auto& scalar_batches = scalar_data.second;
-    std::string format = (format_type == StorageFormatType::PARQUET) ? LOON_FORMAT_PARQUET : LOON_FORMAT_VORTEX;
-
-    // All scalar columns in one group (use regex OR '|' so they match a single pattern = one file)
-    std::string patterns;
-    for (int i = 0; i < scalar_schema->num_fields(); ++i) {
-      if (i > 0)
-        patterns += "|";
-      patterns += scalar_schema->field(i)->name();
-    }
-    ARROW_ASSIGN_OR_RAISE(auto policy, CreatePolicyForFormat(patterns, format, scalar_schema));
-
-    auto writer = Writer::create(path, scalar_schema, std::move(policy), properties_);
-    if (!writer)
-      return arrow::Status::Invalid("Failed to create writer");
-
-    for (const auto& batch : scalar_batches) {
-      ARROW_RETURN_NOT_OK(writer->write(batch));
-    }
-    ARROW_ASSIGN_OR_RAISE(auto cgs, writer->close());
-
-    ARROW_ASSIGN_OR_RAISE(auto txn, Transaction::Open(fs_, path));
-    txn->AppendFiles(*cgs);
-    ARROW_ASSIGN_OR_RAISE(auto version, txn->Commit());
-    return arrow::Status::OK();
-  }
-
-  arrow::Status EnsureMilvusStorageScalarOnlyData(StorageFormatType format_type, const std::string& path) {
-    auto txn_result = Transaction::Open(fs_, path);
-    if (txn_result.ok()) {
-      auto manifest_result = (*txn_result)->GetManifest();
-      if (manifest_result.ok() && !(*manifest_result)->columnGroups().empty()) {
-        return arrow::Status::OK();
-      }
-    }
-    ARROW_RETURN_NOT_OK(DeleteTestDir(fs_, path));
-    ARROW_RETURN_NOT_OK(CreateTestDir(fs_, path));
-    return WriteMilvusStorageScalarOnly(format_type, path);
-  }
-
-  arrow::Status WriteLanceDatasetScalarOnly(const std::string& lance_uri,
-                                            const lance::LanceStorageOptions& storage_options) {
-    ARROW_ASSIGN_OR_RAISE(auto scalar_data, GetScalarOnlyData());
-    auto& scalar_schema = scalar_data.first;
-    auto& scalar_batches = scalar_data.second;
-    ARROW_ASSIGN_OR_RAISE(auto batch_reader, arrow::RecordBatchReader::Make(scalar_batches, scalar_schema));
-
-    ArrowArrayStream stream;
-    ARROW_RETURN_NOT_OK(arrow::ExportRecordBatchReader(batch_reader, &stream));
-
-    try {
-      auto dataset = lance::BlockingDataset::WriteDataset(lance_uri, &stream, storage_options);
-    } catch (const lance::LanceException& e) {
-      return arrow::Status::IOError("Lance write failed: ", e.what());
-    }
-    return arrow::Status::OK();
-  }
-
-  arrow::Status EnsureLanceScalarOnlyData(const std::string& lance_uri,
-                                          const lance::LanceStorageOptions& storage_options,
-                                          const std::string& path) {
-    try {
-      auto dataset = lance::BlockingDataset::Open(lance_uri, storage_options);
-      if (!dataset->GetAllFragmentIds().empty()) {
-        return arrow::Status::OK();
-      }
-    } catch (...) {
-    }
-    ARROW_RETURN_NOT_OK(DeleteTestDir(fs_, path));
-    ARROW_RETURN_NOT_OK(CreateTestDir(fs_, path));
-    return WriteLanceDatasetScalarOnly(lance_uri, storage_options);
-  }
-
-  //-----------------------------------------------------------------------
   // Column Group Projection Helper
   //-----------------------------------------------------------------------
   struct ProjectionInfo {
     std::shared_ptr<std::vector<std::string>> columns;  // nullptr = all columns
     std::shared_ptr<arrow::Schema> schema;
+    std::string label;
   };
 
-  // Build projection from column group index.
-  // cg_index < 0: all columns (returns nullptr columns + full schema)
-  // cg_index >= 0: columns from specified column group (requires CUSTOM_SEGMENT_PATH)
-  ProjectionInfo BuildCGProjection(int cg_index, ::benchmark::State& st) {
-    if (cg_index < 0) {
-      return {nullptr, schema_};
+  // Build projection from BENCH_CG_INDEX and/or BENCH_PROJ_COL_INDEX env vars.
+  // Priority: BENCH_PROJ_COL_INDEX > BENCH_CG_INDEX > all columns
+  ProjectionInfo BuildProjection(::benchmark::State& st) {
+    // Single column projection via BENCH_PROJ_COL_INDEX
+    if (auto* env = std::getenv("BENCH_PROJ_COL_INDEX")) {
+      int col_index = std::atoi(env);
+      if (col_index < 0 || col_index >= schema_->num_fields()) {
+        st.SkipWithError(("BENCH_PROJ_COL_INDEX=" + std::to_string(col_index) + " out of range [0," +
+                          std::to_string(schema_->num_fields()) + ")")
+                             .c_str());
+        return {nullptr, nullptr, ""};
+      }
+      auto field = schema_->field(col_index);
+      auto columns = std::make_shared<std::vector<std::string>>(std::vector<std::string>{field->name()});
+      return {columns, arrow::schema({field}), "/col=" + field->name()};
     }
-    auto* loader = GetDataLoader();
-    if (loader->GetNumColumnGroups() == 0) {
-      std::cerr << "[BENCH] Column group projection requires CUSTOM_SEGMENT_PATH; using all columns" << std::endl;
-      return {nullptr, schema_};
+
+    // Column group projection via BENCH_CG_INDEX
+    int cg_index = GetCGIndexFromEnv();
+    if (cg_index >= 0) {
+      auto* loader = GetDataLoader();
+      if (loader->GetNumColumnGroups() == 0) {
+        std::cerr << "[BENCH] Column group projection requires CUSTOM_SEGMENT_PATH; using all columns" << std::endl;
+        return {nullptr, schema_, ""};
+      }
+      auto columns = loader->GetColumnGroupProjection(static_cast<size_t>(cg_index));
+      if (!columns) {
+        st.SkipWithError(("Column group index " + std::to_string(cg_index) + " out of range [0," +
+                          std::to_string(loader->GetNumColumnGroups()) + ")")
+                             .c_str());
+        return {nullptr, nullptr, ""};
+      }
+      std::vector<std::shared_ptr<arrow::Field>> fields;
+      for (const auto& name : *columns) {
+        auto field = schema_->GetFieldByName(name);
+        if (field)
+          fields.push_back(field);
+      }
+      return {columns, arrow::schema(fields), "/cg" + std::to_string(cg_index)};
     }
-    auto columns = loader->GetColumnGroupProjection(static_cast<size_t>(cg_index));
-    if (!columns) {
-      st.SkipWithError(("Column group index " + std::to_string(cg_index) + " out of range [0," +
-                        std::to_string(loader->GetNumColumnGroups()) + ")")
-                           .c_str());
-      return {nullptr, nullptr};
-    }
-    std::vector<std::shared_ptr<arrow::Field>> fields;
-    for (const auto& name : *columns) {
-      auto field = schema_->GetFieldByName(name);
-      if (field)
-        fields.push_back(field);
-    }
-    return {columns, arrow::schema(fields)};
+
+    return {nullptr, schema_, ""};
   }
 
   // Read CG index from BENCH_CG_INDEX environment variable
@@ -475,13 +386,6 @@ class StorageLayerFixture : public FormatBenchFixtureBase<false> {
       return -1;
     return std::atoi(env);
   }
-
-  std::string CGLabel(int cg_index) {
-    if (cg_index < 0)
-      return "";
-    return "/cg" + std::to_string(cg_index);
-  }
-
   std::shared_ptr<arrow::Schema> schema_;
 };
 
@@ -545,6 +449,11 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_OpenRead)(::benchmark::Sta
   BENCH_ASSERT_STATUS_OK(ReadMilvusStorageWithStats(path, rows_per_iter, bytes_per_iter), st);
 
   ResetFsMetrics();
+  if (format_type == StorageFormatType::VORTEX) {
+    vortex::ResetVortexDecodeMetrics();
+  } else if (format_type == StorageFormatType::PARQUET) {
+    parquet::ResetParquetDecodeMetrics();
+  }
 
   for (auto _ : st) {
     BENCH_ASSERT_STATUS_OK(ReadMilvusStorage(path), st);
@@ -555,6 +464,24 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_OpenRead)(::benchmark::Sta
   int64_t total_bytes = bytes_per_iter * static_cast<int64_t>(st.iterations());
   ReportThroughput(st, total_bytes, total_rows);
   ReportFsMetrics(st);
+
+  double iters = static_cast<double>(st.iterations());
+  if (format_type == StorageFormatType::VORTEX) {
+    auto vortex_metrics = vortex::GetVortexDecodeMetrics();
+    double decode_ms = static_cast<double>(vortex_metrics.decode_ns) / 1e6;
+    double io_wait_ms = static_cast<double>(vortex_metrics.io_wait_ns) / 1e6;
+    st.counters["decode_ms/iter"] = ::benchmark::Counter(decode_ms / iters, ::benchmark::Counter::kDefaults);
+    st.counters["decode_ms_total"] = ::benchmark::Counter(decode_ms, ::benchmark::Counter::kDefaults);
+    st.counters["io_wait_ms/iter"] = ::benchmark::Counter(io_wait_ms / iters, ::benchmark::Counter::kDefaults);
+  } else if (format_type == StorageFormatType::PARQUET) {
+    auto pq_metrics = parquet::GetParquetDecodeMetrics();
+    double io_decode_ms = static_cast<double>(pq_metrics.read_decode_ns) / 1e6;
+    double decode_ms = static_cast<double>(pq_metrics.decode_only_ns) / 1e6;
+    st.counters["io+decode_ms/iter"] = ::benchmark::Counter(io_decode_ms / iters, ::benchmark::Counter::kDefaults);
+    st.counters["decode_ms/iter"] = ::benchmark::Counter(decode_ms / iters, ::benchmark::Counter::kDefaults);
+    st.counters["decode_ms_total"] = ::benchmark::Counter(decode_ms, ::benchmark::Counter::kDefaults);
+  }
+
   st.counters["threads"] = ::benchmark::Counter(static_cast<double>(num_threads), ::benchmark::Counter::kDefaults);
   st.SetLabel(std::string(StorageFormatTypeName(format_type)) + "/" + GetDataDescription() + "/" +
               std::to_string(num_threads) + "T");
@@ -584,10 +511,9 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_Take)(::benchmark::State& 
 
   ConfigureThreadPool(num_threads);
 
-  // Build projection from BENCH_CG_INDEX env var
-  int cg_index = GetCGIndexFromEnv();
-  auto proj = BuildCGProjection(cg_index, st);
-  if (cg_index >= 0 && !proj.columns)
+  // Build projection from env vars (BENCH_PROJ_COL_INDEX or BENCH_CG_INDEX)
+  auto proj = BuildProjection(st);
+  if (!proj.schema)
     return;
 
   std::string path = GetCachedDataPath(StorageFormatTypeName(format_type));
@@ -637,7 +563,7 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_Take)(::benchmark::State& 
   st.counters["rows_taken"] = ::benchmark::Counter(static_cast<double>(take_count), ::benchmark::Counter::kDefaults);
   st.counters["threads"] = ::benchmark::Counter(static_cast<double>(num_threads), ::benchmark::Counter::kDefaults);
   st.SetLabel(std::string(StorageFormatTypeName(format_type)) + "/" + std::to_string(take_count) + "rows/" +
-              std::to_string(num_threads) + "T" + CGLabel(cg_index));
+              std::to_string(num_threads) + "T" + proj.label);
 }
 
 BENCHMARK_REGISTER_F(StorageLayerFixture, MilvusStorage_Take)
@@ -675,7 +601,26 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_TakeTimeBreakdown)(::bench
   BENCH_ASSERT_AND_ASSIGN(auto manifest, txn->GetManifest(), st);
   auto cgs = std::make_shared<ColumnGroups>(manifest->columnGroups());
 
-  auto reader = Reader::create(cgs, schema_, nullptr, properties_);
+  // Optional single-column projection via BENCH_PROJ_COL_INDEX env var
+  std::shared_ptr<arrow::Schema> read_schema = schema_;
+  std::shared_ptr<std::vector<std::string>> proj_columns = nullptr;
+  std::string proj_label;
+
+  if (auto* env = std::getenv("BENCH_PROJ_COL_INDEX")) {
+    int col_index = std::atoi(env);
+    if (col_index < 0 || col_index >= schema_->num_fields()) {
+      st.SkipWithError(("BENCH_PROJ_COL_INDEX=" + std::to_string(col_index) + " out of range [0," +
+                        std::to_string(schema_->num_fields()) + ")")
+                           .c_str());
+      return;
+    }
+    auto field = schema_->field(col_index);
+    read_schema = arrow::schema({field});
+    proj_columns = std::make_shared<std::vector<std::string>>(std::vector<std::string>{field->name()});
+    proj_label = "/col=" + field->name();
+  }
+
+  auto reader = Reader::create(cgs, read_schema, proj_columns, properties_);
   if (!reader) {
     st.SkipWithError("Failed to create reader");
     return;
@@ -710,7 +655,7 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_TakeTimeBreakdown)(::bench
   st.counters["rows_taken"] = ::benchmark::Counter(static_cast<double>(take_count), ::benchmark::Counter::kDefaults);
   st.counters["threads"] = ::benchmark::Counter(static_cast<double>(num_threads), ::benchmark::Counter::kDefaults);
   st.SetLabel(std::string(StorageFormatTypeName(format_type)) + "/" + std::to_string(take_count) + "rows/" +
-              std::to_string(num_threads) + "T/breakdown");
+              std::to_string(num_threads) + "T/breakdown" + proj_label);
 }
 
 BENCHMARK_REGISTER_F(StorageLayerFixture, MilvusStorage_TakeTimeBreakdown)
@@ -718,98 +663,6 @@ BENCHMARK_REGISTER_F(StorageLayerFixture, MilvusStorage_TakeTimeBreakdown)
         {0, 1},   // FormatType: parquet(0), vortex(1)
         {1, 10},  // Take count
         {1}       // Threads: single thread only
-    })
-    ->Unit(::benchmark::kMillisecond)
-    ->UseRealTime();
-
-//=============================================================================
-// MilvusStorage Take (No Transaction, Single Column Projection) Benchmark
-// Projects single column by BENCH_PROJ_COL_INDEX env var (default 0)
-//=============================================================================
-
-// Args: [format_type]
-BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_TakeScalarOnly)(::benchmark::State& st) {
-  auto format_type = static_cast<StorageFormatType>(st.range(0));
-  size_t take_count = 1;
-  if (auto* env = std::getenv("BENCH_TAKE_COUNT")) {
-    take_count = static_cast<size_t>(std::atoi(env));
-  }
-  constexpr int num_threads = 1;
-
-  if (!CheckStorageFormatAvailable(st, format_type))
-    return;
-
-  ConfigureThreadPool(num_threads);
-
-  // Write scalar-only data (excludes FixedSizeBinary/LIST vector columns)
-  std::string format_suffix = std::string(StorageFormatTypeName(format_type)) + "_scalar";
-  std::string path = GetCachedDataPath(format_suffix);
-  BENCH_ASSERT_STATUS_OK(EnsureMilvusStorageScalarOnlyData(format_type, path), st);
-
-  // Pre-cache ColumnGroups (transaction happens here, outside benchmark loop)
-  BENCH_ASSERT_AND_ASSIGN(auto cgs, LoadColumnGroups(path), st);
-
-  auto indices = GenerateRandomIndices(take_count, GetLoaderNumRows());
-
-  // Get scalar-only columns (excludes FixedSizeBinary/LIST vector columns)
-  auto scalar_cols = GetScalarProjection();
-  if (scalar_cols->empty()) {
-    st.SkipWithError("No scalar columns available");
-    return;
-  }
-
-  // Get projection column index from env (indexes into scalar columns)
-  int col_index = 0;
-  if (auto* env = std::getenv("BENCH_PROJ_COL_INDEX")) {
-    col_index = std::atoi(env);
-  }
-  if (col_index < 0 || col_index >= static_cast<int>(scalar_cols->size())) {
-    st.SkipWithError(("BENCH_PROJ_COL_INDEX=" + std::to_string(col_index) + " out of range [0," +
-                      std::to_string(scalar_cols->size()) + ")")
-                         .c_str());
-    return;
-  }
-  auto col_name = (*scalar_cols)[col_index];
-  auto proj_field = schema_->GetFieldByName(col_name);
-  auto proj_schema = arrow::schema({proj_field});
-  auto proj_columns = std::make_shared<std::vector<std::string>>(std::vector<std::string>{col_name});
-
-  ResetFsMetrics();
-
-  auto reader = Reader::create(cgs, proj_schema, proj_columns, properties_);
-  if (!reader) {
-    st.SkipWithError("Failed to create reader");
-    return;
-  }
-
-  bool io_trace_printed = false;
-  for (auto _ : st) {
-    if (!io_trace_printed && IsIOTraceEnabled() && format_type == StorageFormatType::VORTEX) {
-      vortex::ResetIOTrace();
-    }
-
-    auto table_result = reader->take(indices, num_threads);
-    if (!table_result.ok()) {
-      st.SkipWithError(table_result.status().ToString().c_str());
-      return;
-    }
-
-    if (!io_trace_printed && IsIOTraceEnabled() && format_type == StorageFormatType::VORTEX) {
-      vortex::PrintIOTrace();
-      vortex::DisableIOTrace();
-      io_trace_printed = true;
-    }
-  }
-
-  ReportFsMetrics(st);
-  st.counters["rows_taken"] = ::benchmark::Counter(static_cast<double>(take_count), ::benchmark::Counter::kDefaults);
-  st.SetLabel(std::string(StorageFormatTypeName(format_type)) + "/col=" + col_name + "/" + std::to_string(take_count) +
-              "rows/1T");
-}
-
-BENCHMARK_REGISTER_F(StorageLayerFixture, MilvusStorage_TakeScalarOnly)
-    ->ArgsProduct({
-        {0, 1}  // FormatType: parquet(0), vortex(1)
     })
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
@@ -895,6 +748,7 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_OpenRead)(::benchmark::State
 
   ResetFsMetrics();
   dataset->IOStatsIncremental();  // reset Lance IO counters
+  lance::ResetLanceDecodeMetrics();
 
   for (auto _ : st) {
     int64_t dummy_rows = 0, dummy_bytes = 0;
@@ -902,12 +756,17 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_OpenRead)(::benchmark::State
   }
 
   auto lance_io = dataset->IOStatsIncremental();
+  auto lance_decode = lance::GetLanceDecodeMetrics();
+  double iters = static_cast<double>(st.iterations());
+  double decode_ms = static_cast<double>(lance_decode.decode_ns) / 1e6;
 
   // Calculate totals using iteration count
   int64_t total_rows = rows_per_iter * static_cast<int64_t>(st.iterations());
   int64_t total_bytes = bytes_per_iter * static_cast<int64_t>(st.iterations());
   ReportThroughput(st, total_bytes, total_rows);
   ReportIOMetrics(st, lance_io.read_iops, lance_io.read_bytes);
+  st.counters["decode_ms/iter"] = ::benchmark::Counter(decode_ms / iters, ::benchmark::Counter::kDefaults);
+  st.counters["decode_ms_total"] = ::benchmark::Counter(decode_ms, ::benchmark::Counter::kDefaults);
   st.counters["threads"] = ::benchmark::Counter(static_cast<double>(num_threads), ::benchmark::Counter::kDefaults);
   st.SetLabel("lance/" + GetDataDescription() + "/" + std::to_string(num_threads) + "T");
 }
@@ -928,10 +787,9 @@ BENCHMARK_REGISTER_F(StorageLayerFixture, LanceNative_OpenRead)
 BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_Take)(::benchmark::State& st) {
   size_t take_count = static_cast<size_t>(st.range(0));
 
-  // Build projection from BENCH_CG_INDEX env var
-  int cg_index = GetCGIndexFromEnv();
-  auto proj = BuildCGProjection(cg_index, st);
-  if (cg_index >= 0 && !proj.columns)
+  // Build projection from env vars (BENCH_PROJ_COL_INDEX or BENCH_CG_INDEX)
+  auto proj = BuildProjection(st);
+  if (!proj.schema)
     return;
 
   std::string path = GetCachedDataPath("lance");
@@ -1004,7 +862,7 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_Take)(::benchmark::State& st
   ReportThroughput(st, total_bytes, total_rows);
   ReportIOMetrics(st, lance_io.read_iops, lance_io.read_bytes);
   st.counters["rows_taken"] = ::benchmark::Counter(static_cast<double>(take_count), ::benchmark::Counter::kDefaults);
-  st.SetLabel("lance/" + std::to_string(take_count) + "rows" + CGLabel(cg_index));
+  st.SetLabel("lance/" + std::to_string(take_count) + "rows" + proj.label);
 }
 
 BENCHMARK_REGISTER_F(StorageLayerFixture, LanceNative_Take)
@@ -1035,11 +893,28 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_TakeTimeBreakdown)(::benchma
 
   auto indices = GenerateRandomIndices(take_count, GetLoaderNumRows());
 
+  // Optional single-column projection via BENCH_PROJ_COL_INDEX env var
+  std::shared_ptr<arrow::Schema> proj_schema = schema_;
+  std::string proj_label;
+
+  if (auto* env = std::getenv("BENCH_PROJ_COL_INDEX")) {
+    int col_index = std::atoi(env);
+    if (col_index < 0 || col_index >= schema_->num_fields()) {
+      st.SkipWithError(("BENCH_PROJ_COL_INDEX=" + std::to_string(col_index) + " out of range [0," +
+                        std::to_string(schema_->num_fields()) + ")")
+                           .c_str());
+      return;
+    }
+    auto field = schema_->field(col_index);
+    proj_schema = arrow::schema({field});
+    proj_label = "/col=" + field->name();
+  }
+
   auto dataset = lance::BlockingDataset::Open(lance_uri, storage_options);
 
   auto take_lance = [&](bool collect_stats, int64_t& out_rows, int64_t& out_bytes) -> arrow::Status {
     ArrowSchema c_schema;
-    ARROW_RETURN_NOT_OK(arrow::ExportSchema(*schema_, &c_schema));
+    ARROW_RETURN_NOT_OK(arrow::ExportSchema(*proj_schema, &c_schema));
 
     auto stream = dataset->Take(indices, c_schema);
 
@@ -1092,7 +967,8 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_TakeTimeBreakdown)(::benchma
   ReportIOMetrics(st, lance_io.read_iops, lance_io.read_bytes);
   st.counters["rows_taken"] = ::benchmark::Counter(static_cast<double>(take_count), ::benchmark::Counter::kDefaults);
   st.counters["threads"] = ::benchmark::Counter(static_cast<double>(num_threads), ::benchmark::Counter::kDefaults);
-  st.SetLabel("lance/" + std::to_string(take_count) + "rows/" + std::to_string(num_threads) + "T/breakdown");
+  st.SetLabel("lance/" + std::to_string(take_count) + "rows/" + std::to_string(num_threads) + "T/breakdown" +
+              proj_label);
 }
 
 BENCHMARK_REGISTER_F(StorageLayerFixture, LanceNative_TakeTimeBreakdown)
@@ -1102,114 +978,6 @@ BENCHMARK_REGISTER_F(StorageLayerFixture, LanceNative_TakeTimeBreakdown)
     })
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
-
-//=============================================================================
-// Lance Native Take (Single Column Projection) Benchmark
-// Projects single column by BENCH_PROJ_COL_INDEX env var (default 0)
-//=============================================================================
-
-BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_TakeScalarOnly)(::benchmark::State& st) {
-  size_t take_count = 1;
-  if (auto* env = std::getenv("BENCH_TAKE_COUNT")) {
-    take_count = static_cast<size_t>(std::atoi(env));
-  }
-  constexpr int num_threads = 1;
-
-  lance::ReplaceLanceRuntime(static_cast<uint32_t>(num_threads));
-
-  // Write scalar-only data (excludes FixedSizeBinary/LIST vector columns)
-  std::string path = GetCachedDataPath("lance_scalar");
-
-  BENCH_ASSERT_AND_ASSIGN(auto lance_uri, BuildLanceUri(path), st);
-  auto storage_options = GetLanceStorageOptions();
-
-  BENCH_ASSERT_STATUS_OK(EnsureLanceScalarOnlyData(lance_uri, storage_options, path), st);
-
-  auto indices = GenerateRandomIndices(take_count, GetLoaderNumRows());
-
-  // Get scalar-only columns (excludes FixedSizeBinary/LIST vector columns)
-  auto scalar_cols = GetScalarProjection();
-  if (scalar_cols->empty()) {
-    st.SkipWithError("No scalar columns available");
-    return;
-  }
-
-  // Get projection column index from env (indexes into scalar columns)
-  int col_index = 0;
-  if (auto* env = std::getenv("BENCH_PROJ_COL_INDEX")) {
-    col_index = std::atoi(env);
-  }
-  if (col_index < 0 || col_index >= static_cast<int>(scalar_cols->size())) {
-    st.SkipWithError(("BENCH_PROJ_COL_INDEX=" + std::to_string(col_index) + " out of range [0," +
-                      std::to_string(scalar_cols->size()) + ")")
-                         .c_str());
-    return;
-  }
-  auto col_name = (*scalar_cols)[col_index];
-  auto proj_field = schema_->GetFieldByName(col_name);
-  auto proj_schema = arrow::schema({proj_field});
-
-  // Open dataset once and reuse across iterations
-  auto dataset = lance::BlockingDataset::Open(lance_uri, storage_options);
-
-  auto take_lance = [&](bool collect_stats, int64_t& out_rows, int64_t& out_bytes) -> arrow::Status {
-    ArrowSchema c_schema;
-    ARROW_RETURN_NOT_OK(arrow::ExportSchema(*proj_schema, &c_schema));
-
-    auto stream = dataset->Take(indices, c_schema);
-
-    ARROW_ASSIGN_OR_RAISE(auto reader, arrow::ImportRecordBatchReader(&stream));
-
-    std::shared_ptr<arrow::RecordBatch> rb;
-    while (true) {
-      ARROW_RETURN_NOT_OK(reader->ReadNext(&rb));
-      if (!rb)
-        break;
-      if (collect_stats) {
-        out_rows += rb->num_rows();
-        out_bytes += CalculateRawDataSize(rb);
-      }
-    }
-    return arrow::Status::OK();
-  };
-
-  // Verify before benchmark loop
-  int64_t rows_per_iter = 0;
-  int64_t bytes_per_iter = 0;
-  BENCH_ASSERT_STATUS_OK(take_lance(true, rows_per_iter, bytes_per_iter), st);
-  BENCH_ASSERT_STATUS_OK(
-      VerifyTakeResult("Lance(proj)", rows_per_iter, static_cast<int64_t>(take_count), bytes_per_iter), st);
-
-  ResetFsMetrics();
-  dataset->IOStatsIncremental();  // reset Lance IO counters
-
-  bool io_trace_printed = false;
-  for (auto _ : st) {
-    if (!io_trace_printed && IsIOTraceEnabled()) {
-      lance::ResetIOTrace();
-    }
-
-    int64_t dummy_rows = 0, dummy_bytes = 0;
-    BENCH_ASSERT_STATUS_OK(take_lance(false, dummy_rows, dummy_bytes), st);
-
-    if (!io_trace_printed && IsIOTraceEnabled()) {
-      lance::PrintIOTrace();
-      lance::DisableIOTrace();
-      io_trace_printed = true;
-    }
-  }
-
-  auto lance_io = dataset->IOStatsIncremental();
-
-  int64_t total_rows = rows_per_iter * static_cast<int64_t>(st.iterations());
-  int64_t total_bytes = bytes_per_iter * static_cast<int64_t>(st.iterations());
-  ReportThroughput(st, total_bytes, total_rows);
-  ReportIOMetrics(st, lance_io.read_iops, lance_io.read_bytes);
-  st.counters["rows_taken"] = ::benchmark::Counter(static_cast<double>(take_count), ::benchmark::Counter::kDefaults);
-  st.SetLabel("lance/col=" + col_name + "/" + std::to_string(take_count) + "rows/1T");
-}
-
-BENCHMARK_REGISTER_F(StorageLayerFixture, LanceNative_TakeScalarOnly)->Unit(::benchmark::kMillisecond)->UseRealTime();
 
 // Typical: Lance benchmarks
 BENCHMARK_REGISTER_F(StorageLayerFixture, LanceNative_WriteCommit)
@@ -1241,15 +1009,13 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_MultiTake)(::benchmark::Stat
   int num_readers = static_cast<int>(st.range(1));
   bool skip_vector = static_cast<bool>(st.range(2));
 
-  // Build projection: BENCH_CG_INDEX overrides skip_vector when set
-  int cg_index = GetCGIndexFromEnv();
-  auto proj_schema = schema_;
-  if (cg_index >= 0) {
-    auto proj = BuildCGProjection(cg_index, st);
-    if (!proj.columns)
-      return;
-    proj_schema = proj.schema;
-  } else if (skip_vector) {
+  // Build projection: BENCH_PROJ_COL_INDEX > BENCH_CG_INDEX > skip_vector > all columns
+  auto proj = BuildProjection(st);
+  if (!proj.schema)
+    return;
+  auto proj_schema = proj.schema;
+  std::string proj_label = proj.label;
+  if (proj_label.empty() && skip_vector) {
     std::vector<std::shared_ptr<arrow::Field>> scalar_fields;
     for (const auto& field : schema_->fields()) {
       if (field->type()->id() != arrow::Type::FIXED_SIZE_LIST &&
@@ -1258,6 +1024,7 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_MultiTake)(::benchmark::Stat
       }
     }
     proj_schema = arrow::schema(scalar_fields);
+    proj_label = "/no_vec";
   }
 
   std::string path = GetCachedDataPath("lance");
@@ -1319,12 +1086,6 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, LanceNative_MultiTake)(::benchmark::Stat
 
   int64_t total_takes = static_cast<int64_t>(num_readers) * static_cast<int64_t>(st.iterations());
   st.counters["takes/s"] = ::benchmark::Counter(static_cast<double>(total_takes), ::benchmark::Counter::kIsRate);
-  std::string proj_label;
-  if (cg_index >= 0) {
-    proj_label = "/cg" + std::to_string(cg_index);
-  } else if (skip_vector) {
-    proj_label = "/no_vec";
-  }
   st.SetLabel("lance/" + std::to_string(take_count) + "rows/" + std::to_string(num_readers) + "readers" + proj_label);
 }
 
@@ -1354,15 +1115,13 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_MultiTake)(::benchmark::St
   if (!CheckStorageFormatAvailable(st, format_type))
     return;
 
-  // Build needed_columns: BENCH_CG_INDEX overrides skip_vector when set
-  int cg_index = GetCGIndexFromEnv();
-  std::shared_ptr<std::vector<std::string>> needed_columns;
-  if (cg_index >= 0) {
-    auto proj = BuildCGProjection(cg_index, st);
-    if (!proj.columns)
-      return;
-    needed_columns = proj.columns;
-  } else if (skip_vector) {
+  // Build needed_columns: BENCH_PROJ_COL_INDEX > BENCH_CG_INDEX > skip_vector > all columns
+  auto proj = BuildProjection(st);
+  if (!proj.schema)
+    return;
+  std::shared_ptr<std::vector<std::string>> needed_columns = proj.columns;
+  std::string proj_label = proj.label;
+  if (proj_label.empty() && skip_vector) {
     needed_columns = std::make_shared<std::vector<std::string>>();
     for (const auto& field : schema_->fields()) {
       if (field->type()->id() != arrow::Type::FIXED_SIZE_LIST &&
@@ -1370,6 +1129,7 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_MultiTake)(::benchmark::St
         needed_columns->push_back(field->name());
       }
     }
+    proj_label = "/no_vec";
   }
 
   ConfigureThreadPool(num_threads);
@@ -1426,12 +1186,6 @@ BENCHMARK_DEFINE_F(StorageLayerFixture, MilvusStorage_MultiTake)(::benchmark::St
   int64_t total_takes = static_cast<int64_t>(num_readers) * static_cast<int64_t>(st.iterations());
   st.counters["takes/s"] = ::benchmark::Counter(static_cast<double>(total_takes), ::benchmark::Counter::kIsRate);
   ReportFsMetrics(st);
-  std::string proj_label;
-  if (cg_index >= 0) {
-    proj_label = "/cg" + std::to_string(cg_index);
-  } else if (skip_vector) {
-    proj_label = "/no_vec";
-  }
   st.SetLabel(std::string(StorageFormatTypeName(format_type)) + "/" + std::to_string(take_count) + "rows/" +
               std::to_string(num_readers) + "readers/" + std::to_string(num_threads) + "pool" + proj_label);
 }
