@@ -66,9 +66,6 @@ class FormatWriteBenchmark : public FormatBenchFixtureBase<> {
 
   protected:
   std::shared_ptr<arrow::Schema> schema_;
-  std::vector<std::shared_ptr<arrow::RecordBatch>> batches_;
-  int64_t total_bytes_ = 0;
-  int64_t total_rows_ = 0;
 };
 
 // Write comparison benchmark across formats

@@ -430,7 +430,11 @@ class FormatBenchFixtureBase : public ::benchmark::Fixture {
       memory_tracker_.ReportToState(st);
     }
 
-    // Release data loader to free loaded data
+    // Release pre-loaded batches and data loader to free memory
+    batches_.clear();
+    batches_.shrink_to_fit();
+    total_bytes_ = 0;
+    total_rows_ = 0;
     data_loader_.reset();
 
     // Clean up test directory
@@ -484,6 +488,26 @@ class FormatBenchFixtureBase : public ::benchmark::Fixture {
 
   // Get data description for labels
   std::string GetDataDescription() const { return data_loader_->GetDescription(); }
+
+  //-----------------------------------------------------------------------
+  // Lazy batch loading: only load source data when actually needed for writing
+  //-----------------------------------------------------------------------
+  arrow::Status EnsureBatchesLoaded() {
+    if (!batches_.empty()) {
+      return arrow::Status::OK();
+    }
+    ARROW_ASSIGN_OR_RAISE(auto batch_reader, GetLoaderBatchReader());
+    std::shared_ptr<arrow::RecordBatch> batch;
+    while (true) {
+      ARROW_RETURN_NOT_OK(batch_reader->ReadNext(&batch));
+      if (!batch)
+        break;
+      batches_.push_back(batch);
+      total_bytes_ += CalculateRawDataSize(batch);
+      total_rows_ += batch->num_rows();
+    }
+    return arrow::Status::OK();
+  }
 
   //-----------------------------------------------------------------------
   // Legacy Methods - For backward compatibility (uses synthetic data)
@@ -611,6 +635,9 @@ class FormatBenchFixtureBase : public ::benchmark::Fixture {
   std::string base_path_;
   std::vector<std::string> available_formats_;
   std::unique_ptr<BenchmarkDataLoader> data_loader_;
+  std::vector<std::shared_ptr<arrow::RecordBatch>> batches_;
+  int64_t total_bytes_ = 0;
+  int64_t total_rows_ = 0;
   MemoryTracker memory_tracker_;
   ThreadTracker thread_tracker_;
 };

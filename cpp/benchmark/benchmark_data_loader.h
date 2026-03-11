@@ -77,6 +77,13 @@ class BenchmarkDataLoader {
 
   // Get data source description (for logging/labels)
   virtual std::string GetDescription() const = 0;
+
+  // Get the number of column groups (only meaningful for MilvusSegmentLoader)
+  virtual size_t GetNumColumnGroups() const = 0;
+
+  // Get column names for a specific column group index
+  // Returns nullptr if index is out of range or not supported
+  virtual std::shared_ptr<std::vector<std::string>> GetColumnGroupProjection(size_t cg_index) const = 0;
 };
 
 //=============================================================================
@@ -120,6 +127,11 @@ class SyntheticDataLoader : public BenchmarkDataLoader {
 
   std::string GetDescription() const override;
 
+  size_t GetNumColumnGroups() const override { return 0; }
+  std::shared_ptr<std::vector<std::string>> GetColumnGroupProjection(size_t /*cg_index*/) const override {
+    return nullptr;
+  }
+
   private:
   SyntheticDataConfig config_;
   std::shared_ptr<arrow::Schema> schema_;
@@ -147,13 +159,16 @@ class MilvusSegmentLoader : public BenchmarkDataLoader {
 
   arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> GetRecordBatchReader() const override;
 
-  std::shared_ptr<arrow::Table> GetTable() const override { return merged_table_; }
+  std::shared_ptr<arrow::Table> GetTable() const override {
+    (void)const_cast<MilvusSegmentLoader*>(this)->EnsureDataLoaded();
+    return merged_table_;
+  }
 
   arrow::Result<std::shared_ptr<arrow::RecordBatch>> GetRecordBatch() const override;
 
   std::string GetSchemaBasePatterns() const override;
 
-  int64_t NumRows() const override { return merged_table_ ? merged_table_->num_rows() : 0; }
+  int64_t NumRows() const override { return total_num_rows_; }
 
   int64_t GetDataSize() const override;
 
@@ -163,17 +178,24 @@ class MilvusSegmentLoader : public BenchmarkDataLoader {
 
   std::string GetDescription() const override;
 
+  size_t GetNumColumnGroups() const override { return column_groups_.size(); }
+  std::shared_ptr<std::vector<std::string>> GetColumnGroupProjection(size_t cg_index) const override;
+
   // Get column group info (for advanced use)
   const std::map<int64_t, ColumnGroupInfo>& GetColumnGroups() const { return column_groups_; }
 
   private:
-  arrow::Status LoadColumnGroup(int64_t group_id, const std::string& file_path);
+  arrow::Status LoadColumnGroupMetadata(int64_t group_id, const std::string& file_path);
+  arrow::Status EnsureDataLoaded();
+  arrow::Status BuildMergedSchema();
   arrow::Status BuildMergedData();
 
   std::string segment_path_;
   std::map<int64_t, ColumnGroupInfo> column_groups_;
   std::shared_ptr<arrow::Schema> merged_schema_;
   std::shared_ptr<arrow::Table> merged_table_;
+  int64_t total_num_rows_ = 0;
+  bool data_loaded_ = false;
 };
 
 //=============================================================================
