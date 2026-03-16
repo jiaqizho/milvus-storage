@@ -29,6 +29,17 @@ use vortex::io::runtime::current::CurrentThreadRuntime;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::error::VortexError;
 
+use vortex::file::VortexWriteOptions;
+use vortex::layout::LayoutStrategy;
+use vortex::layout::layouts::flat::writer::FlatLayoutStrategy;
+use vortex::layout::layouts::compressed::CompressingStrategy;
+use vortex::layout::layouts::chunked::writer::ChunkedLayoutStrategy;
+// ZonedStrategy removed from v2 pipeline: storage path doesn't use filter pushdown,
+// and zones would be non-contiguous (interleaved with data per-column due to split_off).
+use vortex::layout::layouts::collect::CollectStrategy;
+use vortex::layout::layouts::struct_::writer::StructStrategy;
+use vortex::layout::layouts::repartition::{RepartitionStrategy, RepartitionWriterOptions};
+
 use crate::filesystem_c::*;
 use crate::VORTEX_RT;
 use crate::VORTEX_SESSION;
@@ -485,6 +496,102 @@ pub(crate) unsafe fn write(&mut self, in_schema: *mut u8, in_array: *mut u8) -> 
 
         let blocking_writer = vortex::file::VortexWriteOptions::new(VORTEX_SESSION.clone())
             .with_file_statistics(stats_options)
+            .blocking(&*VORTEX_RT)
+            .writer(objw, vortex_schema);
+
+        self.inner_writer = Some(blocking_writer);
+    }
+    let mut inner_writer = self.inner_writer.take().unwrap();
+
+    inner_writer.push(ArrayRef::from_arrow(&converted_array, false))
+        .map_err(|e| Box::new(VortexError::from(e)))?;
+
+    self.inner_writer = Some(inner_writer);
+    Ok(())
+}
+
+pub(crate) unsafe fn close(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(w) = self.inner_writer.take() {
+        w.finish().map_err(|e| Box::new(VortexError::from(e)))?;
+    }
+    Ok(())
+}
+
+}
+
+/*
+ * V2 writer (row-group layout)
+ */
+
+fn build_row_group_strategy(row_group_size: usize) -> Arc<dyn LayoutStrategy> {
+    let flat = FlatLayoutStrategy::default();
+    let compress_flat = CompressingStrategy::new_btrblocks(flat, false);
+    let chunked_inner = ChunkedLayoutStrategy::new(compress_flat.clone());
+    let validity = CollectStrategy::new(compress_flat);
+    let struct_inner = StructStrategy::new(chunked_inner, validity);
+    let repartition = RepartitionStrategy::new(
+        struct_inner,
+        RepartitionWriterOptions {
+            block_size_minimum: 0,
+            block_len_multiple: row_group_size,
+            canonicalize: false,
+        },
+    );
+    Arc::new(ChunkedLayoutStrategy::new(repartition))
+}
+
+pub(crate) struct VortexV2Writer {
+    pub fswrapper_ptr: *mut u8,
+    pub path: String,
+    pub inner_writer: Option<BlockingWriter<'static, 'static, CurrentThreadRuntime>>,
+    pub enable_stats: bool,
+    pub row_group_size: usize,
+}
+
+pub(crate) unsafe fn open_v2_writer(
+    fswrapper_ptr: *mut u8, path: &str, enable_stats: bool, row_group_size: u64
+) -> Result<Box<VortexV2Writer>, Box<dyn std::error::Error>> {
+    Ok(Box::new(VortexV2Writer {
+        fswrapper_ptr,
+        path: path.to_string(),
+        inner_writer: None,
+        enable_stats,
+        row_group_size: row_group_size as usize,
+    }))
+}
+
+impl VortexV2Writer {
+
+pub(crate) unsafe fn write(&mut self, in_schema: *mut u8, in_array: *mut u8) -> Result<()> {
+    let ffi_array = unsafe {
+        FFI_ArrowArray::from_raw(in_array as *mut FFI_ArrowArray)
+    };
+
+    let ffi_schema = unsafe {
+         FFI_ArrowSchema::from_raw(in_schema as *mut FFI_ArrowSchema)
+    };
+    let arrow_schema = Schema::try_from(&ffi_schema)?;
+
+    let arrow_array_data = arrow_array::array::StructArray::from(unsafe { arrow_array::ffi::from_ffi(ffi_array, &ffi_schema) }
+        .map_err(|e| VortexError::from(e))?);
+
+    let converted_array = convert_struct_array_for_vortex(&arrow_array_data);
+    let converted_schema = convert_schema_for_vortex(&arrow_schema);
+    let vortex_schema = RustDType::from_arrow(&converted_schema);
+
+    if self.inner_writer.is_none() {
+        let objw = ObjectStoreWriterCpp::new(self.fswrapper_ptr as *mut c_void, &self.path)
+            .map_err(|e| VortexError::from(e))?;
+
+        let stats_options = if self.enable_stats {
+            VORTEX_BASIC_STATS.to_vec()
+        } else {
+            VORTEX_NON_STATS.to_vec()
+        };
+
+        let blocking_writer = VortexWriteOptions::new(VORTEX_SESSION.clone())
+            .with_file_statistics(stats_options)
+            .with_strategy(build_row_group_strategy(self.row_group_size))
             .blocking(&*VORTEX_RT)
             .writer(objw, vortex_schema);
 

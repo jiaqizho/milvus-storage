@@ -541,6 +541,11 @@ static std::unordered_map<std::string, PropertyInfo> property_infos = {
                       "Whether to enable statistics collection in Vortex writer.",
                       false,
                       ValidatePropertyType()),
+    REGISTER_PROPERTY(PROPERTY_WRITER_VORTEX_V2_ROW_GROUP_SIZE,
+                      PropertyType::INT64,
+                      "Row group size for Vortex V2 row-group layout strategy.",
+                      int64_t(8192),
+                      ValidatePropertyType() + ValidatePropertyRange<int64_t>(1, INT64_MAX)),
 
     // --- reader properties define ---
     REGISTER_PROPERTY(PROPERTY_READER_RECORD_BATCH_MAX_ROWS,

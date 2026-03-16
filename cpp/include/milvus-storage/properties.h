@@ -142,6 +142,8 @@ struct PropertyInfo {
 
 #define PROPERTY_WRITER_VORTEX_ENABLE_STATISTICS "writer.vortex.enable_statistics"
 
+#define PROPERTY_WRITER_VORTEX_V2_ROW_GROUP_SIZE "writer.vortex_v2.row_group_size"
+
 // --- Define Reader property keys ---
 #define PROPERTY_READER_RECORD_BATCH_MAX_ROWS "reader.record_batch_max_rows"
 #define PROPERTY_READER_RECORD_BATCH_MAX_SIZE "reader.record_batch_max_size"

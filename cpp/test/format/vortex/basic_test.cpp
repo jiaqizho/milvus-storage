@@ -40,6 +40,8 @@
 #include "milvus-storage/filesystem/fs.h"
 #include "milvus-storage/format/vortex/vortex_writer.h"
 #include "milvus-storage/format/vortex/vortex_format_reader.h"
+#include "milvus-storage/format/vortex/vortex_v2_writer.h"
+#include "milvus-storage/format/vortex/vortex_v2_format_reader.h"
 
 #include <boost/filesystem/path.hpp>
 #include <boost/filesystem/operations.hpp>
@@ -398,6 +400,36 @@ TEST_F(VortexBasicTest, TestBasicTake) {
   take_verify(vx_reader, rangeNumbers<int64_t>(0, recordBatchsRows()), (int64_t)recordBatchsRows());
   // Note: vortex 0.56+ does not gracefully handle out-of-range indices (panics instead of returning error),
   // so we removed the out-of-range index tests.
+}
+
+TEST_F(VortexBasicTest, TestV2RowGroupWrite) {
+  properties_.insert_or_assign(PROPERTY_WRITER_VORTEX_V2_ROW_GROUP_SIZE, int64_t(500));
+
+  auto vx_writer = vortex::VortexV2FileWriter(file_system_, schema_, test_file_name_, properties_);
+
+  for (const auto& rb : record_bacths_) {
+    ASSERT_TRUE(vx_writer.Write(rb).ok());
+  }
+  ASSERT_TRUE(vx_writer.Flush().ok());
+  ASSERT_AND_ASSIGN(auto cgfile, vx_writer.Close());
+  ASSERT_EQ(recordBatchsRows(), cgfile.end_index);
+
+  // read back with V2 reader
+  auto vx_reader = vortex::VortexV2FormatReader(file_system_, schema_, test_file_name_, properties_,
+                                                std::vector<std::string>{"int32", "int64", "binary"});
+  ASSERT_STATUS_OK(vx_reader.open());
+  ASSERT_AND_ASSIGN(auto chunked_array, vx_reader.blocking_read(0, recordBatchsRows()));
+  ASSERT_AND_ASSIGN(auto rb, ChunkedArrayToRecordBatch(chunked_array));
+
+  ASSERT_EQ(recordBatchsRows(), rb->num_rows());
+  ASSERT_EQ(3, rb->num_columns());
+
+  auto i32array = std::dynamic_pointer_cast<arrow::Int32Array>(rb->column(0));
+  auto i64array = std::dynamic_pointer_cast<arrow::Int64Array>(rb->column(1));
+  for (int i = 0; i < i32array->length(); ++i) {
+    ASSERT_EQ(i32array->Value(i), (int32_t)i);
+    ASSERT_EQ(i64array->Value(i), (int64_t)i);
+  }
 }
 
 }  // namespace milvus_storage
