@@ -226,6 +226,14 @@ pub mod vortex_ffi {
         unsafe fn write(self: &mut VortexWriter, in_schema: *mut u8, in_array: *mut u8) -> Result<()>;
         unsafe fn close(self: &mut VortexWriter) -> Result<VortexWriteSummary>;
 
+        // v2 writer (row-group layout)
+        type VortexV2Writer;
+        unsafe fn open_v2_writer(
+            fswrapper_ptr: *mut u8, path: &str, enable_stats: bool, row_group_size: u64
+        ) -> Result<Box<VortexV2Writer>>;
+        unsafe fn write(self: &mut VortexV2Writer, in_schema: *mut u8, in_array: *mut u8) -> Result<()>;
+        unsafe fn close(self: &mut VortexV2Writer) -> Result<()>;
+
         // reader
         type VortexFile;
         fn row_count(self: &VortexFile) -> u64;

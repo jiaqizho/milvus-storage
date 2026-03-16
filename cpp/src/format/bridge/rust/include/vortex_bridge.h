@@ -178,6 +178,26 @@ class VortexWriter {
   rust::Box<ffi::VortexWriter> impl_;
 };
 
+class VortexV2Writer {
+  public:
+  static VortexV2Writer Open(uint8_t* fs_rawptr, const std::string& path, bool enable_stats, uint64_t row_group_size);
+
+  void Write(ArrowSchema& in_schema, ArrowArray& in_array);
+  void Close();
+
+  VortexV2Writer(VortexV2Writer&& other) noexcept = default;
+  VortexV2Writer& operator=(VortexV2Writer&& other) noexcept = default;
+  ~VortexV2Writer() = default;
+
+  VortexV2Writer(const VortexV2Writer&) = delete;
+  VortexV2Writer& operator=(const VortexV2Writer&) = delete;
+
+  private:
+  explicit VortexV2Writer(rust::Box<ffi::VortexV2Writer> impl) : impl_(std::move(impl)) {}
+
+  rust::Box<ffi::VortexV2Writer> impl_;
+};
+
 class VortexFile {
   public:
   static VortexFile Open(uint8_t* fs_rawptr, const std::string& path, uint64_t file_size = 0, uint64_t footer_size = 0);

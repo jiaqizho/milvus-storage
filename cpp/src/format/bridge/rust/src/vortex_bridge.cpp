@@ -162,6 +162,34 @@ ffi::VortexWriteSummary VortexWriter::Close() {
   }
 }
 
+VortexV2Writer VortexV2Writer::Open(uint8_t* fs_rawptr,
+                                    const std::string& path,
+                                    bool enable_stats,
+                                    uint64_t row_group_size) {
+  try {
+    return VortexV2Writer(
+        ffi::open_v2_writer(fs_rawptr, rust::Str(path.data(), path.length()), enable_stats, row_group_size));
+  } catch (const rust::cxxbridge1::Error& e) {
+    throw VortexException(e.what());
+  }
+}
+
+void VortexV2Writer::Write(ArrowSchema& in_schema, ArrowArray& in_array) {
+  try {
+    impl_->write(reinterpret_cast<uint8_t*>(&in_schema), reinterpret_cast<uint8_t*>(&in_array));
+  } catch (const rust::cxxbridge1::Error& e) {
+    throw VortexException(e.what());
+  }
+}
+
+void VortexV2Writer::Close() {
+  try {
+    impl_->close();
+  } catch (const rust::cxxbridge1::Error& e) {
+    throw VortexException(e.what());
+  }
+}
+
 VortexFile VortexFile::Open(uint8_t* fs_rawptr, const std::string& path, uint64_t file_size, uint64_t footer_size) {
   try {
     return VortexFile(ffi::open_file(fs_rawptr, rust::Str(path.data(), path.length()), file_size, footer_size));

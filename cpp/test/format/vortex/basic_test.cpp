@@ -41,6 +41,8 @@
 #include "milvus-storage/filesystem/fs.h"
 #include "milvus-storage/format/vortex/vortex_writer.h"
 #include "milvus-storage/format/vortex/vortex_format_reader.h"
+#include "milvus-storage/format/vortex/vortex_v2_writer.h"
+#include "milvus-storage/format/vortex/vortex_v2_format_reader.h"
 
 #include <boost/filesystem/path.hpp>
 #include <boost/filesystem/operations.hpp>
@@ -437,11 +439,6 @@ TEST_F(VortexBasicTest, FooterSizeMatchesActualFile) {
   std::cout << "cgfile.footer_size: " << cgfile.footer_size << std::endl;
   std::cout << "postscript_len: " << postscript_len << std::endl;
 
-  // The footer spans from the earliest segment to the end of file.
-  // The postscript contains segment descriptors with absolute offsets.
-  // We can parse the postscript flatbuffer to find the earliest offset,
-  // but a simpler sanity check: footer_size must be > postscript_len + 8 (postscript + EOF)
-  // and footer_size must be < file_size - 4 (exclude file header magic).
   EXPECT_GT(cgfile.footer_size, static_cast<uint64_t>(postscript_len) + 8)
       << "footer_size should include postscript + EOF + segment data";
   EXPECT_LT(cgfile.footer_size, cgfile.file_size - 4) << "footer_size should be less than file_size minus header magic";
@@ -478,13 +475,37 @@ TEST_F(VortexBasicTest, FooterSizeNotMatch) {
     }
   };
 
-  // Case 1: footer_size too small (1 byte).
-  // Vortex clamps initial_read_size to at least ~65KB and uses NeedMoreData loop for remaining segments.
   verify_read(1);
-
-  // Case 2: footer_size too large (= file_size, reads entire file as initial read).
-  // Vortex clamps to min(initial_read_size, file_size). Extra bytes get cached as segments.
   verify_read(cgfile.file_size);
+}
+
+TEST_F(VortexBasicTest, TestV2RowGroupWrite) {
+  properties_.insert_or_assign(PROPERTY_WRITER_VORTEX_V2_ROW_GROUP_SIZE, int64_t(500));
+
+  auto vx_writer = vortex::VortexV2FileWriter(file_system_, schema_, test_file_name_, properties_);
+  for (const auto& rb : record_bacths_) {
+    ASSERT_TRUE(vx_writer.Write(rb).ok());
+  }
+  ASSERT_TRUE(vx_writer.Flush().ok());
+  ASSERT_AND_ASSIGN(auto cgfile, vx_writer.Close());
+  ASSERT_EQ(recordBatchsRows(), cgfile.end_index);
+
+  // read back with V2 reader
+  auto vx_reader = vortex::VortexV2FormatReader(file_system_, schema_, test_file_name_, properties_,
+                                                std::vector<std::string>{"int32", "int64", "binary"});
+  ASSERT_STATUS_OK(vx_reader.open());
+  ASSERT_AND_ASSIGN(auto chunked_array, vx_reader.blocking_read(0, recordBatchsRows()));
+  ASSERT_AND_ASSIGN(auto rb, ChunkedArrayToRecordBatch(chunked_array));
+
+  ASSERT_EQ(recordBatchsRows(), rb->num_rows());
+  ASSERT_EQ(3, rb->num_columns());
+
+  auto i32array = std::dynamic_pointer_cast<arrow::Int32Array>(rb->column(0));
+  auto i64array = std::dynamic_pointer_cast<arrow::Int64Array>(rb->column(1));
+  for (int i = 0; i < i32array->length(); ++i) {
+    ASSERT_EQ(i32array->Value(i), (int32_t)i);
+    ASSERT_EQ(i64array->Value(i), (int64_t)i);
+  }
 }
 
 }  // namespace milvus_storage
