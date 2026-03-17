@@ -32,7 +32,8 @@ namespace milvus_storage::api {
 // Manifest version history:
 // - Version 1: Initial format with column_groups, delta_logs, stats
 // - Version 2: Added indexes field for index metadata support
-constexpr int32_t MANIFEST_VERSION = 2;
+// - Version 3: Added file_size and footer_size to ColumnGroupFile
+constexpr int32_t MANIFEST_VERSION = 3;
 
 /**
  * @brief Type of delta log entry

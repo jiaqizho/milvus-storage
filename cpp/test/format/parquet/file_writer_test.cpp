@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
+#include <cstring>
 #include <arrow/array.h>
 #include <arrow/builder.h>
 #include <arrow/record_batch.h>
@@ -31,6 +32,7 @@
 #include "milvus-storage/common/config.h"
 #include "milvus-storage/common/constants.h"
 #include "milvus-storage/packed/writer.h"
+#include "milvus-storage/format/parquet/parquet_format_reader.h"
 
 namespace milvus_storage::test {
 
