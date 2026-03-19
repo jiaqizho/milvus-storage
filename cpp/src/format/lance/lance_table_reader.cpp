@@ -84,6 +84,12 @@ arrow::Status LanceTableReader::open() {
   }
 
   ARROW_ASSIGN_OR_RAISE(logical_chunk_rows_, api::GetValue<uint64_t>(properties_, PROPERTY_READER_LOGICAL_CHUNK_ROWS));
+
+  // Fetch native physical schema from the fragment
+  ArrowSchema c_physical_schema;
+  dataset_->GetFragmentSchema(fragment_id_, c_physical_schema);
+  ARROW_ASSIGN_OR_RAISE(physical_schema_, arrow::ImportSchema(&c_physical_schema));
+
   ARROW_RETURN_NOT_OK(arrow::ExportSchema(*schema_, &c_arrow_schema));
 
   fragment_reader_ = BlockingFragmentReader::Open(*dataset_, fragment_id_, c_arrow_schema);

@@ -85,6 +85,9 @@ class BlockingDataset {
 
   std::vector<uint64_t> GetAllFragmentIds() const;
 
+  /// Get the physical schema of a specific fragment.
+  void GetFragmentSchema(uint64_t fragment_id, ArrowSchema& out_schema) const;
+
   uint64_t GetFragmentRowCount(uint64_t fragment_id) const;
 
   // Dataset-level scan: create a scanner for projected columns

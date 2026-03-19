@@ -38,6 +38,8 @@ class ParquetFormatReader final : public FormatReader {
   // open the file
   [[nodiscard]] arrow::Status open() override;
 
+  [[nodiscard]] std::shared_ptr<arrow::Schema> output_schema() const override { return schema_; }
+
   // get the row group infos
   [[nodiscard]] arrow::Result<std::vector<RowGroupInfo>> get_row_group_infos() override;
 

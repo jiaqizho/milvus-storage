@@ -40,6 +40,7 @@
 #include "milvus-storage/common/constants.h"
 #include "milvus-storage/common/macro.h"  // for UNLIKELY
 #include "milvus-storage/common/fiu_local.h"
+#include "milvus-storage/format/schema_caster.h"
 
 namespace milvus_storage::api {
 
@@ -98,6 +99,7 @@ class ColumnGroupReaderImpl : public ColumnGroupReader {
   size_t total_rows_;
 
   std::vector<std::shared_ptr<FormatReader>> format_readers_;
+  SchemaCaster adapter_;
 };  // ColumnGroupReaderImpl
 
 arrow::Result<std::unique_ptr<ColumnGroupReader>> ColumnGroupReader::create(
@@ -224,6 +226,13 @@ arrow::Status ColumnGroupReaderImpl::open() {
   }
 
   total_rows_ = rows_in_all_files;
+
+  // Build type adapter: compare physical output schema vs requested schema
+  if (!format_readers_.empty()) {
+    auto source_schema = format_readers_[0]->output_schema();
+    ARROW_ASSIGN_OR_RAISE(adapter_, SchemaCaster::Build(schema_, source_schema));
+  }
+
   return arrow::Status::OK();
 }
 
@@ -274,6 +283,7 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> ColumnGroupReaderImpl::get_ch
     rb = rb->Slice(chunk_info.row_offset_in_row_group, chunk_info.number_of_rows);
   }
 
+  ARROW_ASSIGN_OR_RAISE(rb, adapter_(rb));
   return rb;
 }
 
@@ -396,6 +406,7 @@ ChunkRBMapResult ColumnGroupReaderImpl::read_chunks_from_files(const std::vector
       }
 
       auto rb = rbs_in_file[rbs_idx]->Slice(rbs_offset, chunk_info.number_of_rows);
+      ARROW_ASSIGN_OR_RAISE(rb, adapter_(rb));
       chunk_rb_map[chunk_idxs[i]] = rb;
       rbs_offset += chunk_info.number_of_rows;
 

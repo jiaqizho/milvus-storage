@@ -78,6 +78,9 @@ class FormatReader {
   [[nodiscard]] virtual arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> read_with_range(
       const uint64_t& start_offset, const uint64_t& end_offset) = 0;
 
+  // get the physical output schema of this format reader
+  [[nodiscard]] virtual std::shared_ptr<arrow::Schema> output_schema() const = 0;
+
   // clone itself for multi-threading
   // if the reader is not thread-safe, then it should be cloned
   // if the reader is thread-safe, then return itself

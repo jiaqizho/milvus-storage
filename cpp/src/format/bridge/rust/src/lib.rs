@@ -72,6 +72,7 @@ pub mod lance_ffi {
 
         pub unsafe fn write_stream(self: &mut BlockingDataset, stream_ptr: *mut u8) -> Result<()>;
         pub fn get_all_fragment_ids(self: &BlockingDataset) -> Vec<u64>;
+        pub unsafe fn get_fragment_schema(dataset: &BlockingDataset, fragment_id: u64, out_schema: *mut u8) -> Result<()>;
         pub fn get_fragment_row_count(dataset: &BlockingDataset, fragment_id: u64) -> Result<u64>;
 
         type BlockingFragmentReader;
@@ -197,6 +198,7 @@ pub mod vortex_ffi {
         fn row_count(self: &VortexFile) -> u64;
         fn scan_builder(self: &VortexFile) -> Result<Box<VortexScanBuilder>>;
         unsafe fn scan_builder_with_schema(self: &VortexFile, in_schema: *mut u8) -> Result<Box<VortexScanBuilder>>;
+        unsafe fn get_schema(self: &VortexFile, out_schema: *mut u8) -> Result<()>;
         fn splits(self: &VortexFile) -> Result<Vec<u64>>;
         fn uncompressed_sizes(self: &VortexFile) -> Vec<u64>;
 

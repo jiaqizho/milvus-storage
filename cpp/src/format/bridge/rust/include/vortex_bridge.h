@@ -193,6 +193,9 @@ class VortexFile {
   /// Get the number of rows in the file.
   uint64_t RowCount() const;
 
+  /// Get the file's native physical schema (e.g., Vortex stores FixedSizeBinary as FixedSizeList<u8>).
+  void GetSchema(ArrowSchema& out_schema) const;
+
   /// Create a scan builder for the file.
   /// The scan builder can be used to scan the file.
   ScanBuilder CreateScanBuilder() const;

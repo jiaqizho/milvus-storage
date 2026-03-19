@@ -117,6 +117,11 @@ arrow::Status VortexFormatReader::open() {
   }
   vxfile_ = VortexFile::OpenUnique((uint8_t*)fs_holder_.get(), path_);
 
+  // Fetch native physical schema from the Vortex file
+  ArrowSchema c_schema;
+  vxfile_->GetSchema(c_schema);
+  ARROW_ASSIGN_OR_RAISE(physical_schema_, arrow::ImportSchema(&c_schema));
+
   row_group_infos_ =
       create_row_group_infos(total_mem_usage(), rows(), recalc_row_ranges(row_ranges(), logical_chunk_rows_));
 

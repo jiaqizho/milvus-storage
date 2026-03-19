@@ -34,6 +34,8 @@ class VortexFormatReader final : public FormatReader, public std::enable_shared_
 
   [[nodiscard]] arrow::Status open() override;
 
+  [[nodiscard]] std::shared_ptr<arrow::Schema> output_schema() const override { return physical_schema_; }
+
   // get the row group infos
   [[nodiscard]] arrow::Result<std::vector<RowGroupInfo>> get_row_group_infos() override;
 
@@ -79,6 +81,7 @@ class VortexFormatReader final : public FormatReader, public std::enable_shared_
 
   uint64_t logical_chunk_rows_;
   std::vector<RowGroupInfo> row_group_infos_;
+  std::shared_ptr<arrow::Schema> physical_schema_;
   std::unique_ptr<VortexFile> vxfile_;
 };
 

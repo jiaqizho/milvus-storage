@@ -74,6 +74,14 @@ std::unique_ptr<BlockingDataset> BlockingDataset::WriteDataset(const std::string
   }
 }
 
+void BlockingDataset::GetFragmentSchema(uint64_t fragment_id, ArrowSchema& out_schema) const {
+  try {
+    ffi::get_fragment_schema(*impl_, fragment_id, reinterpret_cast<uint8_t*>(&out_schema));
+  } catch (const rust::cxxbridge1::Error& e) {
+    throw LanceException(e.what());
+  }
+}
+
 std::vector<uint64_t> BlockingDataset::GetAllFragmentIds() const {
   try {
     auto fragment_ids = impl_->get_all_fragment_ids();
