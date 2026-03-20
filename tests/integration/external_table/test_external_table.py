@@ -748,3 +748,140 @@ class TestExternalTable:
         self._verify_import(
             base_rel, simple_schema, num_batches * rows_per_batch, props
         )
+
+    def test_lance_deletion_vector(
+        self,
+        temp_case_path: str,
+        simple_schema: pa.Schema,
+        default_properties,
+        test_config,
+    ):
+        """Verify that reading a Lance dataset with deletions correctly excludes deleted rows.
+
+        Lance stores deletion vectors (delete log) per fragment. When reading through
+        FragmentReader, deleted rows should be filtered out. This test:
+        1. Writes data with pylance
+        2. Deletes some rows via pylance (creates deletion vectors)
+        3. Imports the dataset as an external table
+        4. Reads via scan/get_chunk/take and verifies only non-deleted rows are returned
+        """
+        lance = pytest.importorskip("lance")
+
+        explore_rel = f"{temp_case_path}/lance_del_data"
+        explore_meta_rel = f"{temp_case_path}/lance_del_meta"
+        base_rel = f"{temp_case_path}/lance_del_imported"
+
+        num_rows = 100
+        delete_threshold = 50  # delete rows with id >= 50
+
+        # 1. Write Lance dataset (single fragment)
+        lance_uri = _get_lance_write_uri(test_config, explore_rel)
+        storage_options = _get_lance_storage_options(test_config)
+
+        batch = _generate_batch(simple_schema, num_rows)
+        table = pa.Table.from_batches([batch])
+        ds = lance.write_dataset(
+            table, lance_uri, mode="create", storage_options=storage_options
+        )
+
+        # 2. Delete rows where id >= delete_threshold
+        ds.delete(f"id >= {delete_threshold}")
+
+        # Verify deletion with pylance
+        expected_rows = delete_threshold  # rows with id 0..49
+        assert ds.count_rows() == expected_rows
+        remaining = ds.to_table()
+        ids = remaining.column("id").to_pylist()
+        assert all(i < delete_threshold for i in ids)
+        print(f"\n  pylance: {num_rows} written, {num_rows - expected_rows} deleted, {expected_rows} remaining")
+
+        # 3. Import as external table
+        props = _get_extfs_properties(default_properties, test_config)
+        explore_uri = _get_explore_uri(test_config, explore_rel)
+        print(f"  explore_dir URI: {explore_uri}")
+
+        found_files, manifest_path = ExternalTable.explore(
+            columns=simple_schema.names,
+            format="lance-table",
+            base_dir=explore_meta_rel,
+            explore_dir=explore_uri,
+            properties=props,
+        )
+        assert found_files == 1  # single fragment
+
+        # Check manifest — explore uses Fragment::num_rows() (physical count)
+        manifest = ExternalTable.read_manifest(manifest_path, properties=props)
+        manifest_rows = sum(
+            f.end_index - f.start_index
+            for cg in manifest.column_groups
+            for f in cg.files
+        )
+        print(f"  manifest reports {manifest_rows} rows (physical)")
+        print(f"  expected readable rows: {expected_rows} (after deletion)")
+
+        # 4. Commit to base_path
+        cg_to_write = ColumnGroups.from_list(manifest.column_groups)
+        txn = Transaction(base_rel, props)
+        txn.append_files(cg_to_write)
+        txn.commit()
+        txn.close()
+
+        # 5. Read via external table and verify deletion filtering
+        txn = Transaction(base_rel, props)
+        read_manifest = txn.get_manifest()
+        txn.close()
+
+        cg_for_reader = ColumnGroups.from_list(read_manifest.column_groups)
+
+        # --- scan ---
+        print("\n--- scan ---")
+        reader = Reader(cg_for_reader, simple_schema, properties=props)
+        scan_batches = list(reader.scan())
+        scan_rows = sum(b.num_rows for b in scan_batches)
+        print(f"  scan returned {scan_rows} rows")
+        reader.close()
+
+        # Verify: scan should return only non-deleted rows
+        assert scan_rows == expected_rows, (
+            f"scan returned {scan_rows} rows, expected {expected_rows} "
+            f"(deletion vector should filter out {num_rows - expected_rows} deleted rows)"
+        )
+
+        # Verify actual values — all returned ids should be < delete_threshold
+        all_ids = []
+        for b in scan_batches:
+            all_ids.extend(b.column("id").to_pylist())
+        assert sorted(all_ids) == list(range(expected_rows))
+        print(f"  all returned ids are in [0, {expected_rows})")
+
+        # --- get_chunk ---
+        print("\n--- get_chunk ---")
+        reader = Reader(cg_for_reader, simple_schema, properties=props)
+        chunk_reader = reader.get_chunk_reader(0)
+        num_chunks = chunk_reader.get_number_of_chunks()
+        chunk_rows = 0
+        for i in range(num_chunks):
+            chunk = chunk_reader.get_chunk(i)
+            chunk_rows += chunk.num_rows
+        print(f"  get_chunk returned {chunk_rows} rows")
+        chunk_reader.close()
+        reader.close()
+
+        assert chunk_rows == expected_rows, (
+            f"get_chunk returned {chunk_rows} rows, expected {expected_rows}"
+        )
+
+        # --- take ---
+        print("\n--- take ---")
+        reader = Reader(cg_for_reader, simple_schema, properties=props)
+        take_indices = [0, expected_rows // 4, expected_rows // 2, expected_rows - 1]
+        take_indices = sorted(set(take_indices))
+        print(f"  take indices: {take_indices}")
+        batches = reader.take(take_indices)
+        take_rows = sum(b.num_rows for b in batches)
+        print(f"  take returned {take_rows} rows")
+        reader.close()
+
+        assert take_rows == len(take_indices), (
+            f"take returned {take_rows} rows, expected {len(take_indices)}"
+        )
