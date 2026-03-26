@@ -216,6 +216,25 @@ class VortexFile {
   // otherwise, return vector with uncompressed sizes
   std::vector<uint64_t> GetUncompressedSizes() const;
 
+  /// Get byte ranges needed to read a specific field from a sparse file.
+  /// Returns pairs of [start, end) byte ranges. First pair is footer, rest are data segments.
+  std::vector<uint64_t> FieldByteRanges(const std::string& field_name, uint64_t file_size) const;
+
+  /// Get the full layout tree as a formatted string for diagnostics.
+  std::string LayoutTreeString() const;
+
+  /// Get [offset, length] for a given segment ID.
+  std::vector<uint64_t> SegmentBytes(uint64_t segment_id) const;
+
+  /// Get zones segment info for a specific field.
+  /// Returns: [count, seg_id0, offset0, length0, seg_id1, offset1, length1, ...]
+  std::vector<uint64_t> FieldZonesInfo(const std::string& field_name) const;
+
+  /// Get chunk-level info for a specific field.
+  /// Returns: [num_chunked_layouts, total_chunk_children,
+  ///           chunk_idx, row_offset, row_count, num_segments, seg_id0, seg_id1, ..., ...]
+  std::vector<uint64_t> FieldChunkOffsets(const std::string& field_name) const;
+
   private:
   explicit VortexFile(rust::Box<ffi::VortexFile> impl) : impl_(std::move(impl)) {}
 

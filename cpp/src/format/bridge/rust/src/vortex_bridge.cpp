@@ -216,6 +216,50 @@ std::vector<uint64_t> VortexFile::GetUncompressedSizes() const {
   return {rs_sizes.begin(), rs_sizes.end()};
 }
 
+std::vector<uint64_t> VortexFile::FieldByteRanges(const std::string& field_name, uint64_t file_size) const {
+  try {
+    ::rust::Vec<::rust::u64> rs_ranges = impl_->field_byte_ranges(
+        ::rust::Str(field_name.data(), field_name.size()), file_size);
+    return std::vector<uint64_t>(rs_ranges.begin(), rs_ranges.end());
+  } catch (const rust::cxxbridge1::Error& e) {
+    throw VortexException(e.what());
+  }
+}
+
+std::string VortexFile::LayoutTreeString() const {
+  try {
+    auto rs = impl_->layout_tree_string();
+    return std::string(rs.data(), rs.length());
+  } catch (const rust::cxxbridge1::Error& e) {
+    throw VortexException(e.what());
+  }
+}
+
+std::vector<uint64_t> VortexFile::SegmentBytes(uint64_t segment_id) const {
+  ::rust::Vec<::rust::u64> rs = impl_->segment_bytes(segment_id);
+  return std::vector<uint64_t>(rs.begin(), rs.end());
+}
+
+std::vector<uint64_t> VortexFile::FieldZonesInfo(const std::string& field_name) const {
+  try {
+    ::rust::Vec<::rust::u64> rs = impl_->field_zones_info(
+        ::rust::Str(field_name.data(), field_name.size()));
+    return std::vector<uint64_t>(rs.begin(), rs.end());
+  } catch (const rust::cxxbridge1::Error& e) {
+    throw VortexException(e.what());
+  }
+}
+
+std::vector<uint64_t> VortexFile::FieldChunkOffsets(const std::string& field_name) const {
+  try {
+    ::rust::Vec<::rust::u64> rs_offsets = impl_->field_chunk_offsets(
+        ::rust::Str(field_name.data(), field_name.size()));
+    return std::vector<uint64_t>(rs_offsets.begin(), rs_offsets.end());
+  } catch (const rust::cxxbridge1::Error& e) {
+    throw VortexException(e.what());
+  }
+}
+
 ScanBuilder& ScanBuilder::WithFilter(expr::Expr&& expr) & {
   impl_->with_filter(std::move(expr).IntoImpl());
   return *this;

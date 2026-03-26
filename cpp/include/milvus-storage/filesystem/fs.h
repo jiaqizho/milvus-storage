@@ -315,6 +315,17 @@ class FilesystemCache {
   void clean();
 
   /**
+   * @brief Directly insert a filesystem into the cache with a given key
+   *
+   * This allows registering custom filesystem implementations (e.g., in-memory)
+   * that can be retrieved later by the same key.
+   *
+   * @param key Cache key to associate with the filesystem
+   * @param fs The filesystem to cache
+   */
+  void put(const std::string& key, const ArrowFileSystemPtr& fs);
+
+  /**
    * @brief Set the cache capacity
    */
   void set_capacity(size_t capacity);

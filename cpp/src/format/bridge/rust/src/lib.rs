@@ -228,6 +228,11 @@ pub mod vortex_ffi {
         unsafe fn scan_builder_with_schema(self: &VortexFile, in_schema: *mut u8) -> Result<Box<VortexScanBuilder>>;
         fn splits(self: &VortexFile) -> Result<Vec<u64>>;
         fn uncompressed_sizes(self: &VortexFile) -> Vec<u64>;
+        fn field_byte_ranges(self: &VortexFile, field_name: &str, file_size: u64) -> Result<Vec<u64>>;
+        fn layout_tree_string(self: &VortexFile) -> String;
+        fn segment_bytes(self: &VortexFile, segment_id: u64) -> Vec<u64>;
+        fn field_zones_info(self: &VortexFile, field_name: &str) -> Result<Vec<u64>>;
+        fn field_chunk_offsets(self: &VortexFile, field_name: &str) -> Result<Vec<u64>>;
 
         unsafe fn open_file(fswrapper_ptr: *mut u8, path: &str, file_size: u64, footer_size: u64) -> Result<Box<VortexFile>>;
 

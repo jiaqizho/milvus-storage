@@ -110,6 +110,8 @@ void FilesystemCache::clean() { cache_.clean(); }
 
 void FilesystemCache::set_capacity(size_t capacity) { cache_.set_capacity(capacity); }
 
+void FilesystemCache::put(const std::string& key, const ArrowFileSystemPtr& fs) { cache_.put(key, fs); }
+
 arrow::Status ArrowFileSystemConfig::create_file_system_config(const milvus_storage::api::Properties& properties_map,
                                                                ArrowFileSystemConfig& result) {
   ARROW_ASSIGN_OR_RAISE(result.address, api::GetValue<std::string>(properties_map, PROPERTY_FS_ADDRESS));
@@ -220,6 +222,18 @@ arrow::Status CreateExternalFsConfig(const std::string& alias,
 }  // namespace
 
 arrow::Result<ArrowFileSystemPtr> FilesystemCache::get(const api::Properties& properties, const std::string& path) {
+  // Handle mem:// scheme: look up directly by "mem" key in cache
+  if (!path.empty()) {
+    auto uri_result = StorageUri::Parse(path);
+    if (uri_result.ok() && uri_result->scheme == "mem") {
+      auto cached_fs = cache_.get("mem");
+      if (cached_fs.has_value()) {
+        return cached_fs.value();
+      }
+      return arrow::Status::KeyError("No in-memory filesystem registered with key 'mem'");
+    }
+  }
+
   ARROW_ASSIGN_OR_RAISE(auto config, resolve_config(properties, path));
 
   std::string cache_key = config.GetCacheKey();
@@ -241,7 +255,7 @@ arrow::Result<ArrowFileSystemConfig> FilesystemCache::resolve_config(const api::
   if (!path.empty()) {
     ARROW_ASSIGN_OR_RAISE(auto uri, StorageUri::Parse(path));
 
-    if (!uri.scheme.empty()) {
+    if (!uri.scheme.empty() && uri.scheme != "mem") {
       ARROW_ASSIGN_OR_RAISE(auto external_fs_props_map, ExtractExternalFsProperties(properties));
 
       for (const auto& [fs_alias, fs_props] : external_fs_props_map) {

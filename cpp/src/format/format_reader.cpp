@@ -15,6 +15,7 @@
 #include "milvus-storage/format/format_reader.h"
 #include <memory>
 #include <fmt/format.h>
+#include <arrow/util/logging.h>
 
 #include "milvus-storage/format/parquet/parquet_format_reader.h"
 #include "milvus-storage/format/vortex/vortex_format_reader.h"
@@ -39,6 +40,7 @@ arrow::Result<std::shared_ptr<FormatReader>> FormatReader::create(
     const api::Properties& properties,
     const std::vector<std::string>& needed_columns,
     const std::function<std::string(const std::string&)>& key_retriever) {
+  ARROW_LOG(INFO) << "FormatReader::create format=" << format << ", file=" << file.path;
   std::shared_ptr<FormatReader> format_reader;
   if (format == LOON_FORMAT_PARQUET) {
     ARROW_ASSIGN_OR_RAISE(auto file_system, FilesystemCache::getInstance().get(properties, file.path));

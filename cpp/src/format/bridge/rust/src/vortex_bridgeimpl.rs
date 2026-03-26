@@ -8,6 +8,7 @@ use std::ffi::c_void;
 use anyhow::Result;
 
 use arrow_array::{Array, ArrayRef as ArrowArrayRef, RecordBatch, RecordBatchReader, FixedSizeBinaryArray, FixedSizeListArray, UInt8Array};
+use arrow_array::builder::{BinaryBuilder, StringBuilder};
 use arrow_array::ffi::FFI_ArrowSchema;
 use arrow_array::ffi_stream::{FFI_ArrowArrayStream};
 use arrow_data::ffi::{FFI_ArrowArray};
@@ -28,6 +29,8 @@ use vortex::expr::Expression;
 use vortex::io::runtime::tokio::TokioRuntime;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::error::VortexError;
+use vortex::layout::{LayoutChildType, LayoutRef};
+use vortex::layout::segments::SegmentId;
 
 use std::collections::VecDeque;
 use async_trait::async_trait;
@@ -367,10 +370,22 @@ fn convert_list_to_fixed_size_binary(array: &FixedSizeListArray, byte_width: i32
     Arc::new(FixedSizeBinaryArray::from(fsb_data))
 }
 
-/// Convert RecordBatch: replace FixedSizeList<u8> columns with FixedSizeBinary
-/// based on the original schema that specifies FixedSizeBinary
+/// Check if schema needs any type conversion from vortex output types
+fn schema_needs_vortex_conversion(original_schema: &Schema, batch: &RecordBatch) -> bool {
+    original_schema.fields().iter().zip(batch.columns().iter()).any(|(field, col)| {
+        // FixedSizeBinary came back as FixedSizeList
+        (is_fixed_size_binary(field.data_type()) && matches!(col.data_type(), DataType::FixedSizeList(_, _)))
+        // Binary came back as BinaryView
+        || (matches!(field.data_type(), DataType::Binary | DataType::LargeBinary) && matches!(col.data_type(), DataType::BinaryView))
+        // Utf8 came back as Utf8View
+        || (matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) && matches!(col.data_type(), DataType::Utf8View))
+    })
+}
+
+/// Convert RecordBatch from vortex output types back to the original schema types.
+/// Handles: FixedSizeList<u8> → FixedSizeBinary, BinaryView → Binary, Utf8View → Utf8
 fn convert_record_batch_from_vortex(batch: &RecordBatch, original_schema: &Schema) -> RecordBatch {
-    if !schema_has_fixed_size_binary(original_schema) {
+    if !schema_needs_vortex_conversion(original_schema, &batch) {
         return batch.clone();
     }
 
@@ -379,16 +394,44 @@ fn convert_record_batch_from_vortex(batch: &RecordBatch, original_schema: &Schem
         .iter()
         .zip(original_schema.fields().iter())
         .map(|(col, orig_field)| {
-            if let DataType::FixedSizeBinary(byte_width) = orig_field.data_type() {
-                if let DataType::FixedSizeList(_, _) = col.data_type() {
+            match (orig_field.data_type(), col.data_type()) {
+                // FixedSizeBinary: FixedSizeList<u8> → FixedSizeBinary
+                (DataType::FixedSizeBinary(byte_width), DataType::FixedSizeList(_, _)) => {
                     let fsl_array = col.as_any().downcast_ref::<FixedSizeListArray>()
                         .expect("Expected FixedSizeListArray");
                     convert_list_to_fixed_size_binary(fsl_array, *byte_width)
-                } else {
-                    col.clone()
                 }
-            } else {
-                col.clone()
+                // Binary: BinaryView → Binary
+                (DataType::Binary | DataType::LargeBinary, DataType::BinaryView) => {
+                    let view_array = col.as_any().downcast_ref::<arrow_array::BinaryViewArray>()
+                        .expect("Expected BinaryViewArray");
+                    let mut builder = BinaryBuilder::with_capacity(
+                        view_array.len(), view_array.len() * 64);
+                    for i in 0..view_array.len() {
+                        if view_array.is_null(i) {
+                            builder.append_null();
+                        } else {
+                            builder.append_value(view_array.value(i));
+                        }
+                    }
+                    Arc::new(builder.finish()) as ArrowArrayRef
+                }
+                // Utf8: Utf8View → Utf8
+                (DataType::Utf8 | DataType::LargeUtf8, DataType::Utf8View) => {
+                    let view_array = col.as_any().downcast_ref::<arrow_array::StringViewArray>()
+                        .expect("Expected StringViewArray");
+                    let mut builder = StringBuilder::with_capacity(
+                        view_array.len(), view_array.len() * 64);
+                    for i in 0..view_array.len() {
+                        if view_array.is_null(i) {
+                            builder.append_null();
+                        } else {
+                            builder.append_value(view_array.value(i));
+                        }
+                    }
+                    Arc::new(builder.finish()) as ArrowArrayRef
+                }
+                _ => col.clone(),
             }
         })
         .collect();
@@ -814,6 +857,129 @@ impl VortexFile {
         Ok(ends)
     }
 
+    /// Returns the full layout tree as a formatted string for diagnostics.
+    pub(crate) fn layout_tree_string(&self) -> String {
+        format!("{}", self.inner.footer().layout().display_tree_verbose(true))
+    }
+
+    /// Returns [offset, length] for a given segment ID.
+    pub(crate) fn segment_bytes(&self, segment_id: u64) -> Vec<u64> {
+        let footer = self.inner.footer();
+        let segment_map = footer.segment_map();
+        let idx = segment_id as usize;
+        if idx < segment_map.len() {
+            vec![segment_map[idx].offset, u64::from(segment_map[idx].length)]
+        } else {
+            vec![0, 0]
+        }
+    }
+
+    /// Returns zones segment info for a specific field.
+    /// Output: [num_zones_segments, seg_id0, offset0, length0, seg_id1, offset1, length1, ...]
+    /// Only collects Auxiliary("zones") children from the field's layout subtree.
+    pub(crate) fn field_zones_info(&self, field_name: &str) -> Result<Vec<u64>> {
+        let footer = self.inner.footer();
+        let segment_map = footer.segment_map();
+        let layout = footer.layout();
+
+        let mut zone_seg_ids = Vec::new();
+
+        for i in 0..layout.nchildren() {
+            if let LayoutChildType::Field(ref name) = layout.child_type(i) {
+                if name.as_ref() == field_name {
+                    let child = layout.child(i).map_err(|e| VortexError::from(e))?;
+                    collect_zones_segment_ids(&child, &mut zone_seg_ids)?;
+                }
+            }
+        }
+
+        let mut result = Vec::new();
+        result.push(zone_seg_ids.len() as u64);
+        for sid in &zone_seg_ids {
+            let idx = **sid as usize;
+            result.push(**sid as u64);
+            if idx < segment_map.len() {
+                result.push(segment_map[idx].offset);
+                result.push(u64::from(segment_map[idx].length));
+            } else {
+                result.push(0);
+                result.push(0);
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Returns chunk-level info for a specific field.
+    /// Output format: flat Vec starting with [num_chunked_layouts, total_chunk_children],
+    /// then for each chunk: [chunk_index, row_offset, row_count, num_segments, seg_id0, seg_id1, ...]
+    pub(crate) fn field_chunk_offsets(&self, field_name: &str) -> Result<Vec<u64>> {
+        let footer = self.inner.footer();
+        let layout = footer.layout();
+
+        let mut result = Vec::new();
+        // Placeholders for num_chunked_layouts and total_chunk_children
+        result.push(0);
+        result.push(0);
+
+        let mut num_chunked = 0u64;
+        let mut total_chunks = 0u64;
+
+        // Find the field in the top-level layout
+        for i in 0..layout.nchildren() {
+            if let LayoutChildType::Field(ref name) = layout.child_type(i) {
+                if name.as_ref() == field_name {
+                    let child = layout.child(i).map_err(|e| VortexError::from(e))?;
+                    collect_chunk_info(&child, &mut result, &mut num_chunked, &mut total_chunks)?;
+                }
+            }
+        }
+
+        result[0] = num_chunked;
+        result[1] = total_chunks;
+
+        Ok(result)
+    }
+
+    /// Returns byte ranges needed to read a specific field from a sparse file.
+    /// Output format: flat Vec of [start, end, start, end, ...] pairs.
+    /// First pair is the footer range (from end of last data segment to end of file).
+    /// Subsequent pairs are data segment byte ranges for the requested field.
+    /// file_size must be provided since we don't store it.
+    pub(crate) fn field_byte_ranges(&self, field_name: &str, file_size: u64) -> Result<Vec<u64>> {
+        let footer = self.inner.footer();
+        let segment_map = footer.segment_map();
+        let layout = footer.layout();
+
+        // 1. Collect segment IDs for the target field
+        let mut segment_ids = Vec::new();
+        collect_field_segments(layout, field_name, &mut segment_ids)?;
+
+        // 2. Build result: footer range first, then data segment ranges
+        let mut ranges = Vec::new();
+
+        // Footer range: after last data segment to end of file
+        let footer_start = segment_map
+            .iter()
+            .map(|s| s.offset + u64::from(s.length))
+            .max()
+            .unwrap_or(0);
+        ranges.push(footer_start);
+        ranges.push(file_size);
+
+        // Data segment ranges
+        for sid in &segment_ids {
+            let idx = **sid as usize;
+            if idx < segment_map.len() {
+                let spec = &segment_map[idx];
+                ranges.push(spec.offset);
+                ranges.push(spec.offset + u64::from(spec.length));
+            }
+        }
+
+        Ok(ranges)
+    }
+
     pub(crate) fn uncompressed_sizes(&self) -> Vec<u64> {
         let stats_opt = self.inner.footer().statistics();
         
@@ -869,6 +1035,125 @@ pub(crate) unsafe fn open_file(
     })?;
 
     Ok(Box::new(VortexFile { inner: file }))
+}
+
+/// Recursively collect all non-auxiliary segment IDs from a layout subtree.
+fn collect_all_segments(layout: &LayoutRef, segment_ids: &mut Vec<SegmentId>) -> Result<()> {
+    // Collect this layout's own segment IDs (leaf nodes like FlatLayout)
+    segment_ids.extend(layout.segment_ids());
+
+    for i in 0..layout.nchildren() {
+        let child_type = layout.child_type(i);
+        match child_type {
+            LayoutChildType::Auxiliary(_) => {
+                // Skip auxiliary data (zone maps, stats, etc.)
+            }
+            _ => {
+                let child = layout.child(i).map_err(|e| VortexError::from(e))?;
+                collect_all_segments(&child, segment_ids)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recursively traverse the layout tree to find segment IDs for a specific field.
+/// At StructLayout level, only follows the matching Field child.
+/// At other levels, follows Transparent and Chunk children, skips Auxiliary.
+fn collect_field_segments(layout: &LayoutRef, target_field: &str, segment_ids: &mut Vec<SegmentId>) -> Result<()> {
+    // Collect this layout's own segment IDs
+    segment_ids.extend(layout.segment_ids());
+
+    for i in 0..layout.nchildren() {
+        let child_type = layout.child_type(i);
+        match child_type {
+            LayoutChildType::Field(ref name) => {
+                if name.as_ref() == target_field {
+                    let child = layout.child(i).map_err(|e| VortexError::from(e))?;
+                    collect_all_segments(&child, segment_ids)?;
+                }
+                // Skip other fields
+            }
+            LayoutChildType::Auxiliary(_) => {
+                // Skip auxiliary data
+            }
+            LayoutChildType::Transparent(_) | LayoutChildType::Chunk(_) => {
+                let child = layout.child(i).map_err(|e| VortexError::from(e))?;
+                collect_field_segments(&child, target_field, segment_ids)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recursively collect Auxiliary("zones") segment IDs from a layout subtree.
+fn collect_zones_segment_ids(
+    layout: &LayoutRef,
+    seg_ids_out: &mut Vec<SegmentId>,
+) -> Result<()> {
+    for i in 0..layout.nchildren() {
+        let child_type = layout.child_type(i);
+        match child_type {
+            LayoutChildType::Auxiliary(ref name) if name.as_ref() == "zones" => {
+                let child = layout.child(i).map_err(|e| VortexError::from(e))?;
+                seg_ids_out.extend(child.segment_ids());
+            }
+            LayoutChildType::Auxiliary(_) => {}
+            _ => {
+                let child = layout.child(i).map_err(|e| VortexError::from(e))?;
+                collect_zones_segment_ids(&child, seg_ids_out)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recursively collect chunk-level info for a field's layout subtree.
+/// For each Chunk child found, appends [chunk_index, row_offset, row_count, num_segments, seg_id0, seg_id1, ...]
+/// to the result vector. Also counts ChunkedLayout nodes and total Chunk children.
+fn collect_chunk_info(
+    layout: &LayoutRef,
+    result: &mut Vec<u64>,
+    num_chunked: &mut u64,
+    total_chunks: &mut u64,
+) -> Result<()> {
+    let encoding = layout.encoding_id();
+    let encoding_str = format!("{}", encoding);
+
+    // Count ChunkedLayout nodes
+    if encoding_str == "vortex.chunked" {
+        *num_chunked += 1;
+    }
+
+    for i in 0..layout.nchildren() {
+        let child_type = layout.child_type(i);
+        match child_type {
+            LayoutChildType::Chunk((chunk_idx, row_offset)) => {
+                *total_chunks += 1;
+                let child = layout.child(i).map_err(|e| VortexError::from(e))?;
+                let row_count = child.row_count();
+
+                // Collect segment IDs from this chunk leaf
+                let seg_ids = child.segment_ids();
+
+                result.push(chunk_idx as u64);
+                result.push(row_offset);
+                result.push(row_count);
+                result.push(seg_ids.len() as u64);
+                for sid in &seg_ids {
+                    result.push(**sid as u64);
+                }
+            }
+            LayoutChildType::Auxiliary(_) => {
+                // Skip auxiliary data
+            }
+            _ => {
+                let child = layout.child(i).map_err(|e| VortexError::from(e))?;
+                collect_chunk_info(&child, result, num_chunked, total_chunks)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) struct VortexScanBuilder {
