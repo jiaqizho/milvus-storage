@@ -30,6 +30,7 @@
 #include "milvus-storage/format/parquet/parquet_writer.h"
 #include "milvus-storage/format/parquet/key_retriever.h"
 #include "milvus-storage/format/vortex/vortex_writer.h"
+#include "milvus-storage/format/vortex/vortex_v2_writer.h"
 #include "milvus-storage/format/lance/lance_table_writer.h"
 #include <fmt/format.h>
 #include "milvus-storage/properties.h"
@@ -133,7 +134,7 @@ class ColumnGroupWriterImpl final : public ColumnGroupWriter {
                                         file_system, schema,
                                         std::move(get_data_filepath(base_path, column_group_id, format)), properties));
     } else if (format == LOON_FORMAT_VORTEX) {
-      writer = std::make_unique<vortex::VortexFileWriter>(
+      writer = std::make_unique<vortex::VortexV2FileWriter>(
           file_system, schema, std::move(get_data_filepath(base_path, column_group_id, format)), properties);
     }
 #ifdef BUILD_GTEST

@@ -10,7 +10,7 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
 
-use vortex::buffer::ByteBufferMut;
+use vortex::buffer::{ByteBuffer, ByteBufferMut};
 use vortex::error::{VortexError, VortexResult, vortex_err};
 use vortex::io::runtime::Handle;
 use vortex::io::file::{CoalesceWindow, IntoReadSource, ReadSource, ReadSourceRef, IoRequest};
@@ -35,8 +35,8 @@ struct IoTraceState {
     seq_counter: u32,
 }
 
-static IO_TRACE: once_cell::sync::Lazy<Mutex<IoTraceState>> =
-    once_cell::sync::Lazy::new(|| Mutex::new(IoTraceState {
+static IO_TRACE: std::sync::LazyLock<Mutex<IoTraceState>> =
+    std::sync::LazyLock::new(|| Mutex::new(IoTraceState {
         enabled: false,
         epoch: Instant::now(),
         entries: Vec::new(),
@@ -336,9 +336,9 @@ impl Write for ObjectStoreWriterCpp {
 
 const COALESCING_WINDOW: CoalesceWindow = CoalesceWindow {
     distance: 1024 * 1024,       // 1 MB
-    max_size: 1 * 1024 * 1024,   // 1 MB
+    max_size: 1 * 1024 * 1024,  // 1 MB
 };
-const CONCURRENCY: usize = 192;
+const CONCURRENCY: usize = 256;
 
 /// Arc-wrapped reader handle that ensures the underlying C++ RandomAccessFile
 /// is only closed/destroyed after all concurrent spawn_blocking tasks are done.
@@ -395,24 +395,12 @@ impl ObjectStoreReadSourceCpp {
             reader: Arc::new(ReaderHandle { ptr: reader_raw }),
             path: path.to_string(),
             uri: Arc::from(path.to_string()),
-            coalesce_window: Some(COALESCING_WINDOW),
+            coalesce_window: None,
         })
     }
 }
 
-impl Drop for ObjectStoreReadSourceCpp {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.reader.as_ptr().is_null() {
-                let mut result = loon_filesystem_reader_close(self.reader.as_ptr());
-                check_loon_ffi_result(&mut result, "Failed to close ObjectStoreReadSourceCpp reader")
-                    .unwrap_or(());
-                loon_filesystem_reader_destroy(self.reader.as_raw_ptr());
-            }
-        }
-    }
-}
-
+// Drop is handled by Arc<ReaderHandle> which closes and destroys the reader.
 
 impl IntoReadSource for ObjectStoreReadSourceCpp {
     fn into_read_source(self, handle: Handle) -> VortexResult<ReadSourceRef> {
@@ -485,17 +473,18 @@ impl ReadSource for ObjectStoreIoSourceCpp {
 
                 let alignment = req.alignment();
 
-                // Offload sync FFI to blocking pool, reuse the pre-opened reader handle
-                let blocking = self.handle.spawn_blocking(move || -> VortexResult<Vec<u8>> {
+                // Offload sync FFI to blocking pool, read directly into aligned buffer
+                let blocking = self.handle.spawn_blocking(move || -> VortexResult<ByteBuffer> {
                     let (trace_enabled, trace_start) = record_io_start();
-                    let mut owned: Vec<u8> = Vec::with_capacity(len as usize);
+                    let mut buffer = ByteBufferMut::with_capacity_aligned(len as usize, alignment);
 
                     unsafe {
+                        let dst = buffer.spare_capacity_mut().as_mut_ptr() as *mut u8;
                         let mut result = loon_filesystem_reader_readat(
                             reader.as_ptr(),
                             start,
                             len,
-                            owned.as_mut_ptr(),
+                            dst,
                         );
 
                         check_loon_ffi_result(
@@ -503,18 +492,16 @@ impl ReadSource for ObjectStoreIoSourceCpp {
                             "Failed to readat from ObjectStoreIoSourceCpp",
                         )?;
 
-                        owned.set_len(len as usize);
+                        buffer.set_len(len as usize);
                     }
 
                     record_io_end(trace_enabled, trace_start, start, len);
-                    Ok(owned)
+                    Ok(buffer.freeze())
                 });
 
                 let fut = async move {
-                    let bytes: Vec<u8> = Compat::new(blocking).await?;
-                    let mut buffer = ByteBufferMut::with_capacity_aligned(len as usize, alignment);
-                    buffer.extend_from_slice(&bytes);
-                    Ok(buffer.freeze())
+                    let buffer: ByteBuffer = Compat::new(blocking).await?;
+                    Ok(buffer)
                 };
 
                 async move { req.resolve(Compat::new(fut).await) }

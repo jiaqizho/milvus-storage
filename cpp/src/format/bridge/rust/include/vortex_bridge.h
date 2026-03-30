@@ -183,7 +183,7 @@ class VortexV2Writer {
   static VortexV2Writer Open(uint8_t* fs_rawptr, const std::string& path, bool enable_stats, uint64_t row_group_size);
 
   void Write(ArrowSchema& in_schema, ArrowArray& in_array);
-  void Close();
+  ffi::VortexWriteSummary Close();
 
   VortexV2Writer(VortexV2Writer&& other) noexcept = default;
   VortexV2Writer& operator=(VortexV2Writer&& other) noexcept = default;

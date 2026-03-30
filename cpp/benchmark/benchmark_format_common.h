@@ -446,7 +446,11 @@ class FormatBenchFixtureBase : public ::benchmark::Fixture {
 
   protected:
   // Configure global properties for all benchmarks
-  void ConfigureGlobalProp() { api::SetValue(properties_, PROPERTY_READER_LOGICAL_CHUNK_ROWS, "32768"); }
+  void ConfigureGlobalProp() {
+    api::SetValue(properties_, PROPERTY_READER_LOGICAL_CHUNK_ROWS, "32768");
+    // Use 1GB buffer for full scan to avoid splitting row groups into multiple I/O batches
+    api::SetValue(properties_, PROPERTY_READER_RECORD_BATCH_MAX_SIZE, std::to_string(1LL * 1024 * 1024 * 1024).c_str());
+  }
 
   // Configure memory settings based on MemoryConfig
   void ConfigureMemory(const MemoryConfig& config) {
@@ -528,12 +532,9 @@ class FormatBenchFixtureBase : public ::benchmark::Fixture {
   }
 
   // Create policy based on format:
-  // Vortex=Single (one file, reduce IOPS), Parquet=SchemaBase (multiple column groups)
+  // Both Vortex and Parquet use SchemaBase policy (multiple column groups)
   arrow::Result<std::unique_ptr<api::ColumnGroupPolicy>> CreatePolicyForFormat(
       const std::string& patterns, const std::string& format, const std::shared_ptr<arrow::Schema>& schema) {
-    if (format == LOON_FORMAT_VORTEX) {
-      return CreateSinglePolicy(format, schema);
-    }
     return CreateSchemaBasePolicy(patterns, format, schema);
   }
 

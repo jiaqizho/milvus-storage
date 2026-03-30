@@ -19,7 +19,7 @@ mod filesystem_c;
 use lance_bridgeimpl::*;
 use vortex_bridgeimpl::*;
 
-use std::sync::{LazyLock, Once};
+use std::sync::LazyLock;
 
 use vortex::VortexSessionDefault;
 use vortex::io::runtime::tokio::TokioRuntime;
@@ -32,7 +32,7 @@ use vortex::session::VortexSession;
 /// preventing excessive thread creation under concurrent reader load.
 static VORTEX_TOKIO_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
-        .max_blocking_threads(64)
+        .max_blocking_threads(256)
         .enable_all()
         .build()
         .expect("Failed to create Vortex tokio runtime")
@@ -147,20 +147,6 @@ pub mod lance_ffi {
             out_stream: *mut u8,
         ) -> Result<()>;
 
-        // Decode metrics
-        fn reset_lance_decode_metrics_ffi();
-        fn get_lance_decode_metrics_ffi() -> LanceDecodeMetrics;
-
-        // IO trace
-        fn reset_lance_io_trace_ffi();
-        fn print_lance_io_trace_ffi();
-        fn disable_lance_io_trace_ffi();
-    }
-
-    /// IO/decode time breakdown metrics for Lance
-    struct LanceDecodeMetrics {
-        io_wait_ns: u64,
-        decode_ns: u64,
     }
 }  // mod lance_ffi
 
@@ -232,7 +218,7 @@ pub mod vortex_ffi {
             fswrapper_ptr: *mut u8, path: &str, enable_stats: bool, row_group_size: u64
         ) -> Result<Box<VortexV2Writer>>;
         unsafe fn write(self: &mut VortexV2Writer, in_schema: *mut u8, in_array: *mut u8) -> Result<()>;
-        unsafe fn close(self: &mut VortexV2Writer) -> Result<()>;
+        unsafe fn close(self: &mut VortexV2Writer) -> Result<VortexWriteSummary>;
 
         // reader
         type VortexFile;

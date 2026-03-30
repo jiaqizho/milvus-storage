@@ -554,7 +554,7 @@ fn build_row_group_strategy(row_group_size: usize) -> Arc<dyn LayoutStrategy> {
 pub(crate) struct VortexV2Writer {
     pub fswrapper_ptr: *mut u8,
     pub path: String,
-    pub inner_writer: Option<BlockingWriter<'static, 'static, CurrentThreadRuntime>>,
+    pub inner_writer: Option<BlockingWriter<'static, 'static, TokioRuntime>>,
     pub enable_stats: bool,
     pub row_group_size: usize,
 }
@@ -617,11 +617,22 @@ pub(crate) unsafe fn write(&mut self, in_schema: *mut u8, in_array: *mut u8) -> 
     Ok(())
 }
 
-pub(crate) unsafe fn close(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) unsafe fn close(&mut self) -> Result<crate::vortex_ffi::VortexWriteSummary, Box<dyn std::error::Error>> {
     if let Some(w) = self.inner_writer.take() {
-        w.finish().map_err(|e| Box::new(VortexError::from(e)))?;
+        let summary = w.finish().map_err(|e| Box::new(VortexError::from(e)) as Box<dyn std::error::Error>)?;
+        let file_size = summary.size();
+
+        let footer_size: u64 = summary.footer().clone()
+            .into_serializer()
+            .serialize()
+            .map_err(|e| Box::new(VortexError::from(e)) as Box<dyn std::error::Error>)?
+            .iter()
+            .map(|b| b.len() as u64)
+            .sum();
+
+        return Ok(crate::vortex_ffi::VortexWriteSummary { file_size, footer_size });
     }
-    Ok(())
+    Ok(crate::vortex_ffi::VortexWriteSummary { file_size: 0, footer_size: 0 })
 }
 
 }
@@ -857,14 +868,14 @@ pub(crate) unsafe fn scan_builder_into_stream(
 }
 
 pub fn reset_vortex_decode_metrics_ffi() {
-    vortex_layout::reset_vortex_decode_metrics();
+    // metrics API removed in new vortex; stub for now
 }
 
 pub fn get_vortex_decode_metrics_ffi() -> crate::vortex_ffi::VortexDecodeMetrics {
-    let (io_ns, decode_ns) = vortex_layout::get_vortex_decode_metrics();
+    // metrics API removed in new vortex; return zeros for now
     crate::vortex_ffi::VortexDecodeMetrics {
-        io_wait_ns: io_ns,
-        decode_ns,
+        io_wait_ns: 0,
+        decode_ns: 0,
     }
 }
 

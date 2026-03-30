@@ -479,7 +479,6 @@ BENCHMARK_DEFINE_F(CompressionBenchFixture, LanceFullScan)(::benchmark::State& s
 
   ResetFsMetrics();
   dataset->IOStatsIncremental();
-  lance::ResetLanceDecodeMetrics();
 
   auto cpu_before = GetProcessCpuTime();
 
@@ -492,15 +491,11 @@ BENCHMARK_DEFINE_F(CompressionBenchFixture, LanceFullScan)(::benchmark::State& s
   ReportCpuTime(st, cpu_elapsed);
 
   auto lance_io = dataset->IOStatsIncremental();
-  auto lance_decode = lance::GetLanceDecodeMetrics();
-  double iters = static_cast<double>(st.iterations());
-  double decode_ms = static_cast<double>(lance_decode.decode_ns) / 1e6;
 
   int64_t total_rows = rows_per_iter * static_cast<int64_t>(st.iterations());
   int64_t total_bytes = bytes_per_iter * static_cast<int64_t>(st.iterations());
   ReportThroughput(st, total_bytes, total_rows);
   ReportIOMetrics(st, lance_io.read_iops, lance_io.read_bytes);
-  st.counters["decode_ms/iter"] = ::benchmark::Counter(decode_ms / iters, ::benchmark::Counter::kDefaults);
   st.SetLabel("lance/10M_rows");
 }
 

@@ -19,7 +19,7 @@
 namespace milvus_storage {
 
 // current config will be used in packed writer/reader layer
-inline constexpr int64_t DEFAULT_MAX_ROW_GROUP_SIZE = 1024LL * 1024;  // 1 MB
+inline constexpr int64_t DEFAULT_MAX_ROW_GROUP_SIZE = 1 * 1024LL * 1024;  // 100kb
 
 // Default number of rows to read when using ::arrow::RecordBatchReader
 inline constexpr int64_t DEFAULT_READ_BATCH_SIZE = 1024LL;

@@ -182,9 +182,9 @@ void VortexV2Writer::Write(ArrowSchema& in_schema, ArrowArray& in_array) {
   }
 }
 
-void VortexV2Writer::Close() {
+ffi::VortexWriteSummary VortexV2Writer::Close() {
   try {
-    impl_->close();
+    return impl_->close();
   } catch (const rust::cxxbridge1::Error& e) {
     throw VortexException(e.what());
   }
