@@ -41,6 +41,7 @@
 
 #include "milvus-storage/properties.h"
 #include "milvus-storage/filesystem/fs.h"
+#include "milvus-storage/filesystem/observable.h"
 #include "milvus-storage/common/config.h"
 #include "milvus-storage/common/macro.h"
 #include "milvus-storage/common/arrow_util.h"
@@ -129,29 +130,38 @@ inline void ReportCompressionRatio(::benchmark::State& st, int64_t raw_size, int
 }
 
 //=============================================================================
-// Data Configuration Structures
+// CPU Time Tracking Utilities
 //=============================================================================
 
-// Data size configurations as per design doc
-struct DataSizeConfig {
-  std::string name;
-  size_t num_rows;
-  size_t vector_dim;
-  size_t string_length;
-
-  static DataSizeConfig Small() { return {"Small", 4096, 128, 128}; }
-  static DataSizeConfig Medium() { return {"Medium", 40960, 128, 128}; }
-  static DataSizeConfig Large() { return {"Large", 409600, 128, 128}; }
-  static DataSizeConfig HighDim() { return {"HighDim", 4096, 768, 128}; }
-  static DataSizeConfig LongString() { return {"LongString", 4096, 128, 1024}; }
-
-  static std::vector<DataSizeConfig> All() { return {Small(), Medium(), Large(), HighDim(), LongString()}; }
-
-  static DataSizeConfig FromIndex(size_t idx) {
-    auto all = All();
-    return idx < all.size() ? all[idx] : Small();
-  }
+struct CpuTime {
+  double user_ms = 0;
+  double sys_ms = 0;
 };
+
+inline CpuTime GetProcessCpuTime() {
+  struct rusage ru;
+  getrusage(RUSAGE_SELF, &ru);
+  return {
+      ru.ru_utime.tv_sec * 1e3 + ru.ru_utime.tv_usec / 1e3,
+      ru.ru_stime.tv_sec * 1e3 + ru.ru_stime.tv_usec / 1e3,
+  };
+}
+
+inline CpuTime operator-(const CpuTime& a, const CpuTime& b) {
+  return {a.user_ms - b.user_ms, a.sys_ms - b.sys_ms};
+}
+
+inline void ReportCpuTime(::benchmark::State& st, const CpuTime& elapsed) {
+  double iters = static_cast<double>(st.iterations());
+  st.counters["cpu_user_ms/iter"] = ::benchmark::Counter(elapsed.user_ms / iters, ::benchmark::Counter::kDefaults);
+  st.counters["cpu_sys_ms/iter"] = ::benchmark::Counter(elapsed.sys_ms / iters, ::benchmark::Counter::kDefaults);
+  st.counters["cpu_total_ms/iter"] =
+      ::benchmark::Counter((elapsed.user_ms + elapsed.sys_ms) / iters, ::benchmark::Counter::kDefaults);
+}
+
+//=============================================================================
+// Data Configuration Structures
+//=============================================================================
 
 // Memory configurations as per design doc
 struct MemoryConfig {
@@ -162,13 +172,6 @@ struct MemoryConfig {
   static MemoryConfig Low() { return {"Low", 16ULL * 1024 * 1024, 1024}; }
   static MemoryConfig Default() { return {"Default", 128ULL * 1024 * 1024, 16384}; }
   static MemoryConfig High() { return {"High", 256ULL * 1024 * 1024, 32768}; }
-
-  static std::vector<MemoryConfig> All() { return {Low(), Default(), High()}; }
-
-  static MemoryConfig FromIndex(size_t idx) {
-    auto all = All();
-    return idx < all.size() ? all[idx] : Default();
-  }
 };
 
 //=============================================================================
@@ -436,7 +439,11 @@ class FormatBenchFixtureBase : public ::benchmark::Fixture {
       memory_tracker_.ReportToState(st);
     }
 
-    // Release data loader to free loaded data
+    // Release pre-loaded batches and data loader to free memory
+    batches_.clear();
+    batches_.shrink_to_fit();
+    total_bytes_ = 0;
+    total_rows_ = 0;
     data_loader_.reset();
 
     // Clean up test directory
@@ -448,13 +455,18 @@ class FormatBenchFixtureBase : public ::benchmark::Fixture {
 
   protected:
   // Configure global properties for all benchmarks
-  void ConfigureGlobalProp() { api::SetValue(properties_, PROPERTY_READER_LOGICAL_CHUNK_ROWS, "32768"); }
+  void ConfigureGlobalProp() {
+    api::SetValue(properties_, PROPERTY_READER_LOGICAL_CHUNK_ROWS, "32768");
+    // Use 1GB buffer for full scan to avoid splitting row groups into multiple I/O batches
+    api::SetValue(properties_, PROPERTY_READER_RECORD_BATCH_MAX_SIZE, std::to_string(1LL * 1024 * 1024 * 1024).c_str());
+  }
 
   // Configure memory settings based on MemoryConfig
+  // Note: does NOT touch PROPERTY_READER_RECORD_BATCH_MAX_SIZE — that is set once
+  // in ConfigureGlobalProp() to 1GB to avoid splitting row groups into multiple I/O batches.
   void ConfigureMemory(const MemoryConfig& config) {
     api::SetValue(properties_, PROPERTY_WRITER_BUFFER_SIZE, std::to_string(config.buffer_size).c_str());
     api::SetValue(properties_, PROPERTY_READER_RECORD_BATCH_MAX_ROWS, std::to_string(config.batch_size).c_str());
-    api::SetValue(properties_, PROPERTY_READER_RECORD_BATCH_MAX_SIZE, std::to_string(config.buffer_size).c_str());
   }
 
   //-----------------------------------------------------------------------
@@ -492,27 +504,29 @@ class FormatBenchFixtureBase : public ::benchmark::Fixture {
   std::string GetDataDescription() const { return data_loader_->GetDescription(); }
 
   //-----------------------------------------------------------------------
-  // Legacy Methods - For backward compatibility (uses synthetic data)
+  // Lazy batch loading: only load source data when actually needed for writing
   //-----------------------------------------------------------------------
-
-  // Create schema for test data (legacy - uses CreateTestSchema directly)
-  arrow::Result<std::shared_ptr<arrow::Schema>> CreateSchema(std::array<bool, 4> needed_columns = {true, true, true,
-                                                                                                   true}) {
-    return CreateTestSchema(needed_columns);
+  arrow::Status EnsureBatchesLoaded() {
+    if (!batches_.empty()) {
+      return arrow::Status::OK();
+    }
+    ARROW_ASSIGN_OR_RAISE(auto batch_reader, GetLoaderBatchReader());
+    std::shared_ptr<arrow::RecordBatch> batch;
+    while (true) {
+      ARROW_RETURN_NOT_OK(batch_reader->ReadNext(&batch));
+      if (!batch)
+        break;
+      batches_.push_back(batch);
+      total_bytes_ += CalculateRawDataSize(batch);
+      total_rows_ += batch->num_rows();
+    }
+    return arrow::Status::OK();
   }
 
-  // Create test data batch (legacy - uses CreateTestData directly)
-  arrow::Result<std::shared_ptr<arrow::RecordBatch>> CreateBatch(std::shared_ptr<arrow::Schema> schema,
-                                                                 const DataSizeConfig& config,
-                                                                 bool random_data = true,
-                                                                 int64_t start_offset = 0) {
-    return CreateTestData(schema, start_offset, random_data, config.num_rows, config.vector_dim, config.string_length);
-  }
-
-  // Create policy for specific format
+  // Create SchemaBase policy (multiple column groups) for the given format
   arrow::Result<std::unique_ptr<api::ColumnGroupPolicy>> CreatePolicyForFormat(
-      const std::string& format, const std::shared_ptr<arrow::Schema>& schema) {
-    return CreateSinglePolicy(format, schema);
+      const std::string& patterns, const std::string& format, const std::shared_ptr<arrow::Schema>& schema) {
+    return CreateSchemaBasePolicy(patterns, format, schema);
   }
 
   // Get unique path for this benchmark iteration
@@ -561,12 +575,61 @@ class FormatBenchFixtureBase : public ::benchmark::Fixture {
     return size;
   }
 
+  //-----------------------------------------------------------------------
+  // Filesystem Metrics Helpers
+  //-----------------------------------------------------------------------
+
+  // Get filesystem metrics (returns nullptr for local filesystem)
+  std::shared_ptr<FilesystemMetrics> GetFsMetrics() const {
+    auto proxy = std::dynamic_pointer_cast<FileSystemProxy>(fs_);
+    if (proxy) {
+      return proxy->GetMetrics();
+    }
+    return nullptr;
+  }
+
+  // Reset filesystem metrics before benchmark iteration
+  void ResetFsMetrics() {
+    auto metrics = GetFsMetrics();
+    if (metrics) {
+      metrics->Reset();
+    }
+  }
+
+  // Report IO metrics to benchmark state (raw values)
+  void ReportIOMetrics(::benchmark::State& st,
+                       int64_t read_count,
+                       int64_t read_bytes,
+                       int64_t write_count = 0,
+                       int64_t write_bytes = 0) {
+    st.counters["s3_read_count"] =
+        ::benchmark::Counter(static_cast<double>(read_count), ::benchmark::Counter::kAvgIterations);
+    st.counters["s3_read_bytes(MB)"] =
+        ::benchmark::Counter(static_cast<double>(read_bytes) / (1024 * 1024), ::benchmark::Counter::kAvgIterations);
+    st.counters["s3_write_count"] =
+        ::benchmark::Counter(static_cast<double>(write_count), ::benchmark::Counter::kAvgIterations);
+    st.counters["s3_write_bytes(MB)"] =
+        ::benchmark::Counter(static_cast<double>(write_bytes) / (1024 * 1024), ::benchmark::Counter::kAvgIterations);
+  }
+
+  // Report filesystem metrics from observable FS to benchmark state
+  void ReportFsMetrics(::benchmark::State& st) {
+    auto metrics = GetFsMetrics();
+    if (metrics) {
+      ReportIOMetrics(st, metrics->GetReadCount(), metrics->GetReadBytes(), metrics->GetWriteCount(),
+                      metrics->GetWriteBytes());
+    }
+  }
+
   protected:
   api::Properties properties_;
   std::shared_ptr<arrow::fs::FileSystem> fs_;
   std::string base_path_;
   std::vector<std::string> available_formats_;
   std::unique_ptr<BenchmarkDataLoader> data_loader_;
+  std::vector<std::shared_ptr<arrow::RecordBatch>> batches_;
+  int64_t total_bytes_ = 0;
+  int64_t total_rows_ = 0;
   MemoryTracker memory_tracker_;
   ThreadTracker thread_tracker_;
 };

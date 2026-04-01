@@ -50,9 +50,9 @@ class FormatReadBenchmark : public FormatBenchFixtureBase<> {
                                 std::string& out_path) {
     out_path = GetUniquePath(format + "_read_test");
 
-    // Use schema-based policy to preserve column groups
+    // Use SchemaBase policy (multiple column groups)
     std::string patterns = GetSchemaBasePatterns();
-    ARROW_ASSIGN_OR_RAISE(auto policy, CreateSchemaBasePolicy(patterns, format, schema_));
+    ARROW_ASSIGN_OR_RAISE(auto policy, CreatePolicyForFormat(patterns, format, schema_));
 
     auto writer = Writer::create(out_path, schema_, std::move(policy), properties_);
     if (!writer) {
@@ -92,21 +92,18 @@ class FormatReadBenchmark : public FormatBenchFixtureBase<> {
 //=============================================================================
 
 // Full scan benchmark - read all rows and all columns
-// Args: [format_idx, num_threads, memory_config_idx]
+// Args: [format_idx, num_threads]
 BENCHMARK_DEFINE_F(FormatReadBenchmark, ReadFullScan)(::benchmark::State& st) {
   auto format_idx = static_cast<size_t>(st.range(0));
   auto num_threads = static_cast<size_t>(st.range(1));
-  auto memory_config_idx = static_cast<size_t>(st.range(2));
 
   std::string format = GetFormatByIndex(format_idx);
   if (!CheckFormatAvailable(st, format)) {
     return;
   }
 
-  MemoryConfig memory_config = MemoryConfig::FromIndex(memory_config_idx);
-
   // Configure memory and thread pool
-  ConfigureMemory(memory_config);
+  ConfigureMemory(MemoryConfig::Default());
   ThreadPoolHolder::WithSingleton(static_cast<int>(num_threads));
 
   // Prepare test data using data loader
@@ -116,6 +113,9 @@ BENCHMARK_DEFINE_F(FormatReadBenchmark, ReadFullScan)(::benchmark::State& st) {
 
   int64_t total_rows_read = 0;
   int64_t total_bytes_read = 0;
+
+  // Reset filesystem metrics before benchmark
+  ResetFsMetrics();
 
   for (auto _ : st) {
     auto reader = Reader::create(cgs, schema_, nullptr, properties_);
@@ -135,6 +135,7 @@ BENCHMARK_DEFINE_F(FormatReadBenchmark, ReadFullScan)(::benchmark::State& st) {
   }
 
   ReportThroughput(st, total_bytes_read, total_rows_read);
+  ReportFsMetrics(st);
   st.counters["threads"] = ::benchmark::Counter(static_cast<double>(num_threads), ::benchmark::Counter::kDefaults);
   st.SetLabel(format + "/" + std::to_string(num_threads) + "T/" + GetDataDescription());
 }
@@ -143,7 +144,6 @@ BENCHMARK_REGISTER_F(FormatReadBenchmark, ReadFullScan)
     ->ArgsProduct({
         {0, 1},         // Format: parquet(0), vortex(1)
         {1, 4, 8, 16},  // Threads: 1, 4, 8, 16
-        {1}             // MemoryConfig: Default(1)
     })
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
@@ -153,21 +153,18 @@ BENCHMARK_REGISTER_F(FormatReadBenchmark, ReadFullScan)
 //=============================================================================
 
 // Column projection benchmark - read subset of columns
-// Args: [format_idx, num_columns, num_threads, memory_config_idx]
+// Args: [format_idx, num_columns, num_threads]
 BENCHMARK_DEFINE_F(FormatReadBenchmark, ReadProjection)(::benchmark::State& st) {
   auto format_idx = static_cast<size_t>(st.range(0));
   auto num_columns = static_cast<size_t>(st.range(1));
   auto num_threads = static_cast<size_t>(st.range(2));
-  auto memory_config_idx = static_cast<size_t>(st.range(3));
 
   std::string format = GetFormatByIndex(format_idx);
   if (!CheckFormatAvailable(st, format)) {
     return;
   }
 
-  MemoryConfig memory_config = MemoryConfig::FromIndex(memory_config_idx);
-
-  ConfigureMemory(memory_config);
+  ConfigureMemory(MemoryConfig::Default());
   ThreadPoolHolder::WithSingleton(static_cast<int>(num_threads));
 
   // Prepare test data (write all columns)
@@ -191,6 +188,9 @@ BENCHMARK_DEFINE_F(FormatReadBenchmark, ReadProjection)(::benchmark::State& st) 
   int64_t total_rows_read = 0;
   int64_t total_bytes_read = 0;
 
+  // Reset filesystem metrics before benchmark
+  ResetFsMetrics();
+
   for (auto _ : st) {
     auto reader = Reader::create(cgs, projected_schema, projection, properties_);
     BENCH_ASSERT_NOT_NULL(reader, st);
@@ -209,6 +209,7 @@ BENCHMARK_DEFINE_F(FormatReadBenchmark, ReadProjection)(::benchmark::State& st) 
   }
 
   ReportThroughput(st, total_bytes_read, total_rows_read);
+  ReportFsMetrics(st);
   st.counters["threads"] = ::benchmark::Counter(static_cast<double>(num_threads), ::benchmark::Counter::kDefaults);
   st.SetLabel(format + "/" + std::to_string(num_columns) + "cols/" + std::to_string(num_threads) + "T/" +
               GetDataDescription());
@@ -219,7 +220,6 @@ BENCHMARK_REGISTER_F(FormatReadBenchmark, ReadProjection)
         {0, 1},        // Format: parquet(0), vortex(1)
         {1, 2, 3, 4},  // Number of columns: 1, 2, 3, 4
         {1, 8},        // Threads: 1, 8
-        {1}            // MemoryConfig: Default(1)
     })
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
@@ -229,22 +229,19 @@ BENCHMARK_REGISTER_F(FormatReadBenchmark, ReadProjection)
 //=============================================================================
 
 // Random access benchmark - read specific rows by indices
-// Args: [format_idx, take_count, distribution, num_threads, memory_config_idx]
+// Args: [format_idx, take_count, distribution, num_threads]
 BENCHMARK_DEFINE_F(FormatReadBenchmark, ReadTake)(::benchmark::State& st) {
   auto format_idx = static_cast<size_t>(st.range(0));
   auto take_count = static_cast<size_t>(st.range(1));
   int distribution = static_cast<int>(st.range(2));
   auto num_threads = static_cast<size_t>(st.range(3));
-  auto memory_config_idx = static_cast<size_t>(st.range(4));
 
   std::string format = GetFormatByIndex(format_idx);
   if (!CheckFormatAvailable(st, format)) {
     return;
   }
 
-  MemoryConfig memory_config = MemoryConfig::FromIndex(memory_config_idx);
-
-  ConfigureMemory(memory_config);
+  ConfigureMemory(MemoryConfig::Default());
   ThreadPoolHolder::WithSingleton(static_cast<int>(num_threads));
 
   // Prepare test data
@@ -258,6 +255,9 @@ BENCHMARK_DEFINE_F(FormatReadBenchmark, ReadTake)(::benchmark::State& st) {
 
   int64_t total_rows_read = 0;
   int64_t total_bytes_read = 0;
+
+  // Reset filesystem metrics before benchmark
+  ResetFsMetrics();
 
   for (auto _ : st) {
     auto reader = Reader::create(cgs, schema_, nullptr, properties_);
@@ -279,6 +279,7 @@ BENCHMARK_DEFINE_F(FormatReadBenchmark, ReadTake)(::benchmark::State& st) {
   }
 
   ReportThroughput(st, total_bytes_read, total_rows_read);
+  ReportFsMetrics(st);
   st.counters["rows_taken"] = ::benchmark::Counter(static_cast<double>(take_count), ::benchmark::Counter::kDefaults);
   st.counters["threads"] = ::benchmark::Counter(static_cast<double>(num_threads), ::benchmark::Counter::kDefaults);
 
@@ -288,11 +289,10 @@ BENCHMARK_DEFINE_F(FormatReadBenchmark, ReadTake)(::benchmark::State& st) {
 
 BENCHMARK_REGISTER_F(FormatReadBenchmark, ReadTake)
     ->ArgsProduct({
-        {0, 1},                  // Format: parquet(0), vortex(1)
-        {10, 100, 1000, 10000},  // Take count
-        {0, 1, 2},               // Distribution: sequential(0), random(1), clustered(2)
-        {1, 8},                  // Threads: 1, 8
-        {1}                      // MemoryConfig: Default(1)
+        {0, 1},           // Format: parquet(0), vortex(1)
+        {1, 5, 10, 100},  // Take count
+        {0, 1, 2},        // Distribution: sequential(0), random(1), clustered(2)
+        {1, 8},           // Threads: 1, 8
     })
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
@@ -304,37 +304,37 @@ BENCHMARK_REGISTER_F(FormatReadBenchmark, ReadTake)
 
 BENCHMARK_REGISTER_F(FormatReadBenchmark, ReadFullScan)
     ->Name("Typical/ReadFullScan_Parquet")
-    ->Args({0, 8, 1})  // Parquet + 8 threads + Default
+    ->Args({0, 8})  // Parquet + 8 threads
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
 
 BENCHMARK_REGISTER_F(FormatReadBenchmark, ReadFullScan)
     ->Name("Typical/ReadFullScan_Vortex")
-    ->Args({1, 8, 1})  // Vortex + 8 threads + Default
+    ->Args({1, 8})  // Vortex + 8 threads
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
 
 BENCHMARK_REGISTER_F(FormatReadBenchmark, ReadProjection)
     ->Name("Typical/ReadProjection_Parquet")
-    ->Args({0, 1, 8, 1})  // Parquet + 1 col + 8 threads + Default
+    ->Args({0, 1, 8})  // Parquet + 1 col + 8 threads
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
 
 BENCHMARK_REGISTER_F(FormatReadBenchmark, ReadProjection)
     ->Name("Typical/ReadProjection_Vortex")
-    ->Args({1, 1, 8, 1})  // Vortex + 1 col + 8 threads + Default
+    ->Args({1, 1, 8})  // Vortex + 1 col + 8 threads
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
 
 BENCHMARK_REGISTER_F(FormatReadBenchmark, ReadTake)
     ->Name("Typical/ReadTake_Parquet")
-    ->Args({0, 1000, 1, 8, 1})  // Parquet + 1000 rows + Random + 8 threads + Default
+    ->Args({0, 10, 1, 8})  // Parquet + 10 rows + Random + 8 threads
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
 
 BENCHMARK_REGISTER_F(FormatReadBenchmark, ReadTake)
     ->Name("Typical/ReadTake_Vortex")
-    ->Args({1, 1000, 1, 8, 1})  // Vortex + 1000 rows + Random + 8 threads + Default
+    ->Args({1, 10, 1, 8})  // Vortex + 10 rows + Random + 8 threads
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
 

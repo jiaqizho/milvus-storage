@@ -19,6 +19,11 @@ list(APPEND BENCHMARK_SOURCES
   ${PROJECT_SOURCE_DIR}/benchmark/benchmark_storage_layer.cpp
 )
 
+# Compression advantage benchmark (standalone synthetic data)
+list(APPEND BENCHMARK_SOURCES
+  ${PROJECT_SOURCE_DIR}/benchmark/benchmark_compression.cpp
+)
+
 # Data loader for configurable data sources (synthetic or Milvus segment)
 list(APPEND BENCHMARK_SOURCES
   ${PROJECT_SOURCE_DIR}/benchmark/benchmark_data_loader.cpp

@@ -66,38 +66,34 @@ class FormatWriteBenchmark : public FormatBenchFixtureBase<> {
 
   protected:
   std::shared_ptr<arrow::Schema> schema_;
-  std::vector<std::shared_ptr<arrow::RecordBatch>> batches_;
-  int64_t total_bytes_ = 0;
-  int64_t total_rows_ = 0;
 };
 
 // Write comparison benchmark across formats
-// Args: [format_idx, data_config_idx, memory_config_idx]
+// Args: [format_idx]
 BENCHMARK_DEFINE_F(FormatWriteBenchmark, WriteComparison)(::benchmark::State& st) {
   auto format_idx = static_cast<size_t>(st.range(0));
-  // data_config_idx is ignored - we use data from loader
-  auto memory_config_idx = static_cast<size_t>(st.range(2));
 
   std::string format = GetFormatByIndex(format_idx);
   if (!CheckFormatAvailable(st, format)) {
     return;
   }
 
-  MemoryConfig memory_config = MemoryConfig::FromIndex(memory_config_idx);
-
   // Configure memory settings
-  ConfigureMemory(memory_config);
+  ConfigureMemory(MemoryConfig::Default());
 
   // Track total bytes and rows for throughput calculation
   int64_t total_bytes_written = 0;
   int64_t total_rows_written = 0;
 
+  // Reset filesystem metrics before benchmark
+  ResetFsMetrics();
+
   for (auto _ : st) {
     std::string path = GetUniquePath(format);
 
-    // Create policy using schema-based patterns from loader
+    // Create policy (SchemaBase for both formats)
     std::string patterns = GetSchemaBasePatterns();
-    BENCH_ASSERT_AND_ASSIGN(auto policy, CreateSchemaBasePolicy(patterns, format, schema_), st);
+    BENCH_ASSERT_AND_ASSIGN(auto policy, CreatePolicyForFormat(patterns, format, schema_), st);
 
     auto writer = Writer::create(path, schema_, std::move(policy), properties_);
     BENCH_ASSERT_NOT_NULL(writer, st);
@@ -116,50 +112,16 @@ BENCHMARK_DEFINE_F(FormatWriteBenchmark, WriteComparison)(::benchmark::State& st
 
   // Report metrics
   ReportThroughput(st, total_bytes_written, total_rows_written);
+  ReportFsMetrics(st);
 
   // Add labels for better output readability
   st.SetLabel(format + "/" + GetDataDescription());
 }
 
-// Register write benchmark with all combinations
+// Register write benchmark — data comes from data_loader_ (env-configurable)
 BENCHMARK_REGISTER_F(FormatWriteBenchmark, WriteComparison)
-    ->ArgsProduct({
-        {0, 1},     // Format: parquet(0), vortex(1)
-        {0, 1, 2},  // DataConfig: Small(0), Medium(1), Large(2)
-        {1}         // MemoryConfig: Default(1) only for basic tests
-    })
-    ->Unit(::benchmark::kMillisecond)
-    ->UseRealTime();
-
-// Extended write benchmark with all memory configurations (for detailed analysis)
-BENCHMARK_REGISTER_F(FormatWriteBenchmark, WriteComparison)
-    ->Name("FormatWriteBenchmark/WriteComparisonExtended")
-    ->ArgsProduct({
-        {0, 1},    // Format: parquet(0), vortex(1)
-        {0},       // DataConfig: Small(0) only
-        {0, 1, 2}  // MemoryConfig: Low(0), Default(1), High(2)
-    })
-    ->Unit(::benchmark::kMillisecond)
-    ->UseRealTime();
-
-// High-dimensional vector write benchmark
-BENCHMARK_REGISTER_F(FormatWriteBenchmark, WriteComparison)
-    ->Name("FormatWriteBenchmark/WriteHighDim")
     ->ArgsProduct({
         {0, 1},  // Format: parquet(0), vortex(1)
-        {3},     // DataConfig: HighDim(3)
-        {1}      // MemoryConfig: Default(1)
-    })
-    ->Unit(::benchmark::kMillisecond)
-    ->UseRealTime();
-
-// Long string write benchmark
-BENCHMARK_REGISTER_F(FormatWriteBenchmark, WriteComparison)
-    ->Name("FormatWriteBenchmark/WriteLongString")
-    ->ArgsProduct({
-        {0, 1},  // Format: parquet(0), vortex(1)
-        {4},     // DataConfig: LongString(4)
-        {1}      // MemoryConfig: Default(1)
     })
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
@@ -183,10 +145,9 @@ static arrow::Result<int64_t> CalculateFileSize(const std::shared_ptr<arrow::fs:
 
 // This benchmark measures file size and compression ratio
 // The compression ratio is calculated by comparing file size against raw data size from loader
-// Args: [format_idx, data_config_idx]
+// Args: [format_idx]
 BENCHMARK_DEFINE_F(FormatWriteBenchmark, CompressionAnalysis)(::benchmark::State& st) {
   auto format_idx = static_cast<size_t>(st.range(0));
-  // data_config_idx is ignored - we use data from loader
 
   std::string format = GetFormatByIndex(format_idx);
   if (!CheckFormatAvailable(st, format)) {
@@ -205,8 +166,8 @@ BENCHMARK_DEFINE_F(FormatWriteBenchmark, CompressionAnalysis)(::benchmark::State
   for (auto _ : st) {
     std::string path = GetUniquePath(format);
 
-    // Create policy and writer with target format (uses default zstd compression for parquet)
-    BENCH_ASSERT_AND_ASSIGN(auto policy, CreateSchemaBasePolicy(patterns, format, schema_), st);
+    // Create policy (SchemaBase for both formats)
+    BENCH_ASSERT_AND_ASSIGN(auto policy, CreatePolicyForFormat(patterns, format, schema_), st);
     auto writer = Writer::create(path, schema_, std::move(policy), properties_);
     BENCH_ASSERT_NOT_NULL(writer, st);
 
@@ -242,8 +203,7 @@ BENCHMARK_DEFINE_F(FormatWriteBenchmark, CompressionAnalysis)(::benchmark::State
 
 BENCHMARK_REGISTER_F(FormatWriteBenchmark, CompressionAnalysis)
     ->ArgsProduct({
-        {0, 1},          // Format: parquet(0), vortex(1)
-        {0, 1, 2, 3, 4}  // All DataConfigs
+        {0, 1},  // Format: parquet(0), vortex(1)
     })
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime()
@@ -256,26 +216,26 @@ BENCHMARK_REGISTER_F(FormatWriteBenchmark, CompressionAnalysis)
 
 BENCHMARK_REGISTER_F(FormatWriteBenchmark, WriteComparison)
     ->Name("Typical/FormatWrite_Parquet")
-    ->Args({0, 1, 1})  // Parquet + Medium + Default
+    ->Args({0})  // Parquet
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
 
 BENCHMARK_REGISTER_F(FormatWriteBenchmark, WriteComparison)
     ->Name("Typical/FormatWrite_Vortex")
-    ->Args({1, 1, 1})  // Vortex + Medium + Default
+    ->Args({1})  // Vortex
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime();
 
 BENCHMARK_REGISTER_F(FormatWriteBenchmark, CompressionAnalysis)
     ->Name("Typical/Compression_Parquet")
-    ->Args({0, 1})  // Parquet + Medium
+    ->Args({0})  // Parquet
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime()
     ->Iterations(3);
 
 BENCHMARK_REGISTER_F(FormatWriteBenchmark, CompressionAnalysis)
     ->Name("Typical/Compression_Vortex")
-    ->Args({1, 1})  // Vortex + Medium
+    ->Args({1})  // Vortex
     ->Unit(::benchmark::kMillisecond)
     ->UseRealTime()
     ->Iterations(3);

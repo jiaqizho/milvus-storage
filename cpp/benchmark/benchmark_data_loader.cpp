@@ -102,7 +102,8 @@ std::shared_ptr<std::vector<std::string>> SyntheticDataLoader::GetVectorProjecti
 }
 
 std::string SyntheticDataLoader::GetDescription() const {
-  return "synthetic/" + std::to_string(config_.num_rows) + "rows/" + std::to_string(config_.vector_dim) + "dim";
+  return "synthetic/" + std::to_string(config_.num_rows) + "rows/" + std::to_string(config_.vector_dim) + "dim/" +
+         (config_.random_data ? "random" : "deterministic");
 }
 
 //=============================================================================
@@ -118,7 +119,7 @@ arrow::Status MilvusSegmentLoader::Load() {
     return arrow::Status::IOError("Segment path does not exist: " + segment_path_);
   }
 
-  // Iterate through column group directories
+  // Iterate through column group directories — only read metadata (schema + num_rows)
   for (const auto& entry : fs::directory_iterator(segment_path_)) {
     if (!entry.is_directory()) {
       continue;
@@ -136,7 +137,7 @@ arrow::Status MilvusSegmentLoader::Load() {
     for (const auto& file_entry : fs::directory_iterator(entry.path())) {
       if (file_entry.is_regular_file()) {
         std::string file_path = file_entry.path().string();
-        ARROW_RETURN_NOT_OK(LoadColumnGroup(group_id, file_path));
+        ARROW_RETURN_NOT_OK(LoadColumnGroupMetadata(group_id, file_path));
         break;  // Only one file per column group
       }
     }
@@ -146,33 +147,65 @@ arrow::Status MilvusSegmentLoader::Load() {
     return arrow::Status::Invalid("No column groups found in segment: " + segment_path_);
   }
 
-  // Build merged schema and table
-  ARROW_RETURN_NOT_OK(BuildMergedData());
+  // Build merged schema from metadata (no data loaded yet)
+  ARROW_RETURN_NOT_OK(BuildMergedSchema());
 
   return arrow::Status::OK();
 }
 
-arrow::Status MilvusSegmentLoader::LoadColumnGroup(int64_t group_id, const std::string& file_path) {
-  // Open parquet file
+arrow::Status MilvusSegmentLoader::LoadColumnGroupMetadata(int64_t group_id, const std::string& file_path) {
+  // Open parquet file — read only metadata, not the actual data
   ARROW_ASSIGN_OR_RAISE(auto infile, arrow::io::ReadableFile::Open(file_path));
 
   std::unique_ptr<parquet::arrow::FileReader> reader;
   ARROW_RETURN_NOT_OK(parquet::arrow::OpenFile(infile, arrow::default_memory_pool(), &reader));
 
-  // Read schema
+  // Read schema from metadata
   std::shared_ptr<arrow::Schema> schema;
   ARROW_RETURN_NOT_OK(reader->GetSchema(&schema));
 
-  // Read table
-  std::shared_ptr<arrow::Table> table;
-  ARROW_RETURN_NOT_OK(reader->ReadTable(&table));
+  // Get num_rows from Parquet footer metadata (no data read)
+  int64_t num_rows = reader->parquet_reader()->metadata()->num_rows();
 
-  column_groups_[group_id] = {group_id, file_path, schema, table};
+  column_groups_[group_id] = {group_id, file_path, schema, nullptr};
+  total_num_rows_ = num_rows;  // All column groups share the same num_rows
+  return arrow::Status::OK();
+}
+
+arrow::Status MilvusSegmentLoader::EnsureDataLoaded() {
+  if (data_loaded_) {
+    return arrow::Status::OK();
+  }
+
+  // Actually read table data for all column groups
+  for (auto& [id, info] : column_groups_) {
+    ARROW_ASSIGN_OR_RAISE(auto infile, arrow::io::ReadableFile::Open(info.file_path));
+
+    std::unique_ptr<parquet::arrow::FileReader> reader;
+    ARROW_RETURN_NOT_OK(parquet::arrow::OpenFile(infile, arrow::default_memory_pool(), &reader));
+
+    std::shared_ptr<arrow::Table> table;
+    ARROW_RETURN_NOT_OK(reader->ReadTable(&table));
+    info.table = std::move(table);
+  }
+
+  ARROW_RETURN_NOT_OK(BuildMergedData());
+  data_loaded_ = true;
+  return arrow::Status::OK();
+}
+
+arrow::Status MilvusSegmentLoader::BuildMergedSchema() {
+  std::vector<std::shared_ptr<arrow::Field>> all_fields;
+  for (const auto& [group_id, info] : column_groups_) {
+    for (int i = 0; i < info.schema->num_fields(); ++i) {
+      all_fields.push_back(info.schema->field(i));
+    }
+  }
+  merged_schema_ = arrow::schema(all_fields);
   return arrow::Status::OK();
 }
 
 arrow::Status MilvusSegmentLoader::BuildMergedData() {
-  // Collect all fields and columns
   std::vector<std::shared_ptr<arrow::Field>> all_fields;
   std::vector<std::shared_ptr<arrow::ChunkedArray>> all_columns;
 
@@ -189,16 +222,12 @@ arrow::Status MilvusSegmentLoader::BuildMergedData() {
 }
 
 arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> MilvusSegmentLoader::GetRecordBatchReader() const {
-  if (!merged_table_) {
-    return arrow::Status::Invalid("Data not loaded");
-  }
+  ARROW_RETURN_NOT_OK(const_cast<MilvusSegmentLoader*>(this)->EnsureDataLoaded());
   return std::make_shared<arrow::TableBatchReader>(*merged_table_);
 }
 
 arrow::Result<std::shared_ptr<arrow::RecordBatch>> MilvusSegmentLoader::GetRecordBatch() const {
-  if (!merged_table_) {
-    return arrow::Status::Invalid("Data not loaded");
-  }
+  ARROW_RETURN_NOT_OK(const_cast<MilvusSegmentLoader*>(this)->EnsureDataLoaded());
   arrow::TableBatchReader reader(*merged_table_);
   reader.set_chunksize(merged_table_->num_rows());
   std::shared_ptr<arrow::RecordBatch> batch;
@@ -268,6 +297,19 @@ std::shared_ptr<std::vector<std::string>> MilvusSegmentLoader::GetVectorProjecti
   return projection;
 }
 
+std::shared_ptr<std::vector<std::string>> MilvusSegmentLoader::GetColumnGroupProjection(size_t cg_index) const {
+  if (cg_index >= column_groups_.size()) {
+    return nullptr;
+  }
+  auto it = column_groups_.begin();
+  std::advance(it, cg_index);
+  auto projection = std::make_shared<std::vector<std::string>>();
+  for (int i = 0; i < it->second.schema->num_fields(); ++i) {
+    projection->push_back(it->second.schema->field(i)->name());
+  }
+  return projection;
+}
+
 std::string MilvusSegmentLoader::GetDescription() const {
   namespace fs = std::filesystem;
   std::string segment_name = fs::path(segment_path_).filename().string();
@@ -296,7 +338,13 @@ std::unique_ptr<BenchmarkDataLoader> CreateDataLoaderFromEnv(const SyntheticData
   if (segment_path && segment_path[0] != '\0') {
     return std::make_unique<MilvusSegmentLoader>(segment_path);
   }
-  return std::make_unique<SyntheticDataLoader>(fallback_config);
+  // BENCH_USE_RANDOM_DATA=0 uses deterministic synthetic data (default: random)
+  auto config = fallback_config;
+  const char* use_random = std::getenv("BENCH_USE_RANDOM_DATA");
+  if (use_random && std::string(use_random) == "0") {
+    config.random_data = false;
+  }
+  return std::make_unique<SyntheticDataLoader>(config);
 }
 
 }  // namespace milvus_storage::benchmark
