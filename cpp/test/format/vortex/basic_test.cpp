@@ -39,6 +39,7 @@
 #include "milvus-storage/common/lrucache.h"
 #include "milvus-storage/common/constants.h"
 #include "milvus-storage/filesystem/fs.h"
+#include "milvus-storage/filesystem/observable.h"
 #include "milvus-storage/format/vortex/vortex_writer.h"
 #include "milvus-storage/format/vortex/vortex_format_reader.h"
 
@@ -482,13 +483,269 @@ TEST_F(VortexBasicTest, FooterSizeNotMatch) {
     }
   };
 
-  // Case 1: footer_size too small (1 byte).
-  // Vortex clamps initial_read_size to at least ~65KB and uses NeedMoreData loop for remaining segments.
   verify_read(1);
 
   // Case 2: footer_size too large (= file_size, reads entire file as initial read).
   // Vortex clamps to min(initial_read_size, file_size). Extra bytes get cached as segments.
   verify_read(vx_file_size2);
+}
+
+TEST_F(VortexBasicTest, TestV2RowGroupWrite) {
+  api::SetValue(properties_, PROPERTY_WRITER_VORTEX_FORMAT_VERSION, "2");
+  api::SetValue(properties_, PROPERTY_WRITER_VORTEX_V2_ROW_GROUP_MAX_SIZE, std::to_string(128 * 1024).c_str());
+
+  auto vx_writer = vortex::VortexFileWriter(file_system_, schema_, test_file_name_, properties_);
+  for (const auto& rb : record_bacths_) {
+    ASSERT_TRUE(vx_writer.Write(rb).ok());
+  }
+  ASSERT_TRUE(vx_writer.Flush().ok());
+  ASSERT_AND_ASSIGN(auto cgfile, vx_writer.Close());
+  ASSERT_EQ(recordBatchsRows(), cgfile.end_index);
+
+  // read back with V1 reader (works for both V1 and V2 written files)
+  auto vx_reader = vortex::VortexFormatReader(file_system_, schema_, test_file_name_, properties_,
+                                              std::vector<std::string>{"int32", "int64", "binary"});
+  ASSERT_STATUS_OK(vx_reader.open());
+  ASSERT_AND_ASSIGN(auto chunked_array, vx_reader.blocking_read(0, recordBatchsRows()));
+  ASSERT_AND_ASSIGN(auto rb, ChunkedArrayToRecordBatch(chunked_array));
+
+  ASSERT_EQ(recordBatchsRows(), rb->num_rows());
+  ASSERT_EQ(3, rb->num_columns());
+
+  auto i32array = std::dynamic_pointer_cast<arrow::Int32Array>(rb->column(0));
+  auto i64array = std::dynamic_pointer_cast<arrow::Int64Array>(rb->column(1));
+  for (int i = 0; i < i32array->length(); ++i) {
+    ASSERT_EQ(i32array->Value(i), (int32_t)i);
+    ASSERT_EQ(i64array->Value(i), (int64_t)i);
+  }
+}
+
+// Test that inline_array_node enables sub-segment range reads.
+// Writes FSB(512) data, takes 1 row, and asserts IO read bytes are small.
+// Only runs in cloud (S3) environment where FilesystemMetrics are available.
+TEST_F(VortexBasicTest, TestInlineArrayNodeSubSegmentRead) {
+  if (!IsCloudEnv()) {
+    GTEST_SKIP() << "Sub-segment IO test requires cloud environment with FilesystemMetrics";
+  }
+
+  // Get cloud filesystem with metrics
+  ASSERT_AND_ASSIGN(auto cloud_fs, GetFileSystem(properties_));
+  auto observable = std::dynamic_pointer_cast<Observable>(cloud_fs);
+  ASSERT_NE(observable, nullptr);
+  auto metrics = observable->GetMetrics();
+  ASSERT_NE(metrics, nullptr);
+
+  // Build schema with a single FSB(512) column
+  auto fsb_schema = arrow::schema({arrow::field("embedding", arrow::fixed_size_binary(512), false,
+                                                arrow::key_value_metadata({ARROW_FIELD_ID_KEY}, {"100"}))});
+
+  // Write 10000 rows of FSB(512) data (~5MB)
+  const int64_t num_rows = 10000;
+  const int fsb_width = 512;
+  std::string test_path = GetTestBasePath("vortex-inline-test") + "/test-fsb.vx";
+
+  {
+    auto vx_writer = vortex::VortexFileWriter(cloud_fs, fsb_schema, test_path, properties_);
+
+    arrow::FixedSizeBinaryBuilder fsb_builder(arrow::fixed_size_binary(fsb_width));
+    std::string row_data(fsb_width, '\0');
+    std::mt19937_64 rng(42);
+    for (int64_t i = 0; i < num_rows; ++i) {
+      // Fill with random data to prevent compression from shrinking the file
+      auto* p = reinterpret_cast<uint64_t*>(row_data.data());
+      for (size_t j = 0; j < fsb_width / sizeof(uint64_t); ++j) {
+        p[j] = rng();
+      }
+      ASSERT_TRUE(fsb_builder.Append(row_data).ok());
+    }
+    std::shared_ptr<arrow::Array> fsb_array;
+    ASSERT_TRUE(fsb_builder.Finish(&fsb_array).ok());
+
+    auto rb = arrow::RecordBatch::Make(fsb_schema, num_rows, {fsb_array});
+    ASSERT_TRUE(vx_writer.Write(rb).ok());
+    ASSERT_TRUE(vx_writer.Flush().ok());
+    ASSERT_AND_ASSIGN(auto cgfile, vx_writer.Close());
+    ASSERT_EQ(num_rows, cgfile.end_index);
+  }
+
+  // Open reader and take 1 row
+  auto vx_reader =
+      vortex::VortexFormatReader(cloud_fs, fsb_schema, test_path, properties_, std::vector<std::string>{"embedding"});
+  ASSERT_STATUS_OK(vx_reader.open());
+
+  // Reset metrics before take
+  metrics->Reset();
+
+  std::vector<int64_t> indices = {42};
+  ASSERT_AND_ASSIGN(auto table, vx_reader.take(indices));
+  ASSERT_EQ(1, table->num_rows());
+
+  // Check IO: reading 1 row of 512 bytes should read far less than the full file
+  // Full file is ~5MB; sub-segment read should be well under 1MB
+  auto read_bytes = metrics->GetReadBytes();
+  ASSERT_EQ(read_bytes, fsb_width) << "Sub-segment read of 1 row should be exactly " << fsb_width << " bytes, got "
+                                   << read_bytes;
+}
+
+// Test V2 row group splits with variable-size string data.
+// Writes two batches of 8192 rows with different string sizes (128B and 512B),
+// then verifies that row group splits reflect the byte-size-based partitioning.
+TEST_F(VortexBasicTest, TestV2RowGroupSplitsBySize) {
+  const int64_t rows_per_batch = 8192;
+  const size_t small_str_len = 128;
+  const size_t large_str_len = 512;
+  const uint64_t row_group_max_size = 1024 * 1024;  // 1MB
+
+  auto str_schema = arrow::schema(
+      {arrow::field("str", arrow::utf8(), false, arrow::key_value_metadata({ARROW_FIELD_ID_KEY}, {"100"}))});
+
+  api::SetValue(properties_, PROPERTY_WRITER_VORTEX_FORMAT_VERSION, "2");
+  api::SetValue(properties_, PROPERTY_WRITER_VORTEX_V2_ROW_GROUP_MAX_SIZE, std::to_string(row_group_max_size).c_str());
+
+  std::string test_path = "test-v2-rg-splits.vx";
+
+  // Helper to build a batch of fixed-length random strings
+  auto make_string_batch = [&](size_t str_len, int64_t num_rows) {
+    arrow::StringBuilder builder;
+    std::string s(str_len, 'x');
+    for (int64_t i = 0; i < num_rows; ++i) {
+      EXPECT_TRUE(builder.Append(s).ok());
+    }
+    std::shared_ptr<arrow::Array> arr;
+    EXPECT_TRUE(builder.Finish(&arr).ok());
+    return arrow::RecordBatch::Make(str_schema, num_rows, {arr});
+  };
+
+  // Write: batch1 = 8192 rows * 128B, batch2 = 8192 rows * 512B
+  {
+    auto vx_writer = vortex::VortexFileWriter(file_system_, str_schema, test_path, properties_);
+    ASSERT_TRUE(vx_writer.Write(make_string_batch(small_str_len, rows_per_batch)).ok());
+    ASSERT_TRUE(vx_writer.Write(make_string_batch(large_str_len, rows_per_batch)).ok());
+    ASSERT_TRUE(vx_writer.Flush().ok());
+    ASSERT_AND_ASSIGN(auto cgfile, vx_writer.Close());
+    ASSERT_EQ(rows_per_batch * 2, cgfile.end_index);
+  }
+
+  // Read back and check row group infos
+  auto vx_reader =
+      vortex::VortexFormatReader(file_system_, str_schema, test_path, properties_, std::vector<std::string>{"str"});
+  ASSERT_STATUS_OK(vx_reader.open());
+
+  ASSERT_AND_ASSIGN(auto rg_infos, vx_reader.get_row_group_infos());
+
+  // batch1: 8192 rows * 128B utf8 (132 B/row with offsets) ≈ 1.03 MB
+  // batch2: 8192 rows * 512B utf8 (516 B/row with offsets) ≈ 4.03 MB
+  // row_group_max_size = 1MB → expect 6 row groups:
+  //   rg[0]: batch1 first ~1MB
+  //   rg[1]: batch1 tail + batch2 start (cross-batch merge)
+  //   rg[2..4]: batch2 middle chunks (~1MB each)
+  //   rg[5]: batch2 tail (EOF remainder)
+  ASSERT_EQ(rg_infos.size(), 6u);
+
+  // Verify exact row ranges
+  struct Expected {
+    uint64_t start;
+    uint64_t end;
+  };
+  std::vector<Expected> expected = {{0, 7944},      {7944, 10161},  {10161, 12194},
+                                    {12194, 14227}, {14227, 16260}, {16260, 16384}};
+  for (size_t i = 0; i < expected.size(); ++i) {
+    ASSERT_EQ(rg_infos[i].start_offset, expected[i].start) << "rg[" << i << "] start_offset mismatch";
+    ASSERT_EQ(rg_infos[i].end_offset, expected[i].end) << "rg[" << i << "] end_offset mismatch";
+  }
+
+  // Verify memory_size is non-zero for all row groups
+  for (size_t i = 0; i < rg_infos.size(); ++i) {
+    ASSERT_GT(rg_infos[i].memory_size, 0u) << "rg[" << i << "] memory_size should be > 0";
+  }
+
+  // Verify total rows
+  uint64_t total_rows = 0;
+  for (const auto& rg : rg_infos) {
+    total_rows += (rg.end_offset - rg.start_offset);
+  }
+  ASSERT_EQ(total_rows, static_cast<uint64_t>(rows_per_batch * 2));
+}
+
+TEST_F(VortexBasicTest, TestV2RowGroupMultiColumnSplitsBySize) {
+  const int64_t rows_per_batch = 8192;
+  const size_t str_len_a = 256;
+  const size_t str_len_b = 512;
+  const size_t str_len_c = 1024;
+  const uint64_t row_group_max_size = 10 * 1024 * 1024;  // 10MB
+
+  auto multi_schema = arrow::schema({
+      arrow::field("col_a", arrow::utf8(), false),
+      arrow::field("col_b", arrow::utf8(), false),
+      arrow::field("col_c", arrow::utf8(), false),
+  });
+
+  api::SetValue(properties_, PROPERTY_WRITER_VORTEX_FORMAT_VERSION, "2");
+  api::SetValue(properties_, PROPERTY_WRITER_VORTEX_V2_ROW_GROUP_MAX_SIZE, std::to_string(row_group_max_size).c_str());
+
+  std::string test_path = "test-v2-rg-multi-col.vx";
+
+  // Helper to build a multi-column batch with fixed-length strings per column
+  auto make_batch = [&](int64_t num_rows) {
+    auto build_col = [&](size_t str_len, int64_t n) {
+      arrow::StringBuilder builder;
+      std::string s(str_len, 'x');
+      for (int64_t i = 0; i < n; ++i) {
+        EXPECT_TRUE(builder.Append(s).ok());
+      }
+      std::shared_ptr<arrow::Array> arr;
+      EXPECT_TRUE(builder.Finish(&arr).ok());
+      return arr;
+    };
+    return arrow::RecordBatch::Make(
+        multi_schema, num_rows,
+        {build_col(str_len_a, num_rows), build_col(str_len_b, num_rows), build_col(str_len_c, num_rows)});
+  };
+
+  // Write 4 batches of 8192 rows each
+  // Per-row uncompressed: 256+4 + 512+4 + 1024+4 ≈ 1804 B/row (with offsets)
+  // Per batch: 8192 * 1804 ≈ 14.1 MB → each batch > 10MB limit → gets split
+  // Total: 4 * 8192 = 32768 rows ≈ 56.4 MB
+  {
+    auto vx_writer = vortex::VortexFileWriter(file_system_, multi_schema, test_path, properties_);
+    for (int i = 0; i < 4; ++i) {
+      ASSERT_TRUE(vx_writer.Write(make_batch(rows_per_batch)).ok());
+    }
+    ASSERT_TRUE(vx_writer.Flush().ok());
+    ASSERT_AND_ASSIGN(auto cgfile, vx_writer.Close());
+    ASSERT_EQ(rows_per_batch * 4, cgfile.end_index);
+  }
+
+  // Read back and check row group infos
+  auto vx_reader = vortex::VortexFormatReader(file_system_, multi_schema, test_path, properties_,
+                                              std::vector<std::string>{"col_a", "col_b", "col_c"});
+  ASSERT_STATUS_OK(vx_reader.open());
+
+  ASSERT_AND_ASSIGN(auto rg_infos, vx_reader.get_row_group_infos());
+
+  // Each batch ≈ 14.1 MB, limit 10MB → each batch should be split into ~2 row groups
+  // 4 batches → expect ~6-8 row groups (with cross-batch merging and EOF tail)
+  ASSERT_GT(rg_infos.size(), 4u) << "Should have more row groups than input batches";
+
+  // Verify contiguous ranges and total rows
+  ASSERT_EQ(rg_infos[0].start_offset, 0u);
+  uint64_t total_rows = 0;
+  for (size_t i = 0; i < rg_infos.size(); ++i) {
+    uint64_t rg_rows = rg_infos[i].end_offset - rg_infos[i].start_offset;
+    ASSERT_GT(rg_rows, 0u) << "rg[" << i << "] should have rows";
+    ASSERT_GT(rg_infos[i].memory_size, 0u) << "rg[" << i << "] memory_size should be > 0";
+    total_rows += rg_rows;
+    if (i > 0) {
+      ASSERT_EQ(rg_infos[i].start_offset, rg_infos[i - 1].end_offset) << "rg[" << i << "] should be contiguous";
+    }
+  }
+  ASSERT_EQ(total_rows, static_cast<uint64_t>(rows_per_batch * 4));
+
+  // Verify read correctness: read all rows and check count
+  ASSERT_AND_ASSIGN(auto chunked_array, vx_reader.blocking_read(0, rows_per_batch * 4));
+  ASSERT_AND_ASSIGN(auto rb, ChunkedArrayToRecordBatch(chunked_array));
+  ASSERT_EQ(rb->num_rows(), rows_per_batch * 4);
+  ASSERT_EQ(rb->num_columns(), 3);
 }
 
 }  // namespace milvus_storage
