@@ -64,6 +64,10 @@ class ExternalTableTest : public ::testing::TestWithParam<std::string> {
     if (!IsCloudEnv()) {
       GTEST_SKIP() << "External table tests require cloud environment (STORAGE_TYPE=remote)";
     }
+    auto use_azurite = std::getenv("USE_AZURITE");
+    if (use_azurite && std::string(use_azurite) == "true") {
+      GTEST_SKIP() << "External table tests require real cloud storage, not Azurite";
+    }
     ASSERT_STATUS_OK(InitTestProperties(properties_));
     ASSERT_AND_ASSIGN(fs_, GetFileSystem(properties_));
     ASSERT_AND_ASSIGN(fs_config_, GetFileSystemConfig(properties_));
@@ -71,11 +75,14 @@ class ExternalTableTest : public ::testing::TestWithParam<std::string> {
     auto address = GetEnvVar(ENV_VAR_ADDRESS).ValueOr("");
     auto bucket = GetEnvVar(ENV_VAR_BUCKET_NAME).ValueOr("");
     auto region = GetEnvVar(ENV_VAR_REGION).ValueOr("");
+    auto cloud_provider = GetEnvVar(ENV_VAR_CLOUD_PROVIDER).ValueOr("aws");
     api::SetValue(properties_, "extfs.iam.storage_type", "remote");
-    api::SetValue(properties_, "extfs.iam.cloud_provider", "aws");
+    api::SetValue(properties_, "extfs.iam.cloud_provider", cloud_provider.c_str());
     api::SetValue(properties_, "extfs.iam.address", address.c_str());
     api::SetValue(properties_, "extfs.iam.bucket_name", bucket.c_str());
     api::SetValue(properties_, "extfs.iam.region", region.c_str());
+    auto use_ssl_str = GetEnvVar(ENV_VAR_USE_SSL).ValueOr("true");
+    api::SetValue(properties_, "extfs.iam.use_ssl", use_ssl_str.c_str());
     auto use_iam_str = GetEnvVar(ENV_VAR_USE_IAM).ValueOr("false");
     api::SetValue(properties_, "extfs.iam.use_iam", use_iam_str.c_str());
     if (use_iam_str != "true" && use_iam_str != "1") {
@@ -86,9 +93,11 @@ class ExternalTableTest : public ::testing::TestWithParam<std::string> {
     }
     FilesystemCache::getInstance().clean();
 
-    // External table tests currently only support S3-compatible storage (AWS, MinIO).
-    if (fs_config_.cloud_provider != kCloudProviderAWS) {
-      GTEST_SKIP() << "External table tests require S3-compatible storage (CLOUD_PROVIDER=aws)";
+    // External table tests support S3-compatible (AWS, MinIO), Azure, and GCP storage.
+    if (fs_config_.cloud_provider != kCloudProviderAWS &&
+        fs_config_.cloud_provider != kCloudProviderAzure &&
+        fs_config_.cloud_provider != kCloudProviderGCP) {
+      GTEST_SKIP() << "External table tests require S3, Azure, or GCP storage";
     }
 
     auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -124,7 +133,18 @@ class ExternalTableTest : public ::testing::TestWithParam<std::string> {
     return arrow::Status::Invalid("Unknown format: " + format);
   }
 
-  std::string MakeTableUri(const std::string& bucket, const std::string& path) { return "s3://" + bucket + "/" + path; }
+  std::string MakeTableUri(const std::string& bucket, const std::string& path) {
+    const auto& provider = fs_config_.cloud_provider;
+    if (provider == kCloudProviderAzure) {
+      // Iceberg requires abfss://container@account.dfs.endpoint/path format.
+      // ADDRESS is the base suffix (e.g., "core.windows.net"), prepend ".dfs." for ADLS Gen2.
+      auto account = fs_config_.access_key_id;
+      return "abfss://" + bucket + "@" + account + ".dfs." + fs_config_.address + "/" + path;
+    } else if (provider == kCloudProviderGCP) {
+      return "gs://" + bucket + "/" + path;
+    }
+    return "s3://" + bucket + "/" + path;
+  }
 
   api::Properties properties_;
   ArrowFileSystemPtr fs_;

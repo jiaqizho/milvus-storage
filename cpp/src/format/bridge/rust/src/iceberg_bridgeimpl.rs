@@ -48,7 +48,7 @@ pub(crate) fn detect_io_scheme(metadata_location: &str) -> &str {
         match &metadata_location[..pos] {
             "s3" | "s3a" => "s3",
             "gs" | "gcs" => "gs",
-            "az" | "abfs" | "abfss" => "az",
+            "abfs" | "abfss" | "wasb" | "wasbs" => "abfss",
             scheme => scheme,
         }
     } else {
@@ -240,8 +240,8 @@ mod tests {
     #[test]
     fn test_detect_io_scheme_azure() {
         assert_eq!(detect_io_scheme("az://container/path"), "az");
-        assert_eq!(detect_io_scheme("abfs://container/path"), "az");
-        assert_eq!(detect_io_scheme("abfss://container/path"), "az");
+        assert_eq!(detect_io_scheme("abfs://container/path"), "abfss");
+        assert_eq!(detect_io_scheme("abfss://container/path"), "abfss");
     }
 
     #[test]

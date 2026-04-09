@@ -39,15 +39,20 @@ StorageOptions ToStorageOptions(const ArrowFileSystemConfig& config) {
 
   const auto& provider = config.cloud_provider;
   if (provider == kCloudProviderAWS) {
-    set("aws_access_key_id", config.access_key_id);
-    set("aws_secret_access_key", config.access_key_value);
+    if (!config.use_iam) {
+      set("aws_access_key_id", config.access_key_id);
+      set("aws_secret_access_key", config.access_key_value);
+    }
     set("aws_region", config.region);
     set_endpoint("aws_endpoint", config.address);
   } else if (provider == kCloudProviderAzure) {
     set("azure_storage_account_name", config.access_key_id);
-    set("azure_storage_account_key", config.access_key_value);
+    if (!config.use_iam) {
+      set("azure_storage_account_key", config.access_key_value);
+    }
     if (!config.address.empty()) {
-      options["azure_endpoint"] = StorageUri::BuildAzureEndpointAddress(config.address, config.access_key_id, config.use_ssl);
+      std::string blob_authority = ".blob." + config.address;
+      options["azure_endpoint"] = StorageUri::BuildAzureEndpointAddress(blob_authority, config.access_key_id, config.use_ssl);
       if (!config.use_ssl) options["allow_http"] = "true";
     }
   } else if (provider == kCloudProviderGCP) {

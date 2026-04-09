@@ -14,6 +14,7 @@
 
 #include "milvus-storage/format/iceberg/iceberg_common.h"
 
+#include <cstdlib>
 #include <folly/json/json.h>
 
 namespace milvus_storage::iceberg {
@@ -63,13 +64,22 @@ std::unordered_map<std::string, std::string> ToStorageOptions(const ArrowFileSys
 
   const auto& provider = config.cloud_provider;
   if (provider == kCloudProviderAWS) {
-    set("s3.access-key-id", config.access_key_id);
-    set("s3.secret-access-key", config.access_key_value);
+    if (!config.use_iam) {
+      set("s3.access-key-id", config.access_key_id);
+      set("s3.secret-access-key", config.access_key_value);
+    }
     set("s3.region", config.region);
     set_endpoint("s3.endpoint", config.address);
   } else if (provider == kCloudProviderAzure) {
     set("adls.account-name", config.access_key_id);
-    set("adls.account-key", config.access_key_value);
+    if (config.use_iam) {
+      auto* client_id = std::getenv("AZURE_CLIENT_ID");
+      if (client_id) set("adls.client-id", client_id);
+      auto* tenant_id = std::getenv("AZURE_TENANT_ID");
+      if (tenant_id) set("adls.tenant-id", tenant_id);
+    } else {
+      set("adls.account-key", config.access_key_value);
+    }
   } else if (provider == kCloudProviderGCP) {
     // GCP uses default credentials
   } else if (provider == kCloudProviderAliyun) {
