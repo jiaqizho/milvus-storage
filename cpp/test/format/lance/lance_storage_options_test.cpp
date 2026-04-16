@@ -99,6 +99,53 @@ TEST_F(LanceStorageOptionsTest, AliyunKeys) {
   EXPECT_EQ(opts["oss_endpoint"], "https://oss-cn-hangzhou.aliyuncs.com");
 }
 
+TEST_F(LanceStorageOptionsTest, AzureCrossTenant) {
+  ScopedUnsetAzurite no_azurite;
+  ArrowFileSystemConfig config;
+  config.storage_type = "remote";
+  config.cloud_provider = kCloudProviderAzure;
+  config.access_key_id = "myaccount";
+  config.address = "core.windows.net";
+  config.use_ssl = true;
+  config.azure_tenant_id = "customer-tenant-id";
+  config.azure_client_id = "multi-tenant-app-id";
+
+  auto opts = ToStorageOptions(config);
+
+  EXPECT_EQ(opts["azure_storage_account_name"], "myaccount");
+  EXPECT_EQ(opts["azure_tenant_id"], "customer-tenant-id");
+  EXPECT_EQ(opts["azure_client_id"], "multi-tenant-app-id");
+  // No account key when cross-tenant (MI provides credential)
+  EXPECT_EQ(opts.count("azure_storage_account_key"), 0);
+  EXPECT_EQ(opts["azure_endpoint"], "https://myaccount.blob.core.windows.net");
+}
+
+TEST_F(LanceStorageOptionsTest, GcpImpersonation) {
+  ArrowFileSystemConfig config;
+  config.storage_type = "remote";
+  config.cloud_provider = kCloudProviderGCP;
+  config.gcp_target_service_account = "target-sa@customer-project.iam.gserviceaccount.com";
+  config.load_frequency = 1800;
+
+  auto opts = ToStorageOptions(config);
+
+  // Bridge-private keys; not forwarded to lance-io / object_store.
+  EXPECT_EQ(opts["gcp_target_service_account"], "target-sa@customer-project.iam.gserviceaccount.com");
+  EXPECT_EQ(opts["gcp_credential_refresh_secs"], "1800");
+}
+
+TEST_F(LanceStorageOptionsTest, GcpDefaultCredentials) {
+  ArrowFileSystemConfig config;
+  config.storage_type = "remote";
+  config.cloud_provider = kCloudProviderGCP;
+
+  auto opts = ToStorageOptions(config);
+
+  // No gcp_target_service_account → no impersonation keys; lance-io falls back
+  // to the default credential chain (VM metadata).
+  EXPECT_TRUE(opts.empty());
+}
+
 TEST_F(LanceStorageOptionsTest, LocalEmpty) {
   ArrowFileSystemConfig config;
   config.storage_type = "local";

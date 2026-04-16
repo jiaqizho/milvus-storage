@@ -193,6 +193,26 @@ struct ArrowFileSystemConfig {
   std::string role_arn = "";
   std::string session_name = "";
   std::string external_id = "";
+
+  // Azure cross-tenant access (Managed Identity + Federated Credential)
+  std::string azure_tenant_id = "";
+  std::string azure_client_id = "";
+
+  // GCP cross-tenant access (Service Account Impersonation)
+  // Target service account email to impersonate (e.g., "sa@project.iam.gserviceaccount.com")
+  std::string gcp_target_service_account = "";
+
+  // Lifetime requested for cross-tenant temporary credentials, in seconds.
+  // Shared across providers that mint short-lived tokens:
+  //   - AWS STS AssumeRole: STS session length (clamped to [900, 43200] by STS)
+  //   - GCP IAM impersonated service account: lifetime passed to
+  //     `iamcredentials.generateAccessToken` (max 3600 unless the source SA
+  //     has the constraints/iam.allowServiceAccountCredentialLifetimeExtension
+  //     org policy applied)
+  // Lance/iceberg readers refresh the credential ahead of expiry using this
+  // value as the TTL, so it doubles as the effective refresh interval.
+  // Ignored by providers that don't mint temporary credentials (plain AKSK,
+  // Azure account key, etc.).
   int32_t load_frequency = 900;
 
   // Minimum TLS version for HTTPS connections.

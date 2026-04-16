@@ -68,10 +68,15 @@ std::unordered_map<std::string, std::string> ToStorageOptions(const ArrowFileSys
   };
 
   const auto& provider = config.cloud_provider;
-  LOG_STORAGE_DEBUG_ << fmt::format("provider={}, endpoint={}, use_ssl={}, use_iam={}, has_aksk={}, role_arn={}",
-                                    provider, config.address, config.use_ssl, config.use_iam,
-                                    !config.access_key_id.empty() && !config.access_key_value.empty(),
-                                    config.role_arn.empty() ? "(empty)" : config.role_arn);
+  LOG_STORAGE_DEBUG_ << fmt::format(
+      "provider={}, endpoint={}, use_ssl={}, use_iam={}, has_aksk={}, role_arn={}, azure_tenant_id={}, "
+      "azure_client_id={}, gcp_target_sa={}",
+      provider, config.address, config.use_ssl, config.use_iam,
+      !config.access_key_id.empty() && !config.access_key_value.empty(),
+      config.role_arn.empty() ? "(empty)" : config.role_arn,
+      config.azure_tenant_id.empty() ? "(empty)" : config.azure_tenant_id,
+      config.azure_client_id.empty() ? "(empty)" : config.azure_client_id,
+      config.gcp_target_service_account.empty() ? "(empty)" : config.gcp_target_service_account);
   if (provider == kCloudProviderAWS) {
     if (!config.role_arn.empty()) {
       // AssumeRole: set ARN fields + region/endpoint; do NOT set AKSK so opendal
@@ -96,7 +101,12 @@ std::unordered_map<std::string, std::string> ToStorageOptions(const ArrowFileSys
     // Pass the endpoint suffix so the Rust bridge can reconstruct the full
     // Azure DFS endpoint (account.dfs.suffix) from scheme://container/path URIs.
     set("adls.endpoint-suffix", config.address);
-    if (config.use_iam) {
+    if (!config.azure_tenant_id.empty()) {
+      // Cross-tenant: use Managed Identity + Federated Credential.
+      // Pass tenant_id and client_id; MI provides the base credential automatically.
+      set("adls.tenant-id", config.azure_tenant_id);
+      set("adls.client-id", config.azure_client_id);
+    } else if (config.use_iam) {
       auto* client_id = std::getenv("AZURE_CLIENT_ID");
       if (client_id)
         set("adls.client-id", client_id);
@@ -107,7 +117,13 @@ std::unordered_map<std::string, std::string> ToStorageOptions(const ArrowFileSys
       set("adls.account-key", config.access_key_value);
     }
   } else if (provider == kCloudProviderGCP) {
-    // GCP uses default credentials
+    if (!config.gcp_target_service_account.empty()) {
+      // Service Account Impersonation: pass the target SA email.
+      // opendal/reqsign will use the VM's default credentials to call
+      // generateAccessToken on the target SA.
+      set("gcs.service-account", config.gcp_target_service_account);
+    }
+    // Otherwise uses default credentials (VM metadata)
   } else if (provider == kCloudProviderAliyun) {
     // NO test in IAM
     set("oss.access-key-id", config.access_key_id);

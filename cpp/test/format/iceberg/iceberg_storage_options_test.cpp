@@ -75,7 +75,36 @@ TEST_F(IcebergStorageOptionsTest, LocalEmpty) {
   EXPECT_TRUE(ToStorageOptions(config).empty());
 }
 
-TEST_F(IcebergStorageOptionsTest, GcpEmpty) {
+TEST_F(IcebergStorageOptionsTest, AzureCrossTenant) {
+  ArrowFileSystemConfig config;
+  config.storage_type = "remote";
+  config.cloud_provider = kCloudProviderAzure;
+  config.access_key_id = "myaccount";
+  config.address = "core.windows.net";
+  config.azure_tenant_id = "customer-tenant-id";
+  config.azure_client_id = "multi-tenant-app-id";
+
+  auto opts = ToStorageOptions(config);
+
+  EXPECT_EQ(opts["adls.account-name"], "myaccount");
+  EXPECT_EQ(opts["adls.tenant-id"], "customer-tenant-id");
+  EXPECT_EQ(opts["adls.client-id"], "multi-tenant-app-id");
+  // No account key when cross-tenant (MI provides credential)
+  EXPECT_EQ(opts.count("adls.account-key"), 0);
+}
+
+TEST_F(IcebergStorageOptionsTest, GcpImpersonation) {
+  ArrowFileSystemConfig config;
+  config.storage_type = "remote";
+  config.cloud_provider = kCloudProviderGCP;
+  config.gcp_target_service_account = "target-sa@customer-project.iam.gserviceaccount.com";
+
+  auto opts = ToStorageOptions(config);
+
+  EXPECT_EQ(opts["gcs.service-account"], "target-sa@customer-project.iam.gserviceaccount.com");
+}
+
+TEST_F(IcebergStorageOptionsTest, GcpDefaultCredentials) {
   ArrowFileSystemConfig config;
   config.storage_type = "remote";
   config.cloud_provider = kCloudProviderGCP;
