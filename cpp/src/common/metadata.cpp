@@ -154,13 +154,13 @@ GroupFieldIDList GroupFieldIDList::Deserialize(const std::string& input) {
       if (!field_id.empty()) {
         field_id_list.Add(std::stoll(field_id));
       }
-      column_start = (column_end == std::string::npos) ? std::string::npos : column_end + COLUMN_DELIMITER.size();
+      column_start = (column_end == std::string::npos) ? std::string::npos : column_end + 1;
       column_end = group.find(COLUMN_DELIMITER, column_start);
     }
     if (!field_id_list.empty()) {
       group_field_id_list.push_back(field_id_list);
     }
-    group_start = (group_end == std::string::npos) ? std::string::npos : group_end + GROUP_DELIMITER.size();
+    group_start = (group_end == std::string::npos) ? std::string::npos : group_end + 1;
     group_end = input.find(GROUP_DELIMITER, group_start);
   }
   return GroupFieldIDList(group_field_id_list);
@@ -265,7 +265,7 @@ RowGroupMetadataVector RowGroupMetadataVector::Deserialize(const std::string& in
   std::stringstream ss(input);
   std::string token;
 
-  while (std::getline(ss, token, GROUP_DELIMITER[0])) {
+  while (std::getline(ss, token, GROUP_DELIMITER)) {
     if (!token.empty()) {
       metadata.push_back(RowGroupMetadata::Deserialize(token));
     }

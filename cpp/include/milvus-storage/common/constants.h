@@ -13,18 +13,18 @@
 // limitations under the License.
 
 #pragma once
-#include <string>
+#include <cstdint>
 
 namespace milvus_storage {
 
-inline const std::string ARROW_FIELD_ID_KEY = "PARQUET:field_id";
+inline constexpr char ARROW_FIELD_ID_KEY[] = "PARQUET:field_id";
 
-inline const std::string GROUP_DELIMITER = ";";
-inline const std::string COLUMN_DELIMITER = ",";
-inline const std::string GROUP_FIELD_ID_LIST_META_KEY = "group_field_id_list";
-inline const std::string STORAGE_VERSION_KEY = "storage_version";
+inline constexpr char GROUP_DELIMITER = ';';
+inline constexpr char COLUMN_DELIMITER = ',';
+inline constexpr char GROUP_FIELD_ID_LIST_META_KEY[] = "group_field_id_list";
+inline constexpr char STORAGE_VERSION_KEY[] = "storage_version";
 inline constexpr char ROW_GROUP_META_KEY[] = "row_group_metadata";
 
-inline const int64_t DEFAULT_ARROW_FILESYSTEM_S3_REQUEST_TIMEOUT_SEC = 10;
+inline constexpr int64_t DEFAULT_ARROW_FILESYSTEM_S3_REQUEST_TIMEOUT_SEC = 10;
 
 }  // namespace milvus_storage
