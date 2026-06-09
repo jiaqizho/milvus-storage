@@ -24,6 +24,7 @@ TEST_F(APIPropertiesTest, basic) {
   EXPECT_EQ(GetValueNoError<std::string>(pp, PROPERTY_WRITER_FORMAT), LOON_FORMAT_PARQUET);
   EXPECT_EQ(GetValueNoError<int32_t>(pp, PROPERTY_WRITER_COMPRESSION_LEVEL), 5);
   EXPECT_EQ(GetValueNoError<int32_t>(pp, PROPERTY_WRITER_BUFFER_SIZE), 32 * 1024 * 1024);
+  EXPECT_EQ(GetValueNoError<int64_t>(pp, PROPERTY_WRITER_MULTI_UPLOAD_BUFFER_SIZE), 0);
   EXPECT_TRUE(GetValueNoError<bool>(pp, PROPERTY_WRITER_ENABLE_DICTIONARY));
 
   // Test set & get properties
@@ -31,15 +32,23 @@ TEST_F(APIPropertiesTest, basic) {
   EXPECT_EQ(SetValue(pp, PROPERTY_WRITER_FORMAT, LOON_FORMAT_VORTEX), std::nullopt);
   EXPECT_EQ(SetValue(pp, PROPERTY_WRITER_COMPRESSION_LEVEL, "3"), std::nullopt);
   EXPECT_EQ(SetValue(pp, PROPERTY_WRITER_BUFFER_SIZE, "67108864"), std::nullopt);
+  EXPECT_EQ(SetValue(pp, PROPERTY_WRITER_MULTI_UPLOAD_BUFFER_SIZE, "1048576"), std::nullopt);
   EXPECT_EQ(SetValue(pp, PROPERTY_WRITER_ENABLE_DICTIONARY, "false"), std::nullopt);
 
   EXPECT_EQ(GetValueNoError<std::string>(pp, PROPERTY_WRITER_COMPRESSION), "gzip");
   EXPECT_EQ(GetValueNoError<std::string>(pp, PROPERTY_WRITER_FORMAT), LOON_FORMAT_VORTEX);
   EXPECT_EQ(GetValueNoError<int32_t>(pp, PROPERTY_WRITER_COMPRESSION_LEVEL), 3);
   EXPECT_EQ(GetValueNoError<int32_t>(pp, PROPERTY_WRITER_BUFFER_SIZE), 64 * 1024 * 1024);
+  EXPECT_EQ(GetValueNoError<int64_t>(pp, PROPERTY_WRITER_MULTI_UPLOAD_BUFFER_SIZE), 1024 * 1024);
   EXPECT_FALSE(GetValueNoError<bool>(pp, PROPERTY_WRITER_ENABLE_DICTIONARY));
 
+  EXPECT_EQ(SetValue(pp, PROPERTY_WRITER_MULTI_UPLOAD_BUFFER_SIZE, "0"), std::nullopt);
+  EXPECT_EQ(GetValueNoError<int64_t>(pp, PROPERTY_WRITER_MULTI_UPLOAD_BUFFER_SIZE), 0);
+  EXPECT_EQ(SetValue(pp, PROPERTY_WRITER_MULTI_UPLOAD_BUFFER_SIZE, "-1"), std::nullopt);
+  EXPECT_EQ(GetValueNoError<int64_t>(pp, PROPERTY_WRITER_MULTI_UPLOAD_BUFFER_SIZE), -1);
+
   EXPECT_STREQ(loon_properties_writer_format, PROPERTY_WRITER_FORMAT);
+  EXPECT_STREQ(loon_properties_writer_multi_upload_buffer_size, PROPERTY_WRITER_MULTI_UPLOAD_BUFFER_SIZE);
 }
 
 TEST_F(APIPropertiesTest, SinglePolicyFallsBackToWriterFormat) {

@@ -69,6 +69,7 @@ const char* loon_properties_writer_schema_base_formats = PROPERTY_WRITER_SCHEMA_
 const char* loon_properties_writer_size_base_macs = PROPERTY_WRITER_SIZE_BASE_MACS;
 const char* loon_properties_writer_size_base_mcig = PROPERTY_WRITER_SIZE_BASE_MCIG;
 const char* loon_properties_writer_buffer_size = PROPERTY_WRITER_BUFFER_SIZE;
+const char* loon_properties_writer_multi_upload_buffer_size = PROPERTY_WRITER_MULTI_UPLOAD_BUFFER_SIZE;
 const char* loon_properties_writer_file_rolling_size = PROPERTY_WRITER_FILE_ROLLING_SIZE;
 const char* loon_properties_writer_compression = PROPERTY_WRITER_COMPRESSION;
 const char* loon_properties_writer_compression_level = PROPERTY_WRITER_COMPRESSION_LEVEL;

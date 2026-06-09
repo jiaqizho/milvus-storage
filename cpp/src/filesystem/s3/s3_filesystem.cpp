@@ -727,7 +727,8 @@ class CustomOutputStream final : public arrow::io::OutputStream {
                      const S3Path& path,
                      const S3Options& options,
                      const std::shared_ptr<const arrow::KeyValueMetadata>& metadata,
-                     const int64_t part_size)
+                     const int64_t upload_part_size,
+                     const int64_t upload_buffer_size)
       : holder_(std::move(holder)),
         io_context_(io_context),
         path_(path),
@@ -735,7 +736,9 @@ class CustomOutputStream final : public arrow::io::OutputStream {
         default_metadata_(options.default_metadata),
         background_writes_(options.background_writes),
         use_crc32c_checksum_(options.use_crc32c_checksum),
-        part_upload_size_(part_size) {}
+        part_upload_size_(upload_part_size),
+        upload_buffer_size_(upload_buffer_size <= 0 ? upload_part_size
+                                                    : std::min(upload_buffer_size, upload_part_size)) {}
 
   template <typename ObjectRequest>
   arrow::Status SetMetadataInRequest(ObjectRequest* request) {
@@ -966,6 +969,7 @@ class CustomOutputStream final : public arrow::io::OutputStream {
     if (current_part_size_ > 0) {
       // Try to fill current buffer
       const int64_t to_copy = std::min(nbytes, part_upload_size_ - current_part_size_);
+      ARROW_RETURN_NOT_OK(EnsureCurrentPartCapacity(current_part_size_ + to_copy));
       ARROW_RETURN_NOT_OK(current_part_->Write(data_ptr, to_copy));
       current_part_size_ += to_copy;
       advance_ptr(to_copy);
@@ -989,8 +993,8 @@ class CustomOutputStream final : public arrow::io::OutputStream {
     // Buffer remaining bytes
     if (nbytes > 0) {
       current_part_size_ = nbytes;
-      ARROW_ASSIGN_OR_RAISE(current_part_buffer_,
-                            arrow::AllocateResizableBuffer(part_upload_size_, io_context_.pool()));
+      const int64_t initial_capacity = std::min(part_upload_size_, std::max(upload_buffer_size_, nbytes));
+      ARROW_ASSIGN_OR_RAISE(current_part_buffer_, arrow::AllocateResizableBuffer(initial_capacity, io_context_.pool()));
       current_part_ = std::make_shared<arrow::io::BufferOutputStream>(current_part_buffer_);
       ARROW_RETURN_NOT_OK(current_part_->Write(data_ptr, current_part_size_));
       pos_ += current_part_size_;
@@ -1014,6 +1018,40 @@ class CustomOutputStream final : public arrow::io::OutputStream {
   }
 
   // Upload-related helpers
+
+  // Grow the buffered partial part by doubling capacity, capped at the upload part size.
+  // BufferOutputStream keeps its own capacity, so growth has to rebuild the stream
+  // around a larger buffer instead of resizing current_part_buffer_ in place.
+  arrow::Status EnsureCurrentPartCapacity(int64_t required_size) {
+    DCHECK(current_part_);
+    DCHECK(current_part_buffer_);
+    if (current_part_buffer_->size() >= required_size) {
+      return arrow::Status::OK();
+    }
+
+    int64_t new_capacity = current_part_buffer_->size();
+    while (new_capacity < required_size && new_capacity < part_upload_size_) {
+      new_capacity = std::min(part_upload_size_, new_capacity * 2);
+    }
+
+    return RebuildCurrentPartBuffer(new_capacity);
+  }
+
+  arrow::Status RebuildCurrentPartBuffer(int64_t new_capacity) {
+    ARROW_ASSIGN_OR_RAISE(auto stream_pos, current_part_->Tell());
+    if (stream_pos != current_part_size_) {
+      return arrow::Status::Invalid("Buffer size mismatch: current_part_size_=", current_part_size_,
+                                    " stream position=", stream_pos);
+    }
+
+    ARROW_ASSIGN_OR_RAISE(auto new_buffer_owner, arrow::AllocateResizableBuffer(new_capacity, io_context_.pool()));
+    std::shared_ptr<arrow::ResizableBuffer> new_buffer = std::move(new_buffer_owner);
+    auto new_stream = std::make_shared<arrow::io::BufferOutputStream>(new_buffer);
+    ARROW_RETURN_NOT_OK(new_stream->Write(current_part_buffer_->data(), current_part_size_));
+    current_part_buffer_ = std::move(new_buffer);
+    current_part_ = std::move(new_stream);
+    return arrow::Status::OK();
+  }
 
   // Get the buffered data as a zero-copy slice, avoiding BufferOutputStream::Finish()
   // which calls ZeroPadding() and memsets (capacity - size) bytes to zero.
@@ -1285,6 +1323,7 @@ class CustomOutputStream final : public arrow::io::OutputStream {
   const bool allow_delayed_open_{true};
 
   int64_t part_upload_size_;
+  int64_t upload_buffer_size_;
 
   Aws::String multipart_upload_id_;
   bool closed_ = true;
@@ -2401,15 +2440,18 @@ arrow::Status S3FileSystem::CopyFile(const std::string& src, const std::string& 
 }
 
 arrow::Result<std::shared_ptr<arrow::io::OutputStream>> S3FileSystem::OpenOutputStreamWithUploadSize(
-    const std::string& s, const std::shared_ptr<const arrow::KeyValueMetadata>& metadata, int64_t upload_size) {
+    const std::string& s,
+    const std::shared_ptr<const arrow::KeyValueMetadata>& metadata,
+    int64_t upload_part_size,
+    int64_t upload_buffer_size) {
   ARROW_RETURN_NOT_OK(arrow::fs::internal::AssertNoTrailingSlash(s));
   ARROW_ASSIGN_OR_RAISE(auto path, S3Path::FromString(s));
   ARROW_RETURN_NOT_OK(ValidateFilePath(path));
 
   ARROW_RETURN_NOT_OK(CheckS3Initialized());
 
-  auto ptr =
-      std::make_shared<CustomOutputStream>(impl_->holder_, io_context(), path, impl_->options(), metadata, upload_size);
+  auto ptr = std::make_shared<CustomOutputStream>(impl_->holder_, io_context(), path, impl_->options(), metadata,
+                                                  upload_part_size, upload_buffer_size);
   ARROW_RETURN_NOT_OK(ptr->Init());
   return ptr;
 };
@@ -2442,7 +2484,8 @@ arrow::Result<std::shared_ptr<arrow::io::RandomAccessFile>> S3FileSystem::OpenIn
 arrow::Result<std::shared_ptr<arrow::io::OutputStream>> S3FileSystem::OpenOutputStream(
     const std::string& s, const std::shared_ptr<const arrow::KeyValueMetadata>& metadata) {
   // safe to cast multi_part_upload_size to int64_t, the range is 5MB to 5GB
-  return OpenOutputStreamWithUploadSize(s, metadata, impl_->options().multi_part_upload_size);
+  return OpenOutputStreamWithUploadSize(s, metadata, impl_->options().multi_part_upload_size,
+                                        impl_->options().multi_part_upload_size);
 };
 
 arrow::Result<std::shared_ptr<arrow::io::OutputStream>> S3FileSystem::OpenAppendStream(

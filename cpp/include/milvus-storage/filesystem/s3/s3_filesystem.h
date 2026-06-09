@@ -95,7 +95,10 @@ class S3FileSystem : public arrow::fs::FileSystem, public UploadConditional, pub
       const std::string& path, std::shared_ptr<arrow::KeyValueMetadata> metadata) override;
 
   arrow::Result<std::shared_ptr<arrow::io::OutputStream>> OpenOutputStreamWithUploadSize(
-      const std::string& s, const std::shared_ptr<const arrow::KeyValueMetadata>& metadata, int64_t part_size) override;
+      const std::string& s,
+      const std::shared_ptr<const arrow::KeyValueMetadata>& metadata,
+      int64_t upload_part_size,
+      int64_t upload_buffer_size) override;
 
   protected:
   explicit S3FileSystem(const S3Options& options, const arrow::io::IOContext& io_context);

@@ -157,9 +157,12 @@ arrow::Result<std::unique_ptr<ParquetFileWriter>> ParquetFileWriter::Make(
     std::shared_ptr<arrow::Schema> schema,
     const std::string& file_path,
     const milvus_storage::api::Properties& properties) {
-  ARROW_ASSIGN_OR_RAISE(auto part_size,
+  ARROW_ASSIGN_OR_RAISE(auto upload_part_size,
                         milvus_storage::api::GetValue<int64_t>(properties, PROPERTY_FS_MULTI_PART_UPLOAD_SIZE));
-  return ParquetFileWriter::Make(std::move(schema), std::move(fs), file_path, milvus_storage::StorageConfig{part_size},
+  ARROW_ASSIGN_OR_RAISE(auto multi_upload_buffer_size,
+                        milvus_storage::api::GetValue<int64_t>(properties, PROPERTY_WRITER_MULTI_UPLOAD_BUFFER_SIZE));
+  return ParquetFileWriter::Make(std::move(schema), std::move(fs), file_path,
+                                 milvus_storage::StorageConfig{upload_part_size, multi_upload_buffer_size},
                                  convert_write_properties(properties));
 }
 
@@ -198,7 +201,8 @@ arrow::Status ParquetFileWriter::init() {
   arrow::Result<std::shared_ptr<arrow::io::OutputStream>> sink_result;
   auto upload_size_fs = std::dynamic_pointer_cast<UploadSizable>(fs_);
   if (upload_size_fs) {
-    sink_result = upload_size_fs->OpenOutputStreamWithUploadSize(file_path_, nullptr, storage_config_.part_size);
+    sink_result = upload_size_fs->OpenOutputStreamWithUploadSize(file_path_, nullptr, storage_config_.upload_part_size,
+                                                                 storage_config_.multi_upload_buffer_size);
     // If not supported, fall back to normal OpenOutputStream
     if (!sink_result.ok() && sink_result.status().code() == arrow::StatusCode::NotImplemented) {
       sink_result = fs_->OpenOutputStream(file_path_);

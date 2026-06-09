@@ -393,7 +393,8 @@ class ARROW_EXPORT AzureFileSystem : public FileSystem,
   arrow::Result<std::shared_ptr<arrow::io::OutputStream>> OpenOutputStreamWithUploadSize(
       const std::string& path,
       const std::shared_ptr<const arrow::KeyValueMetadata>& metadata,
-      int64_t upload_size) override;
+      int64_t upload_part_size,
+      int64_t upload_buffer_size) override;
 };
 
 }  // namespace milvus_storage::fs

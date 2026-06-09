@@ -45,6 +45,7 @@
     loon_properties_writer_size_base_macs;
     loon_properties_writer_size_base_mcig;
     loon_properties_writer_buffer_size;
+    loon_properties_writer_multi_upload_buffer_size;
     loon_properties_writer_file_rolling_size;
     loon_properties_writer_compression;
     loon_properties_writer_compression_level;

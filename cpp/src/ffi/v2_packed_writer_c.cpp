@@ -131,7 +131,12 @@ LoonFFIResult loon_packed_writer_new(const char* const* paths,
       RETURN_ERROR(LOON_INVALID_PROPERTIES,
                    "Failed to read fs.multi_part_upload_size: ", part_size_result.status().ToString());
     }
-    StorageConfig storage_config{part_size_result.ValueOrDie()};
+    auto multi_upload_buffer_size_result = GetValue<int64_t>(properties_map, PROPERTY_WRITER_MULTI_UPLOAD_BUFFER_SIZE);
+    if (!multi_upload_buffer_size_result.ok()) {
+      RETURN_ERROR(LOON_INVALID_PROPERTIES, "Failed to read writer.multi_upload_buffer_size: ",
+                   multi_upload_buffer_size_result.status().ToString());
+    }
+    StorageConfig storage_config{part_size_result.ValueOrDie(), multi_upload_buffer_size_result.ValueOrDie()};
 
     size_t effective_buffer = buffer_size > 0 ? static_cast<size_t>(buffer_size)
                                               : static_cast<size_t>(milvus_storage::DEFAULT_WRITE_BUFFER_SIZE);

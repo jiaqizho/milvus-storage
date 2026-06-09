@@ -32,7 +32,8 @@ inline constexpr int64_t DEFAULT_WRITE_BUFFER_SIZE = 16LL * 1024 * 1024;  // 16 
 #define MAXIMAL_MULTIPART_UPLOAD_PART_SIZE (5LL * 1024 * 1024 * 1024)  // 5 GB
 
 struct StorageConfig {
-  int64_t part_size = DEFAULT_MULTIPART_UPLOAD_PART_SIZE;
+  int64_t upload_part_size = DEFAULT_MULTIPART_UPLOAD_PART_SIZE;
+  int64_t multi_upload_buffer_size = 0;
 };
 
 #define LOON_FORMAT_PARQUET "parquet"

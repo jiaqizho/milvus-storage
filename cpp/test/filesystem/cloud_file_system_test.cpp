@@ -888,7 +888,8 @@ TEST_F(CloudFsTest, OpenOutputStreamWithUploadSize) {
 
   std::string content = "upload size test content";
   auto buf = std::make_shared<arrow::Buffer>(reinterpret_cast<const uint8_t*>(content.data()), content.size());
-  ASSERT_AND_ASSIGN(auto out, sizable_fs->OpenOutputStreamWithUploadSize(path, nullptr, 5 * 1024 * 1024));
+  ASSERT_AND_ASSIGN(auto out,
+                    sizable_fs->OpenOutputStreamWithUploadSize(path, nullptr, 5 * 1024 * 1024, 5 * 1024 * 1024));
   ASSERT_STATUS_OK(out->Write(buf));
   ASSERT_STATUS_OK(out->Close());
 

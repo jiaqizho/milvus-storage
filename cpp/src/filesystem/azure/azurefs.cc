@@ -3718,10 +3718,12 @@ arrow::Result<std::shared_ptr<arrow::io::OutputStream>>
 AzureFileSystem::OpenOutputStreamWithUploadSize(
     const std::string& path,
     const std::shared_ptr<const arrow::KeyValueMetadata>& metadata,
-    int64_t upload_size) {
+    int64_t upload_part_size,
+    int64_t /*upload_buffer_size*/) {
+  // Azure does not yet support a separate initial upload buffer size.
   ARROW_ASSIGN_OR_RAISE(auto location, AzureLocation::FromString(path));
   ARROW_ASSIGN_OR_RAISE(auto stream,
-                        impl_->OpenAppendStream(location, metadata, true, this, upload_size));
+                        impl_->OpenAppendStream(location, metadata, true, this, upload_part_size));
   return stream;
 }
 

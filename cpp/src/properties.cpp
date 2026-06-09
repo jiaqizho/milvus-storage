@@ -489,6 +489,12 @@ static std::unordered_map<std::string, PropertyInfo> property_infos = {
                       "The buffer size(Bytes) used in the writer.",
                       32 * 1024 * 1024,  // 32MB
                       ValidatePropertyType()),
+    REGISTER_PROPERTY(PROPERTY_WRITER_MULTI_UPLOAD_BUFFER_SIZE,
+                      PropertyType::INT64,
+                      "The initial upload buffer size(Bytes) used in the writer. Currently supported by S3; Azure "
+                      "ignores this setting.",
+                      int64_t(0),
+                      ValidatePropertyType()),
     REGISTER_PROPERTY(PROPERTY_WRITER_FILE_ROLLING_SIZE,
                       PropertyType::UINT64,
                       "The max size(Bytes) for each data file rolling. Current size is uncompressed data size. Default "

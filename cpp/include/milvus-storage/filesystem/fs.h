@@ -99,14 +99,15 @@ class FileSystemProxy : public arrow::fs::SubTreeFileSystem,
   arrow::Result<std::shared_ptr<arrow::io::OutputStream>> OpenOutputStreamWithUploadSize(
       const std::string& path,
       const std::shared_ptr<const arrow::KeyValueMetadata>& metadata,
-      int64_t part_size) override {
+      int64_t upload_part_size,
+      int64_t upload_buffer_size) override {
     auto sizable = std::dynamic_pointer_cast<UploadSizable>(base_fs());
     if (!sizable) {
       return arrow::Status::NotImplemented("Filesystem does not implement UploadSizable");
     }
 
     ARROW_ASSIGN_OR_RAISE(auto full_path, PrependBase(path));
-    return sizable->OpenOutputStreamWithUploadSize(full_path, metadata, part_size);
+    return sizable->OpenOutputStreamWithUploadSize(full_path, metadata, upload_part_size, upload_buffer_size);
   }
 };
 

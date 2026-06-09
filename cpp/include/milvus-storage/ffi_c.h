@@ -111,6 +111,7 @@ FFI_EXPORT extern const char* loon_properties_writer_schema_base_formats;
 FFI_EXPORT extern const char* loon_properties_writer_size_base_macs;
 FFI_EXPORT extern const char* loon_properties_writer_size_base_mcig;
 FFI_EXPORT extern const char* loon_properties_writer_buffer_size;
+FFI_EXPORT extern const char* loon_properties_writer_multi_upload_buffer_size;
 FFI_EXPORT extern const char* loon_properties_writer_file_rolling_size;
 FFI_EXPORT extern const char* loon_properties_writer_compression;
 FFI_EXPORT extern const char* loon_properties_writer_compression_level;

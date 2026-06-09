@@ -53,7 +53,7 @@ TEST_F(LocalFsTest, UploadSizableNotImplemented) {
   auto sizable = std::dynamic_pointer_cast<UploadSizable>(fs_);
   ASSERT_NE(sizable, nullptr);
 
-  auto result = sizable->OpenOutputStreamWithUploadSize("local-not-implemented.txt", nullptr, 5);
+  auto result = sizable->OpenOutputStreamWithUploadSize("local-not-implemented.txt", nullptr, 5, 5);
   ASSERT_TRUE(result.status().IsNotImplemented());
 }
 

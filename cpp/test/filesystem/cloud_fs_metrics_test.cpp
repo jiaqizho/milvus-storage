@@ -86,7 +86,8 @@ TEST_F(CloudFsMetricsTest, TestMetricsAfterFileOperations) {
   // 5MB part size is the minimum part size for multipart upload
   auto fs = std::dynamic_pointer_cast<UploadSizable>(arrowfs_);
   ASSERT_NE(fs, nullptr);
-  auto write_result = fs->OpenOutputStreamWithUploadSize(base_path_ + test_file_name, nullptr, 10 * 1024 * 1024);
+  auto write_result =
+      fs->OpenOutputStreamWithUploadSize(base_path_ + test_file_name, nullptr, 10 * 1024 * 1024, 10 * 1024 * 1024);
   ASSERT_OK_AND_ASSIGN(auto output_stream, write_result);
 
   auto write_status = output_stream->Write(test_data.data());
@@ -148,8 +149,8 @@ TEST_F(CloudFsMetricsTest, TestBatchingBelowUploadSize) {
 
   auto fs = std::dynamic_pointer_cast<UploadSizable>(arrowfs_);
   ASSERT_NE(fs, nullptr);
-  ASSERT_OK_AND_ASSIGN(auto output_stream,
-                       fs->OpenOutputStreamWithUploadSize(base_path_ + test_file_name, nullptr, upload_size));
+  ASSERT_OK_AND_ASSIGN(auto output_stream, fs->OpenOutputStreamWithUploadSize(base_path_ + test_file_name, nullptr,
+                                                                              upload_size, upload_size));
 
   for (int i = 0; i < num_chunks; ++i) {
     ASSERT_STATUS_OK(output_stream->Write(chunk.data(), chunk.size()));
@@ -158,7 +159,7 @@ TEST_F(CloudFsMetricsTest, TestBatchingBelowUploadSize) {
 
   metrics = observable->GetMetrics();
   ASSERT_NE(metrics, nullptr);
-  // S3 uses PutObject for data < part_size (no multipart), so Created/Finished = 0.
+  // S3 uses PutObject for data < upload_part_size (no multipart), so Created/Finished = 0.
   // Azure always goes through CreateEmptyBlockBlob + StageBlock + CommitBlockList,
   // so Created/Finished = 1.
   auto provider = GetEnvVar(ENV_VAR_CLOUD_PROVIDER);

@@ -132,6 +132,7 @@ struct PropertyInfo {
 #define PROPERTY_WRITER_SIZE_BASE_MACS "writer.split.size_based.max_avg_column_size"
 #define PROPERTY_WRITER_SIZE_BASE_MCIG "writer.split.size_based.max_columns_in_group"
 #define PROPERTY_WRITER_BUFFER_SIZE "writer.buffer_size"
+#define PROPERTY_WRITER_MULTI_UPLOAD_BUFFER_SIZE "writer.multi_upload_buffer_size"
 
 #define PROPERTY_WRITER_FILE_ROLLING_SIZE "writer.file_rolling.size"
 
