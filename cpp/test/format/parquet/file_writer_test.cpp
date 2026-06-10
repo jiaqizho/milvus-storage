@@ -52,7 +52,7 @@ struct ResizeEvent {
 };
 
 class TrackingMemoryPool final : public arrow::MemoryPool {
- public:
+  public:
   explicit TrackingMemoryPool(arrow::MemoryPool* upstream) : upstream_(upstream) {}
 
   arrow::Status Allocate(int64_t size, int64_t alignment, uint8_t** out) override {
@@ -97,7 +97,7 @@ class TrackingMemoryPool final : public arrow::MemoryPool {
     return events_.size();
   }
 
- private:
+  private:
   void Record(int64_t old_size, int64_t new_size) {
     if (new_size <= old_size) {
       return;
@@ -270,8 +270,8 @@ TEST_F(ParquetFileWriterTest, CompressedStringPageReaderGrowsDecompressionBuffer
   props_builder.data_pagesize(4 * 1024);
   props_builder.write_batch_size(4);
   auto writer_props = props_builder.build();
-  ASSERT_AND_ASSIGN(auto writer, ::parquet::arrow::FileWriter::Open(*str_schema, arrow::default_memory_pool(), sink,
-                                                                    writer_props));
+  ASSERT_AND_ASSIGN(auto writer,
+                    ::parquet::arrow::FileWriter::Open(*str_schema, arrow::default_memory_pool(), sink, writer_props));
   ASSERT_STATUS_OK(writer->WriteTable(*table, table->num_rows()));
   ASSERT_STATUS_OK(writer->Close());
   ASSERT_STATUS_OK(sink->Close());
@@ -294,8 +294,8 @@ TEST_F(ParquetFileWriterTest, CompressedStringPageReaderGrowsDecompressionBuffer
 
   tracking_pool.ClearEvents();
   auto stream = reader_props.GetStream(input, start_offset, compressed_size);
-  auto page_reader = ::parquet::PageReader::Open(stream, column_metadata->num_values(), column_metadata->compression(),
-                                                 reader_props);
+  auto page_reader =
+      ::parquet::PageReader::Open(stream, column_metadata->num_values(), column_metadata->compression(), reader_props);
 
   std::vector<int64_t> data_page_sizes;
   int64_t largest_seen_page = 0;

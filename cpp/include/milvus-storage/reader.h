@@ -262,6 +262,15 @@ class Reader {
       int64_t column_group_index, const std::shared_ptr<std::vector<std::string>>& needed_columns = nullptr) const = 0;
 
   /**
+   * @brief Asynchronously get a chunk reader for a specific column group.
+   *
+   * The returned future includes the format-reader open/footer work needed to
+   * initialize the chunk reader.
+   */
+  [[nodiscard]] virtual folly::SemiFuture<arrow::Result<std::unique_ptr<ChunkReader>>> get_chunk_reader_async(
+      int64_t column_group_index, const std::shared_ptr<std::vector<std::string>>& needed_columns = nullptr) const = 0;
+
+  /**
    * @brief Extracts specific rows by their global indices with parallel processing
    *
    * Efficiently retrieves rows at the specified global indices from across all

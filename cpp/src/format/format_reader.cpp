@@ -39,6 +39,24 @@ arrow::Result<std::shared_ptr<FormatReader>> FormatReader::create(
   return fmt->create_reader(read_schema, file, properties, needed_columns, key_retriever);
 }
 
+folly::SemiFuture<arrow::Status> FormatReader::open_async() {
+  auto executor = ThreadPoolHolder::GetThreadPool(1);
+  return folly::via(executor.get(), [this, executor]() { return open(); });
+}
+
+folly::SemiFuture<arrow::Result<std::shared_ptr<FormatReader>>> FormatReader::create_async(
+    const std::shared_ptr<arrow::Schema>& read_schema,
+    const std::string& format,
+    const api::ColumnGroupFile& file,
+    const api::Properties& properties,
+    const std::vector<std::string>& needed_columns,
+    const std::function<std::string(const std::string&)>& key_retriever) {
+  auto executor = ThreadPoolHolder::GetThreadPool(1);
+  return folly::via(executor.get(), [read_schema, format, file, properties, needed_columns, key_retriever, executor]() {
+    return FormatReader::create(read_schema, format, file, properties, needed_columns, key_retriever);
+  });
+}
+
 folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>> FormatReader::read_with_range_async(
     uint64_t start_offset, uint64_t end_offset) {
   auto executor = ThreadPoolHolder::GetThreadPool(1);

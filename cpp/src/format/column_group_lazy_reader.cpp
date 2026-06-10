@@ -55,7 +55,15 @@ class ColumnGroupLazyReaderImpl : public ColumnGroupLazyReader {
   folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> take_async(const TakeTask& task) override;
 
   private:
+  struct ReaderState {
+    explicit ReaderState(size_t file_count) : loaded_format_readers(file_count) {}
+
+    std::mutex prepare_mutex;
+    std::vector<std::shared_ptr<FormatReader>> loaded_format_readers;
+  };
+
   arrow::Status prepare_format_readers(const std::vector<int64_t>& row_indices);
+  folly::SemiFuture<arrow::Status> prepare_format_reader_async(uint32_t file_index);
   arrow::Result<std::shared_ptr<arrow::Table>> take_rows_from_files(const std::vector<int64_t>& row_indices);
 
   std::shared_ptr<arrow::Schema> schema_;
@@ -64,8 +72,7 @@ class ColumnGroupLazyReaderImpl : public ColumnGroupLazyReader {
   std::vector<std::string> needed_columns_;
   std::function<std::string(const std::string&)> key_retriever_;
 
-  std::mutex prepare_mutex_;
-  std::vector<std::shared_ptr<FormatReader>> loaded_format_readers_;
+  std::shared_ptr<ReaderState> state_;
 };
 
 ColumnGroupLazyReaderImpl::ColumnGroupLazyReaderImpl(
@@ -79,7 +86,7 @@ ColumnGroupLazyReaderImpl::ColumnGroupLazyReaderImpl(
       properties_(properties),
       needed_columns_(needed_columns),
       key_retriever_(key_retriever),
-      loaded_format_readers_(column_group->files.size()) {}
+      state_(std::make_shared<ReaderState>(column_group->files.size())) {}
 
 static inline arrow::Result<std::pair<uint32_t, int64_t>> get_index_and_offset_of_file(
     const std::vector<ColumnGroupFile>& files, const int64_t& global_row_index) {
@@ -115,7 +122,7 @@ static arrow::Status validate_sorted_unique_row_indices(const std::vector<int64_
 }
 
 arrow::Status ColumnGroupLazyReaderImpl::prepare_format_readers(const std::vector<int64_t>& row_indices) {
-  std::lock_guard<std::mutex> lock(prepare_mutex_);
+  std::lock_guard<std::mutex> lock(state_->prepare_mutex);
   const auto& cg_files = column_group_->files;
   for (const auto& row_index : row_indices) {
     uint32_t file_index;
@@ -126,13 +133,40 @@ arrow::Status ColumnGroupLazyReaderImpl::prepare_format_readers(const std::vecto
     }
     ARROW_ASSIGN_OR_RAISE(std::tie(file_index, _unused_row_index_in_file),
                           get_index_and_offset_of_file(cg_files, row_index));
-    if (!loaded_format_readers_[file_index]) {
-      ARROW_ASSIGN_OR_RAISE(loaded_format_readers_[file_index],
+    if (!state_->loaded_format_readers[file_index]) {
+      ARROW_ASSIGN_OR_RAISE(state_->loaded_format_readers[file_index],
                             FormatReader::create(schema_, column_group_->format, cg_files[file_index], properties_,
                                                  needed_columns_, key_retriever_));
     }
   }
   return arrow::Status::OK();
+}
+
+folly::SemiFuture<arrow::Status> ColumnGroupLazyReaderImpl::prepare_format_reader_async(uint32_t file_index) {
+  const auto& cg_files = column_group_->files;
+  if (file_index >= cg_files.size()) {
+    return folly::makeSemiFuture(
+        arrow::Status::Invalid(fmt::format("File index out of range: {} out of {}", file_index, cg_files.size())));
+  }
+
+  auto state = state_;
+  {
+    std::lock_guard<std::mutex> lock(state->prepare_mutex);
+    if (state->loaded_format_readers[file_index]) {
+      return folly::makeSemiFuture(arrow::Status::OK());
+    }
+  }
+
+  return FormatReader::create_async(schema_, column_group_->format, cg_files[file_index], properties_, needed_columns_,
+                                    key_retriever_)
+      .deferValue([state, file_index](arrow::Result<std::shared_ptr<FormatReader>>&& reader_result) -> arrow::Status {
+        ARROW_ASSIGN_OR_RAISE(auto format_reader, std::move(reader_result));
+        std::lock_guard<std::mutex> lock(state->prepare_mutex);
+        if (!state->loaded_format_readers[file_index]) {
+          state->loaded_format_readers[file_index] = std::move(format_reader);
+        }
+        return arrow::Status::OK();
+      });
 }
 
 arrow::Result<std::shared_ptr<arrow::Table>> ColumnGroupLazyReaderImpl::take_rows_from_files(
@@ -152,7 +186,7 @@ arrow::Result<std::shared_ptr<arrow::Table>> ColumnGroupLazyReaderImpl::take_row
       continue;
     }
 
-    ARROW_ASSIGN_OR_RAISE(auto cloned_reader, loaded_format_readers_[file_index]->clone_reader());
+    ARROW_ASSIGN_OR_RAISE(auto cloned_reader, state_->loaded_format_readers[file_index]->clone_reader());
     ARROW_ASSIGN_OR_RAISE(auto table, cloned_reader->take(indices_in_files[file_index]));
     tables.emplace_back(table);
   }
@@ -241,39 +275,50 @@ folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> ColumnGroupLazyR
                 folly::makeSemiFuture(arrow::Result<std::shared_ptr<arrow::Table>>(
                     arrow::Status::IOError(fmt::format("Injected fault: {}", FIUKEY_TAKE_ROWS_FAIL)))));
 
-  auto prepare_status = prepare_format_readers(task.row_indices);
-  if (!prepare_status.ok()) {
-    return folly::makeSemiFuture(arrow::Result<std::shared_ptr<arrow::Table>>(prepare_status));
-  }
+  auto state = state_;
+  auto column_group = column_group_;
+  return prepare_format_reader_async(task.file_index)
+      .deferValue(
+          [state, column_group, task](arrow::Status prepare_status) -> arrow::Result<std::shared_ptr<FormatReader>> {
+            ARROW_RETURN_NOT_OK(prepare_status);
 
-  const auto& cg_files = column_group_->files;
-  std::vector<int64_t> rows_in_file;
-  rows_in_file.reserve(task.row_indices.size());
-  for (auto global_row : task.row_indices) {
-    auto result = get_index_and_offset_of_file(cg_files, global_row);
-    if (!result.ok()) {
-      return folly::makeSemiFuture(arrow::Result<std::shared_ptr<arrow::Table>>(result.status()));
-    }
-    auto [file_idx, row_in_file] = result.MoveValueUnsafe();
-    if (file_idx != task.file_index) {
-      return folly::makeSemiFuture(arrow::Result<std::shared_ptr<arrow::Table>>(arrow::Status::Invalid(
-          fmt::format("TakeTask row does not belong to task file. [row={}, expected_file={}, actual_file={}]",
-                      global_row, task.file_index, file_idx))));
-    }
-    rows_in_file.push_back(row_in_file);
-  }
+            const auto& cg_files = column_group->files;
+            for (auto global_row : task.row_indices) {
+              ARROW_ASSIGN_OR_RAISE(auto file_and_offset, get_index_and_offset_of_file(cg_files, global_row));
+              auto [file_idx, _] = file_and_offset;
+              if (file_idx != task.file_index) {
+                return arrow::Status::Invalid(
+                    fmt::format("TakeTask row does not belong to task file. [row={}, expected_file={}, actual_file={}]",
+                                global_row, task.file_index, file_idx));
+              }
+            }
 
-  auto cloned = loaded_format_readers_[task.file_index]->clone_reader();
-  if (!cloned.ok()) {
-    return folly::makeSemiFuture(arrow::Result<std::shared_ptr<arrow::Table>>(cloned.status()));
-  }
-  auto reader = cloned.MoveValueUnsafe();
+            std::lock_guard<std::mutex> lock(state->prepare_mutex);
+            return state->loaded_format_readers[task.file_index]->clone_reader();
+          })
+      .deferValue([column_group, task](arrow::Result<std::shared_ptr<FormatReader>>&& reader_result)
+                      -> folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> {
+        if (!reader_result.ok()) {
+          return folly::makeSemiFuture(arrow::Result<std::shared_ptr<arrow::Table>>(reader_result.status()));
+        }
+        auto reader = reader_result.MoveValueUnsafe();
 
-  auto forward_result = [reader](auto&& table_result) -> arrow::Result<std::shared_ptr<arrow::Table>> {
-    return std::move(table_result);
-  };
+        const auto& cg_files = column_group->files;
+        std::vector<int64_t> rows_in_file;
+        rows_in_file.reserve(task.row_indices.size());
+        for (auto global_row : task.row_indices) {
+          auto result = get_index_and_offset_of_file(cg_files, global_row);
+          if (!result.ok()) {
+            return folly::makeSemiFuture(arrow::Result<std::shared_ptr<arrow::Table>>(result.status()));
+          }
+          rows_in_file.push_back(result.MoveValueUnsafe().second);
+        }
 
-  return reader->take_async(rows_in_file).deferValue(std::move(forward_result));
+        auto forward_result = [reader](auto&& table_result) -> arrow::Result<std::shared_ptr<arrow::Table>> {
+          return std::move(table_result);
+        };
+        return reader->take_async(rows_in_file).deferValue(std::move(forward_result));
+      });
 }
 
 };  // namespace milvus_storage::api

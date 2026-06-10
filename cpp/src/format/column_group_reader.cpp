@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <utility>
 
 #include <arrow/array/util.h>
 #include <arrow/chunked_array.h>
@@ -57,6 +58,7 @@ class ColumnGroupReaderImpl : public ColumnGroupReader {
   ~ColumnGroupReaderImpl() override = default;
 
   [[nodiscard]] arrow::Status open() override;
+  [[nodiscard]] folly::SemiFuture<arrow::Status> open_async();
   [[nodiscard]] size_t total_number_of_chunks() const override;
   [[nodiscard]] size_t total_rows() const override;
   [[nodiscard]] arrow::Result<std::vector<int64_t>> get_chunk_indices(const std::vector<int64_t>& row_indices) override;
@@ -77,6 +79,19 @@ class ColumnGroupReaderImpl : public ColumnGroupReader {
   [[nodiscard]] std::shared_ptr<arrow::Schema> get_schema() const override;
 
   private:
+  struct OpenedFile {
+    size_t file_index;
+    ColumnGroupFile file;
+    std::shared_ptr<FormatReader> reader;
+    std::vector<RowGroupInfo> row_group_infos;
+  };
+
+  [[nodiscard]] arrow::Status append_file_metadata(size_t file_idx,
+                                                   const ColumnGroupFile& cg_file,
+                                                   const std::vector<RowGroupInfo>& row_group_in_file,
+                                                   std::shared_ptr<FormatReader> format_reader,
+                                                   size_t& rows_in_all_files);
+
   ChunkRBMapResult read_chunks_from_files(const std::vector<int64_t>& task_indices);
 
   protected:
@@ -136,6 +151,51 @@ arrow::Result<std::unique_ptr<ColumnGroupReader>> ColumnGroupReader::create(
   return std::move(reader);
 }
 
+folly::SemiFuture<arrow::Result<std::unique_ptr<ColumnGroupReader>>> ColumnGroupReader::create_async(
+    const std::shared_ptr<arrow::Schema>& schema,
+    const std::shared_ptr<milvus_storage::api::ColumnGroup>& column_group,
+    const std::vector<std::string>& needed_columns,
+    const milvus_storage::api::Properties& properties,
+    const std::function<std::string(const std::string&)>& key_retriever,
+    const std::string& predicate) {
+  if (!column_group) {
+    return folly::makeSemiFuture(
+        arrow::Result<std::unique_ptr<ColumnGroupReader>>(arrow::Status::Invalid("Column group cannot be null")));
+  }
+
+  std::shared_ptr<arrow::Schema> out_schema;
+  std::vector<std::string> filtered_columns;
+  for (const auto& col_name : needed_columns) {
+    if (std::find(column_group->columns.begin(), column_group->columns.end(), col_name) !=
+        column_group->columns.end()) {
+      filtered_columns.emplace_back(col_name);
+    }
+  }
+
+  if (schema) {
+    std::vector<std::shared_ptr<arrow::Field>> fields;
+    for (const auto& col_name : filtered_columns) {
+      auto field = schema->GetFieldByName(col_name);
+      if (!field) {
+        return folly::makeSemiFuture(arrow::Result<std::unique_ptr<ColumnGroupReader>>(
+            arrow::Status::Invalid("ColumnGroupReader: column '" + col_name +
+                                   "' found in column_group but not in schema. Schema fields: " + schema->ToString())));
+      }
+      fields.emplace_back(field);
+    }
+    out_schema = std::make_shared<arrow::Schema>(fields);
+  }
+
+  auto reader = std::make_unique<milvus_storage::api::ColumnGroupReaderImpl>(
+      out_schema, column_group, properties, filtered_columns, key_retriever, predicate);
+  auto* reader_ptr = reader.get();
+  return reader_ptr->open_async().deferValue(
+      [reader = std::move(reader)](arrow::Status status) mutable -> arrow::Result<std::unique_ptr<ColumnGroupReader>> {
+        ARROW_RETURN_NOT_OK(status);
+        return std::move(reader);
+      });
+}
+
 std::string ChunkInfo::ToString() const {
   std::stringstream ss;
   ss << "ChunkInfo{"
@@ -158,6 +218,63 @@ ColumnGroupReaderImpl::ColumnGroupReaderImpl(const std::shared_ptr<arrow::Schema
       needed_columns_(needed_columns),
       key_retriever_(key_retriever),
       predicate_(predicate) {}
+
+arrow::Status ColumnGroupReaderImpl::append_file_metadata(size_t file_idx,
+                                                          const ColumnGroupFile& cg_file,
+                                                          const std::vector<RowGroupInfo>& row_group_in_file,
+                                                          std::shared_ptr<FormatReader> format_reader,
+                                                          size_t& rows_in_all_files) {
+  if (row_group_in_file.empty()) {
+    return arrow::Status::OK();
+  }
+
+  size_t rows_in_file = 0;
+  if ((cg_file.start_index != 0 || cg_file.end_index != row_group_in_file.back().end_offset)) {
+    const auto& start_index = cg_file.start_index;
+    const auto& end_index = cg_file.end_index;
+
+    assert(start_index >= 0 && end_index > 0 && start_index < end_index);
+
+    for (size_t j = 0; j < row_group_in_file.size(); ++j) {
+      size_t rg_start = row_group_in_file[j].start_offset;
+      size_t rg_end = row_group_in_file[j].end_offset;
+
+      size_t overlap_start = std::max(static_cast<size_t>(start_index), rg_start);
+      size_t overlap_end = std::min(static_cast<size_t>(end_index), rg_end);
+
+      if (overlap_start < overlap_end) {
+        rows_in_file += (overlap_end - overlap_start);
+        chunk_infos_.emplace_back(ChunkInfo{
+            .file_index = file_idx,
+            .row_offset_in_row_group = overlap_start - rg_start,
+            .row_offset_in_file = overlap_start,
+            .number_of_rows = overlap_end - overlap_start,
+            .row_group_index_in_file = j,
+            .global_row_end = rows_in_all_files + rows_in_file,
+            .avg_memory_size = row_group_in_file[j].memory_size * (overlap_end - overlap_start) / (rg_end - rg_start),
+        });
+      }
+    }
+  } else {
+    for (size_t j = 0; j < row_group_in_file.size(); ++j) {
+      rows_in_file += (row_group_in_file[j].end_offset - row_group_in_file[j].start_offset);
+      chunk_infos_.emplace_back(ChunkInfo{
+          .file_index = file_idx,
+          .row_offset_in_row_group = 0,
+          .row_offset_in_file = row_group_in_file[j].start_offset,
+          .number_of_rows = row_group_in_file[j].end_offset - row_group_in_file[j].start_offset,
+          .row_group_index_in_file = j,
+          .global_row_end = rows_in_all_files + rows_in_file,
+          .avg_memory_size = row_group_in_file[j].memory_size,
+      });
+    }
+  }
+
+  row_group_infos_.emplace_back(row_group_in_file);
+  format_readers_.emplace_back(std::move(format_reader));
+  rows_in_all_files += rows_in_file;
+  return arrow::Status::OK();
+}
 
 arrow::Status ColumnGroupReaderImpl::open() {
   const auto& cg_files = column_group_->files;
@@ -182,62 +299,63 @@ arrow::Status ColumnGroupReaderImpl::open() {
       }
     }
     ARROW_ASSIGN_OR_RAISE(auto row_group_in_file, format_reader->get_row_group_infos());
-    if (row_group_in_file.empty()) {
-      continue;
-    }
-
-    size_t rows_in_file = 0;
-    if ((cg_file.start_index != 0 || cg_file.end_index != row_group_in_file.back().end_offset)) {
-      const auto& start_index = cg_file.start_index;
-      const auto& end_index = cg_file.end_index;
-
-      assert(start_index >= 0 && end_index > 0 && start_index < end_index);
-
-      for (size_t j = 0; j < row_group_in_file.size(); ++j) {
-        size_t rg_start = row_group_in_file[j].start_offset;
-        size_t rg_end = row_group_in_file[j].end_offset;
-
-        // calculate the overlap range
-        size_t overlap_start = std::max(static_cast<size_t>(start_index), rg_start);
-        size_t overlap_end = std::min(static_cast<size_t>(end_index), rg_end);
-
-        // if the overlap range is valid, create the chunk info
-        if (overlap_start < overlap_end) {
-          rows_in_file += (overlap_end - overlap_start);
-          chunk_infos_.emplace_back(ChunkInfo{
-              .file_index = file_idx,
-              .row_offset_in_row_group = overlap_start - rg_start,
-              .row_offset_in_file = overlap_start,
-              .number_of_rows = overlap_end - overlap_start,
-              .row_group_index_in_file = j,
-              .global_row_end = rows_in_all_files + rows_in_file,
-              .avg_memory_size = row_group_in_file[j].memory_size * (overlap_end - overlap_start) / (rg_end - rg_start),
-          });
-        }
-      }
-    } else {
-      // create the chunk infos with row group indices
-      for (size_t j = 0; j < row_group_in_file.size(); ++j) {
-        rows_in_file += (row_group_in_file[j].end_offset - row_group_in_file[j].start_offset);
-        chunk_infos_.emplace_back(ChunkInfo{
-            .file_index = file_idx,
-            .row_offset_in_row_group = 0,
-            .row_offset_in_file = row_group_in_file[j].start_offset,
-            .number_of_rows = row_group_in_file[j].end_offset - row_group_in_file[j].start_offset,
-            .row_group_index_in_file = j,
-            .global_row_end = rows_in_all_files + rows_in_file,
-            .avg_memory_size = row_group_in_file[j].memory_size,
-        });
-      }
-    }
-
-    row_group_infos_.emplace_back(row_group_in_file);
-    format_readers_.emplace_back(std::move(format_reader));
-    rows_in_all_files += rows_in_file;
+    ARROW_RETURN_NOT_OK(
+        append_file_metadata(file_idx, cg_file, row_group_in_file, std::move(format_reader), rows_in_all_files));
   }
 
   total_rows_ = rows_in_all_files;
   return arrow::Status::OK();
+}
+
+folly::SemiFuture<arrow::Status> ColumnGroupReaderImpl::open_async() {
+  const auto& cg_files = column_group_->files;
+  std::vector<folly::SemiFuture<arrow::Result<OpenedFile>>> futures;
+  futures.reserve(cg_files.size());
+
+  for (size_t file_idx = 0; file_idx < cg_files.size(); ++file_idx) {
+    auto cg_file = cg_files[file_idx];
+    if (cg_file.start_index < 0 || cg_file.end_index < 0 || cg_file.start_index >= cg_file.end_index) {
+      return folly::makeSemiFuture(arrow::Status::Invalid(
+          fmt::format("Invalid start/end index in [file_index={}, path={}]", file_idx, cg_file.path)));
+    }
+
+    auto future =
+        FormatReader::create_async(schema_, column_group_->format, cg_file, properties_, needed_columns_,
+                                   key_retriever_)
+            .deferValue([this, file_idx, cg_file](
+                            arrow::Result<std::shared_ptr<FormatReader>>&& reader_result) -> arrow::Result<OpenedFile> {
+              ARROW_ASSIGN_OR_RAISE(auto format_reader, std::move(reader_result));
+              if (!predicate_.empty()) {
+                try {
+                  format_reader->set_predicate(predicate_);
+                } catch (const std::exception& e) {
+                  return arrow::Status::Invalid(fmt::format("Failed to set predicate '{}': {}", predicate_, e.what()));
+                }
+              }
+              ARROW_ASSIGN_OR_RAISE(auto row_group_infos, format_reader->get_row_group_infos());
+              return OpenedFile{file_idx, cg_file, std::move(format_reader), std::move(row_group_infos)};
+            });
+    futures.push_back(std::move(future));
+  }
+
+  return folly::collectAll(std::move(futures)).deferValue([this](auto&& open_results) mutable -> arrow::Status {
+    chunk_infos_.clear();
+    row_group_infos_.clear();
+    format_readers_.clear();
+
+    size_t rows_in_all_files = 0;
+    for (auto& try_result : open_results) {
+      if (try_result.hasException()) {
+        return arrow::Status::IOError(try_result.exception().what().toStdString());
+      }
+      ARROW_ASSIGN_OR_RAISE(auto opened_file, std::move(try_result.value()));
+      ARROW_RETURN_NOT_OK(append_file_metadata(opened_file.file_index, opened_file.file, opened_file.row_group_infos,
+                                               std::move(opened_file.reader), rows_in_all_files));
+    }
+
+    total_rows_ = rows_in_all_files;
+    return arrow::Status::OK();
+  });
 }
 
 size_t ColumnGroupReaderImpl::total_number_of_chunks() const {

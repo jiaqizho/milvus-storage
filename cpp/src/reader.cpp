@@ -513,6 +513,7 @@ class ChunkReaderImpl : public ChunkReader {
 
   // open the reader
   arrow::Status open();
+  folly::SemiFuture<arrow::Status> open_async();
 
   /**
    * @brief Destructor
@@ -531,6 +532,7 @@ class ChunkReaderImpl : public ChunkReader {
   [[nodiscard]] arrow::Result<std::vector<uint64_t>> get_chunk_rows() override;
 
   private:
+  [[nodiscard]] arrow::Status validate_needed_columns() const;
   [[nodiscard]] arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> get_chunks_sync(
       const std::vector<int64_t>& chunk_indices);
 
@@ -557,7 +559,7 @@ ChunkReaderImpl::ChunkReaderImpl(const std::shared_ptr<arrow::Schema>& schema,
       properties_(properties),
       key_retriever_callback_(key_retriever) {}
 
-arrow::Status ChunkReaderImpl::open() {
+arrow::Status ChunkReaderImpl::validate_needed_columns() const {
   // The case is:
   // column groups:
   //   - group1 :[a, b]
@@ -582,10 +584,28 @@ arrow::Status ChunkReaderImpl::open() {
     // TODO(jiaqizho): more info in invalid message
     return arrow::Status::Invalid("No needed columns found in column group");
   }
+  return arrow::Status::OK();
+}
+
+arrow::Status ChunkReaderImpl::open() {
+  ARROW_RETURN_NOT_OK(validate_needed_columns());
 
   ARROW_ASSIGN_OR_RAISE(chunk_reader_, ColumnGroupReader::create(schema_, column_group_, needed_columns_, properties_,
                                                                  key_retriever_callback_));
   return arrow::Status::OK();
+}
+
+folly::SemiFuture<arrow::Status> ChunkReaderImpl::open_async() {
+  auto validation_status = validate_needed_columns();
+  if (!validation_status.ok()) {
+    return folly::makeSemiFuture(validation_status);
+  }
+
+  return ColumnGroupReader::create_async(schema_, column_group_, needed_columns_, properties_, key_retriever_callback_)
+      .deferValue([this](arrow::Result<std::unique_ptr<ColumnGroupReader>>&& reader_result) -> arrow::Status {
+        ARROW_ASSIGN_OR_RAISE(chunk_reader_, std::move(reader_result));
+        return arrow::Status::OK();
+      });
 }
 
 size_t ChunkReaderImpl::total_number_of_chunks() const { return chunk_reader_->total_number_of_chunks(); }
@@ -696,8 +716,7 @@ folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>
 
   return folly::collectAll(std::move(futures))
       .deferValue([chunk_indices, task_chunk_lists = std::move(task_chunk_lists)](
-                      auto&& all_results) mutable
-                  -> arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> {
+                      auto&& all_results) mutable -> arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> {
         std::unordered_map<int64_t, std::shared_ptr<arrow::RecordBatch>> all_rbs;
         for (size_t i = 0; i < all_results.size(); ++i) {
           auto& tryResult = all_results[i];
@@ -879,6 +898,38 @@ class ReaderImpl : public Reader {
     return chunk_reader;
   }
 
+  [[nodiscard]] folly::SemiFuture<arrow::Result<std::unique_ptr<ChunkReader>>> get_chunk_reader_async(
+      int64_t column_group_index,
+      const std::shared_ptr<std::vector<std::string>>& needed_columns = nullptr) const override {
+    if (column_group_index < 0 || static_cast<size_t>(column_group_index) >= cgs_->size()) {
+      return folly::makeSemiFuture(arrow::Result<std::unique_ptr<ChunkReader>>(arrow::Status::Invalid(
+          fmt::format("Failed to get chunk reader, column group index out of range: {} (size: {})",
+                      column_group_index,  // NOLINT
+                      cgs_->size()))));
+    }
+    auto column_group = (*cgs_)[column_group_index];
+    if (!column_group) {
+      return folly::makeSemiFuture(arrow::Result<std::unique_ptr<ChunkReader>>(arrow::Status::Invalid(
+          fmt::format("Failed to get chunk reader, column group at index {} is null", column_group_index))));
+    }
+
+    auto resolved_columns_result = resolve_needed_columns(schema_, effective_needed_columns(needed_columns));
+    if (!resolved_columns_result.ok()) {
+      return folly::makeSemiFuture(arrow::Result<std::unique_ptr<ChunkReader>>(resolved_columns_result.status()));
+    }
+    auto resolved_columns = resolved_columns_result.MoveValueUnsafe();
+
+    auto chunk_reader = std::make_unique<ChunkReaderImpl>(schema_, column_group, resolved_columns, properties_,
+                                                          key_retriever_callback_);
+    auto* chunk_reader_ptr = chunk_reader.get();
+    return chunk_reader_ptr->open_async().deferValue(
+        [chunk_reader =
+             std::move(chunk_reader)](arrow::Status status) mutable -> arrow::Result<std::unique_ptr<ChunkReader>> {
+          ARROW_RETURN_NOT_OK(status);
+          return std::move(chunk_reader);
+        });
+  }
+
   /**
    * @brief Extracts specific rows by their global indices with parallel processing
    */
@@ -926,8 +977,7 @@ class ReaderImpl : public Reader {
       if (!empty_table.ok()) {
         return folly::makeSemiFuture(arrow::Result<std::shared_ptr<arrow::Table>>(empty_table.status()));
       }
-      return folly::makeSemiFuture(
-          arrow::Result<std::shared_ptr<arrow::Table>>(empty_table.MoveValueUnsafe()));
+      return folly::makeSemiFuture(arrow::Result<std::shared_ptr<arrow::Table>>(empty_table.MoveValueUnsafe()));
     }
 
     if (cgs_->empty()) {
@@ -937,8 +987,7 @@ class ReaderImpl : public Reader {
 
     auto resolved_columns_result = resolve_needed_columns(schema_, effective_needed_columns(needed_columns));
     if (!resolved_columns_result.ok()) {
-      return folly::makeSemiFuture(
-          arrow::Result<std::shared_ptr<arrow::Table>>(resolved_columns_result.status()));
+      return folly::makeSemiFuture(arrow::Result<std::shared_ptr<arrow::Table>>(resolved_columns_result.status()));
     }
     auto resolved_columns = resolved_columns_result.MoveValueUnsafe();
 
@@ -1100,8 +1149,8 @@ arrow::Result<std::shared_ptr<std::vector<std::unique_ptr<ColumnGroupLazyReader>
       return arrow::Status::Invalid(fmt::format("Failed to call take, column group at index {} is empty", i));
     }
     ARROW_ASSIGN_OR_RAISE((*lazy_readers)[i],
-                          ColumnGroupLazyReader::create(schema_, needed_column_groups[i], properties_,
-                                                        resolved_columns, key_retriever_callback_));
+                          ColumnGroupLazyReader::create(schema_, needed_column_groups[i], properties_, resolved_columns,
+                                                        key_retriever_callback_));
   }
   return lazy_readers;
 }
@@ -1195,8 +1244,7 @@ folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::Table>>>> Rea
   for (size_t i = 0; i < readers.size(); ++i) {
     auto natural_result = readers[i]->get_natural_tasks(row_indices);
     if (!natural_result.ok()) {
-      return folly::makeSemiFuture(
-          arrow::Result<std::vector<std::shared_ptr<arrow::Table>>>(natural_result.status()));
+      return folly::makeSemiFuture(arrow::Result<std::vector<std::shared_ptr<arrow::Table>>>(natural_result.status()));
     }
     auto natural = natural_result.MoveValueUnsafe();
     for (auto& task : natural) {

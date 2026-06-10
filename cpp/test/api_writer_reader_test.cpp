@@ -1630,6 +1630,21 @@ TEST_P(APIWriterReaderTest, PublicGetChunksAsync) {
   ExpectStandardTestValue(chunks[0]->column(0), "id", 0);
 }
 
+TEST_P(APIWriterReaderTest, PublicGetChunkReaderAsync) {
+  ASSERT_AND_ASSIGN(auto policy, CreateSinglePolicy(format, schema_));
+  auto writer = Writer::create(base_path_, schema_, std::move(policy), properties_);
+  ASSERT_STATUS_OK(writer->write(test_batch_));
+  ASSERT_AND_ASSIGN(auto cgs, writer->close());
+
+  auto reader = Reader::create(cgs, schema_, nullptr, properties_);
+
+  ASSERT_AND_ASSIGN(auto chunk_reader, std::move(reader->get_chunk_reader_async(0)).get());
+  ASSERT_AND_ASSIGN(auto chunks, std::move(chunk_reader->get_chunks_async({0}, parallelism_)).get());
+  ASSERT_EQ(chunks.size(), 1);
+  ASSERT_EQ(chunks[0]->num_rows(), test_batch_->num_rows());
+  ExpectStandardTestValue(chunks[0]->column(0), "id", 0);
+}
+
 TEST_P(APIWriterReaderTest, TakeOutOfRangeWithParallelism) {
   ASSERT_AND_ASSIGN(auto policy, CreateSinglePolicy(format, schema_));
   auto writer = Writer::create(base_path_, schema_, std::move(policy), properties_);
