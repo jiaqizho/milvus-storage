@@ -325,6 +325,11 @@ class ScanBuilder {
   /// Take ownership and consume the scan builder to a stream of record batches.
   ArrowArrayStream IntoStream() &&;
 
+  /// Transfer ownership of the underlying Rust VortexScanBuilder to a raw
+  /// handle. Used by the async path so the handle can be passed to the extern
+  /// "C" callback API.
+  uintptr_t IntoRawHandle() &&;
+
   private:
   friend class VortexFile;
 
@@ -332,6 +337,16 @@ class ScanBuilder {
 
   rust::Box<ffi::VortexScanBuilder> impl_;
 };
+
+using VortexAsyncCallback = void (*)(void* ctx, ArrowArrayStream* out_stream, const char* error_msg);
+
+extern "C" {
+
+void vortex_scan_collect_async(uintptr_t handle, ArrowArrayStream* out_stream, VortexAsyncCallback callback, void* ctx);
+
+void vortex_free_error_string(char* ptr);
+
+}  // extern "C"
 
 /// IO trace: enable tracing and reset state
 inline void ResetIOTrace() { ffi::reset_io_trace_ffi(); }

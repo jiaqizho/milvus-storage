@@ -90,6 +90,12 @@ class ParquetFormatReader final : public FormatReader {
 
   [[nodiscard]] arrow::Result<std::shared_ptr<FormatReader>> clone_reader() override;
 
+  [[nodiscard]] folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>> read_with_range_async(
+      uint64_t start_offset, uint64_t end_offset, const api::AsyncReadOptions& options = {}) override;
+
+  [[nodiscard]] folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> take_async(
+      const std::vector<int64_t>& row_indices, const api::AsyncReadOptions& options = {}) override;
+
   [[nodiscard]] std::shared_ptr<arrow::Schema> get_schema() const override;
 
   private:

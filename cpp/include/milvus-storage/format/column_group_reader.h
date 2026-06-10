@@ -14,15 +14,40 @@
 
 #pragma once
 
+#include <cstdint>
+#include <string>
+#include <vector>
+
 #include <arrow/filesystem/filesystem.h>
+#include <folly/futures/Future.h>
 
 #include "milvus-storage/column_groups.h"
+#include "milvus-storage/async_read_options.h"
 #include "milvus-storage/properties.h"
 #include "milvus-storage/format/format_reader_cache.h"
 #include "milvus-storage/format/format_reader.h"
 #include "milvus-storage/thread_pool.h"
 
 namespace milvus_storage::api {
+
+struct ChunkInfo {
+  size_t file_index;               // current chunk belong which file
+  size_t row_offset_in_row_group;  // the starting row offset of this row group in its file
+  size_t row_offset_in_file;       // the starting row offset of file
+  size_t number_of_rows;           // number of rows in this row group
+  size_t row_group_index_in_file;  // the index of this row group in its file
+  size_t global_row_end;           // the ending row offset of this row group in the whole chunk reader
+  size_t avg_memory_size;          // average memory usage of this row group
+
+  [[nodiscard]] std::string ToString() const;
+};
+
+struct ChunkTask {
+  size_t file_index;
+  std::vector<int64_t> chunk_indices;
+  uint64_t range_start;
+  uint64_t range_end;
+};
 
 class ColumnGroupReader {
   public:
@@ -42,6 +67,18 @@ class ColumnGroupReader {
   virtual arrow::Result<uint64_t> get_chunk_size(int64_t chunk_index) = 0;
   virtual arrow::Result<uint64_t> get_chunk_rows(int64_t chunk_index) = 0;
 
+  // Returns natural tasks grouped by file x merged contiguous range.
+  // Pure metadata computation, no I/O.
+  virtual std::vector<ChunkTask> get_natural_tasks(const std::vector<int64_t>& chunk_indices) = 0;
+
+  // Get chunk info by index (for task splitting in reader.cpp).
+  virtual const ChunkInfo& get_chunk_info(int64_t chunk_index) const = 0;
+
+  // Async execution of a pre-planned ChunkTask.
+  // The task must come from get_natural_tasks() or be a valid split of one.
+  virtual folly::SemiFuture<arrow::Result<RecordBatchVector>> get_chunks_async(const ChunkTask& task,
+                                                                               const AsyncReadOptions& options) = 0;
+
   // get the file schema of this column group (always derived from file metadata, not projected)
   virtual std::shared_ptr<arrow::Schema> get_schema() const = 0;
 
@@ -55,6 +92,15 @@ class ColumnGroupReader {
    * @return Unique pointer to the created chunk reader
    */
   [[nodiscard]] static arrow::Result<std::unique_ptr<ColumnGroupReader>> create(
+      const std::shared_ptr<arrow::Schema>& schema,
+      const std::shared_ptr<milvus_storage::api::ColumnGroup>& column_group,
+      const std::vector<std::string>& needed_columns,
+      const milvus_storage::api::Properties& properties,
+      const std::function<std::string(const std::string&)>& key_retriever,
+      const std::string& predicate = "",
+      const milvus_storage::MetadataCache& cache = milvus_storage::MetadataCache());
+
+  [[nodiscard]] static folly::SemiFuture<arrow::Result<std::unique_ptr<ColumnGroupReader>>> create_async(
       const std::shared_ptr<arrow::Schema>& schema,
       const std::shared_ptr<milvus_storage::api::ColumnGroup>& column_group,
       const std::vector<std::string>& needed_columns,

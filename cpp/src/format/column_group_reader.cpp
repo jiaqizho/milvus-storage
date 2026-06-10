@@ -14,11 +14,14 @@
 
 #include "milvus-storage/format/column_group_reader.h"
 
+#include <algorithm>
+#include <future>
+#include <sstream>
+#include <map>
 #include <numeric>
 #include <unordered_map>
-#include <future>
+#include <unordered_set>
 #include <vector>
-#include <algorithm>
 
 #include <arrow/array/util.h>
 #include <arrow/chunked_array.h>
@@ -49,18 +52,6 @@ namespace milvus_storage::api {
 
 using milvus_storage::RowGroupInfo;
 using ChunkRBMapResult = arrow::Result<std::unordered_map<int64_t, std::shared_ptr<arrow::RecordBatch>>>;
-struct ChunkInfo {
-  public:
-  size_t file_index;               // current chunk belong which file
-  size_t row_offset_in_row_group;  // the starting row offset of this row group in its file
-  size_t row_offset_in_file;       // the starting row offset of file
-  size_t number_of_rows;           // number of rows in this row group
-  size_t row_group_index_in_file;  // the index of this row group in its file
-  size_t global_row_end;           // the ending row offset of this row group in the whole chunk reader
-  size_t avg_memory_size;          // average memory usage of this row group
-
-  [[nodiscard]] std::string ToString() const;
-};
 
 template <typename ReaderT>
 class ColumnGroupReaderImpl : public ColumnGroupReader {
@@ -87,6 +78,11 @@ class ColumnGroupReaderImpl : public ColumnGroupReader {
 
   [[nodiscard]] arrow::Result<uint64_t> get_chunk_size(int64_t chunk_index) override;
   [[nodiscard]] arrow::Result<uint64_t> get_chunk_rows(int64_t chunk_index) override;
+
+  [[nodiscard]] std::vector<ChunkTask> get_natural_tasks(const std::vector<int64_t>& chunk_indices) override;
+  [[nodiscard]] const ChunkInfo& get_chunk_info(int64_t chunk_index) const override;
+  [[nodiscard]] folly::SemiFuture<arrow::Result<RecordBatchVector>> get_chunks_async(
+      const ChunkTask& task, const AsyncReadOptions& options) override;
 
   [[nodiscard]] std::shared_ptr<arrow::Schema> get_schema() const override;
 
@@ -529,6 +525,131 @@ arrow::Result<uint64_t> ColumnGroupReaderImpl<ReaderT>::get_chunk_rows(int64_t c
 }
 
 template <typename ReaderT>
+std::vector<ChunkTask> ColumnGroupReaderImpl<ReaderT>::get_natural_tasks(const std::vector<int64_t>& chunk_indices) {
+  std::map<size_t, std::vector<int64_t>> file_groups;
+  for (auto idx : chunk_indices) {
+    file_groups[chunk_infos_[idx].file_index].push_back(idx);
+  }
+
+  std::vector<ChunkTask> tasks;
+  for (auto& [file_idx, chunks] : file_groups) {
+    if (chunks.empty()) {
+      continue;
+    }
+    const auto& first_info = chunk_infos_[chunks[0]];
+    ChunkTask current{
+        .file_index = file_idx,
+        .chunk_indices = {chunks[0]},
+        .range_start = first_info.row_offset_in_file,
+        .range_end = first_info.row_offset_in_file + first_info.number_of_rows,
+    };
+
+    for (size_t i = 1; i < chunks.size(); ++i) {
+      const auto& prev = chunk_infos_[chunks[i - 1]];
+      const auto& curr = chunk_infos_[chunks[i]];
+      if (curr.row_offset_in_file == prev.row_offset_in_file + prev.number_of_rows) {
+        current.chunk_indices.push_back(chunks[i]);
+        current.range_end = curr.row_offset_in_file + curr.number_of_rows;
+        continue;
+      }
+
+      tasks.push_back(std::move(current));
+      current = ChunkTask{
+          .file_index = file_idx,
+          .chunk_indices = {chunks[i]},
+          .range_start = curr.row_offset_in_file,
+          .range_end = curr.row_offset_in_file + curr.number_of_rows,
+      };
+    }
+    tasks.push_back(std::move(current));
+  }
+  return tasks;
+}
+
+template <typename ReaderT>
+const ChunkInfo& ColumnGroupReaderImpl<ReaderT>::get_chunk_info(int64_t chunk_index) const {
+  assert(chunk_index >= 0 && static_cast<size_t>(chunk_index) < chunk_infos_.size());
+  return chunk_infos_[chunk_index];
+}
+
+template <typename ReaderT>
+folly::SemiFuture<arrow::Result<RecordBatchVector>> ColumnGroupReaderImpl<ReaderT>::get_chunks_async(
+    const ChunkTask& task, const AsyncReadOptions& options) {
+  FIU_RETURN_ON(FIUKEY_COLUMN_GROUP_READ_FAIL,
+                folly::makeSemiFuture(arrow::Result<RecordBatchVector>(
+                    arrow::Status::IOError(fmt::format("Injected fault: {}", FIUKEY_COLUMN_GROUP_READ_FAIL)))));
+
+  if (task.file_index >= column_group_->files.size()) {
+    return folly::makeSemiFuture(arrow::Result<RecordBatchVector>(arrow::Status::Invalid(fmt::format(
+        "Chunk task file index out of range: {} out of {}", task.file_index, column_group_->files.size()))));
+  }
+
+  for (auto chunk_index : task.chunk_indices) {
+    if (UNLIKELY(chunk_index < 0 || static_cast<size_t>(chunk_index) >= chunk_infos_.size())) {
+      return folly::makeSemiFuture(arrow::Result<RecordBatchVector>(arrow::Status::Invalid(
+          fmt::format("Chunk index out of range: {} out of {}", chunk_index, chunk_infos_.size()))));
+    }
+    if (chunk_infos_[chunk_index].file_index != task.file_index) {
+      return folly::makeSemiFuture(arrow::Result<RecordBatchVector>(arrow::Status::Invalid(fmt::format(
+          "Chunk task contains chunk from different file. [chunk_index={}, expected_file={}, actual_file={}]",
+          chunk_index, task.file_index, chunk_infos_[chunk_index].file_index))));
+    }
+  }
+
+  if (task.chunk_indices.empty()) {
+    return folly::makeSemiFuture(arrow::Result<RecordBatchVector>(RecordBatchVector{}));
+  }
+
+  auto reader_result = open_reader_for_file(task.file_index);
+  if (!reader_result.ok()) {
+    return folly::makeSemiFuture(arrow::Result<RecordBatchVector>(reader_result.status()));
+  }
+
+  auto reader = reader_result.MoveValueUnsafe();
+  auto chunk_indices = task.chunk_indices;
+  auto chunk_infos = std::make_shared<const std::vector<ChunkInfo>>(chunk_infos_);
+
+  return reader->read_with_range_async(task.range_start, task.range_end, options)
+      .deferValue([reader, chunk_indices = std::move(chunk_indices), chunk_infos,
+                   options](arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>&& rb_reader_result)
+                      -> folly::SemiFuture<arrow::Result<RecordBatchVector>> {
+        if (!rb_reader_result.ok()) {
+          return folly::makeSemiFuture(arrow::Result<RecordBatchVector>(rb_reader_result.status()));
+        }
+
+        auto rb_reader = rb_reader_result.MoveValueUnsafe();
+        return submit_to_materialize_executor<arrow::Result<RecordBatchVector>>(
+            options,
+            [reader, rb_reader = std::move(rb_reader), chunk_indices,
+             chunk_infos]() mutable -> arrow::Result<RecordBatchVector> {
+              (void)reader;
+              ARROW_ASSIGN_OR_RAISE(auto rbs, rb_reader->ToRecordBatches());
+
+              RecordBatchVector result;
+              result.reserve(chunk_indices.size());
+              size_t rbs_idx = 0;
+              size_t rbs_offset = 0;
+              for (auto chunk_index : chunk_indices) {
+                const auto& chunk_info = (*chunk_infos)[chunk_index];
+                if (UNLIKELY(rbs_idx >= rbs.size() ||
+                             (rbs[rbs_idx]->num_rows() - rbs_offset) < chunk_info.number_of_rows)) {
+                  return arrow::Status::Invalid(fmt::format(
+                      "Invalid slice of record batches in async read: [chunk_info={}]", chunk_info.ToString()));
+                }
+
+                result.push_back(rbs[rbs_idx]->Slice(rbs_offset, chunk_info.number_of_rows));
+                rbs_offset += chunk_info.number_of_rows;
+                if (rbs_offset == rbs[rbs_idx]->num_rows()) {
+                  ++rbs_idx;
+                  rbs_offset = 0;
+                }
+              }
+              return result;
+            });
+      });
+}
+
+template <typename ReaderT>
 std::shared_ptr<arrow::Schema> ColumnGroupReaderImpl<ReaderT>::get_schema() const {
   return file_schema_;
 }
@@ -609,6 +730,21 @@ arrow::Result<std::unique_ptr<ColumnGroupReader>> ColumnGroupReader::create(
   }
 
   return create_reader(cache);
+}
+
+folly::SemiFuture<arrow::Result<std::unique_ptr<ColumnGroupReader>>> ColumnGroupReader::create_async(
+    const std::shared_ptr<arrow::Schema>& schema,
+    const std::shared_ptr<milvus_storage::api::ColumnGroup>& column_group,
+    const std::vector<std::string>& needed_columns,
+    const milvus_storage::api::Properties& properties,
+    const std::function<std::string(const std::string&)>& key_retriever,
+    const std::string& predicate,
+    const milvus_storage::MetadataCache& cache) {
+  auto executor = ThreadPoolHolder::GetThreadPool(1);
+  return folly::via(executor.get(), [schema, column_group, needed_columns, properties, key_retriever, predicate, cache,
+                                     executor]() {
+    return ColumnGroupReader::create(schema, column_group, needed_columns, properties, key_retriever, predicate, cache);
+  });
 }
 
 }  // namespace milvus_storage::api

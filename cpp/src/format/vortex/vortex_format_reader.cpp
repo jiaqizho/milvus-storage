@@ -734,6 +734,16 @@ arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> VortexFormatReader::rea
   return streaming_read(start_offset, end_offset, kLargeCoalescingWindow);
 }
 
+folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> VortexFormatReader::take_async(
+    const std::vector<int64_t>& row_indices, const api::AsyncReadOptions& options) {
+  return FormatReader::take_async(row_indices, options);
+}
+
+folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>> VortexFormatReader::read_with_range_async(
+    uint64_t start_offset, uint64_t end_offset, const api::AsyncReadOptions& options) {
+  return FormatReader::read_with_range_async(start_offset, end_offset, options);
+}
+
 uint64_t VortexFormatReader::total_mem_usage() { return compute_total_mem_usage(*vxfile_); }
 
 }  // namespace milvus_storage::vortex

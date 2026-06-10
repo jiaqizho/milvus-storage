@@ -15,11 +15,14 @@
 #include "milvus-storage/reader.h"
 
 #include <cstdio>
-#include <mutex>
-#include <memory>
-#include <numeric>
 #include <algorithm>
+#include <memory>
+#include <mutex>
+#include <numeric>
+#include <queue>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <arrow/array.h>
@@ -37,6 +40,7 @@
 #include <fmt/format.h>
 #include <glog/logging.h>
 #include <folly/executors/IOThreadPoolExecutor.h>
+#include <folly/futures/Future.h>
 
 #include "milvus-storage/common/config.h"
 #include "milvus-storage/thread_pool.h"
@@ -52,6 +56,22 @@ namespace {
 
 bool metadata_cache_enabled(const Properties& properties) {
   return GetValueNoError<bool>(properties, PROPERTY_READER_METADATA_CACHE_ENABLE);
+}
+
+// Splits the largest task repeatedly until task count reaches target_count.
+template <typename Task, typename SizeFn, typename SplitFn>
+void split_largest_tasks_to_target_count(std::vector<Task>& tasks,
+                                         size_t target_count,
+                                         SizeFn get_size,
+                                         SplitFn split) {
+  while (tasks.size() < target_count) {
+    auto it = std::max_element(tasks.begin(), tasks.end(),
+                               [&](const Task& a, const Task& b) { return get_size(a) < get_size(b); });
+    if (it == tasks.end() || get_size(*it) <= 1) {
+      break;
+    }
+    tasks.push_back(split(*it));
+  }
 }
 
 }  // namespace
@@ -513,6 +533,7 @@ class ChunkReaderImpl : public ChunkReader {
 
   // open the reader
   arrow::Status open();
+  folly::SemiFuture<arrow::Status> open_async();
 
   /**
    * @brief Destructor
@@ -525,10 +546,15 @@ class ChunkReaderImpl : public ChunkReader {
   [[nodiscard]] arrow::Result<std::shared_ptr<arrow::RecordBatch>> get_chunk(int64_t chunk_index) override;
   [[nodiscard]] arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> get_chunks(
       const std::vector<int64_t>& chunk_indices, size_t parallelism) override;
+  [[nodiscard]] folly::SemiFuture<arrow::Result<RecordBatchVector>> get_chunks_async(
+      const std::vector<int64_t>& chunk_indices, const AsyncReadOptions& options) override;
   [[nodiscard]] arrow::Result<std::vector<uint64_t>> get_chunk_size() override;
   [[nodiscard]] arrow::Result<std::vector<uint64_t>> get_chunk_rows() override;
 
   private:
+  [[nodiscard]] arrow::Status validate_needed_columns() const;
+  void split_chunk_tasks(std::vector<ChunkTask>& tasks, size_t target_count);
+
   std::shared_ptr<arrow::Schema> schema_;
   std::shared_ptr<ColumnGroup> column_group_;  ///< Column group metadata and configuration
   std::vector<std::string> needed_columns_;    ///< Subset of columns to read (empty = all columns)
@@ -553,7 +579,7 @@ ChunkReaderImpl::ChunkReaderImpl(const std::shared_ptr<arrow::Schema>& schema,
       key_retriever_callback_(key_retriever),
       metadata_cache_(std::move(metadata_cache)) {}
 
-arrow::Status ChunkReaderImpl::open() {
+arrow::Status ChunkReaderImpl::validate_needed_columns() const {
   // The case is:
   // column groups:
   //   - group1 :[a, b]
@@ -578,10 +604,29 @@ arrow::Status ChunkReaderImpl::open() {
     // TODO(jiaqizho): more info in invalid message
     return arrow::Status::Invalid("No needed columns found in column group");
   }
+  return arrow::Status::OK();
+}
+
+arrow::Status ChunkReaderImpl::open() {
+  ARROW_RETURN_NOT_OK(validate_needed_columns());
 
   ARROW_ASSIGN_OR_RAISE(chunk_reader_, ColumnGroupReader::create(schema_, column_group_, needed_columns_, properties_,
                                                                  key_retriever_callback_, "", metadata_cache_));
   return arrow::Status::OK();
+}
+
+folly::SemiFuture<arrow::Status> ChunkReaderImpl::open_async() {
+  auto validation_status = validate_needed_columns();
+  if (!validation_status.ok()) {
+    return folly::makeSemiFuture(validation_status);
+  }
+
+  return ColumnGroupReader::create_async(schema_, column_group_, needed_columns_, properties_, key_retriever_callback_,
+                                         "", metadata_cache_)
+      .deferValue([this](arrow::Result<std::unique_ptr<ColumnGroupReader>>&& reader_result) -> arrow::Status {
+        ARROW_ASSIGN_OR_RAISE(chunk_reader_, std::move(reader_result));
+        return arrow::Status::OK();
+      });
 }
 
 size_t ChunkReaderImpl::total_number_of_chunks() const { return chunk_reader_->total_number_of_chunks(); }
@@ -649,6 +694,77 @@ arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> ChunkReaderImpl:
   return sliced_results;
 }
 
+folly::SemiFuture<arrow::Result<RecordBatchVector>> ChunkReaderImpl::get_chunks_async(
+    const std::vector<int64_t>& chunk_indices, const AsyncReadOptions& options) {
+  std::vector<int64_t> unique_chunk_indices(chunk_indices.begin(), chunk_indices.end());
+  std::sort(unique_chunk_indices.begin(), unique_chunk_indices.end());
+  unique_chunk_indices.erase(std::unique(unique_chunk_indices.begin(), unique_chunk_indices.end()),
+                             unique_chunk_indices.end());
+
+  const auto total_chunks = chunk_reader_->total_number_of_chunks();
+  for (auto idx : unique_chunk_indices) {
+    if (UNLIKELY(idx < 0 || static_cast<size_t>(idx) >= total_chunks)) {
+      return folly::makeSemiFuture(arrow::Result<RecordBatchVector>(
+          arrow::Status::Invalid(fmt::format("Chunk index out of range: {} out of {}", idx, total_chunks))));
+    }
+  }
+
+  if (unique_chunk_indices.empty()) {
+    return folly::makeSemiFuture(arrow::Result<RecordBatchVector>(RecordBatchVector{}));
+  }
+
+  auto tasks = chunk_reader_->get_natural_tasks(unique_chunk_indices);
+  split_chunk_tasks(tasks, std::max<size_t>(options.read_parallelism, 1));
+
+  std::vector<folly::SemiFuture<arrow::Result<RecordBatchVector>>> futures;
+  std::vector<std::vector<int64_t>> task_chunk_lists;
+  futures.reserve(tasks.size());
+  task_chunk_lists.reserve(tasks.size());
+
+  for (auto& task : tasks) {
+    task_chunk_lists.push_back(task.chunk_indices);
+    futures.push_back(chunk_reader_->get_chunks_async(task, options));
+  }
+
+  return folly::collectAll(std::move(futures))
+      .deferValue([chunk_indices, task_chunk_lists = std::move(task_chunk_lists),
+                   options](auto&& all_results) mutable -> folly::SemiFuture<arrow::Result<RecordBatchVector>> {
+        return submit_to_materialize_executor<arrow::Result<RecordBatchVector>>(
+            options,
+            [chunk_indices, task_chunk_lists = std::move(task_chunk_lists),
+             all_results = std::move(all_results)]() mutable -> arrow::Result<RecordBatchVector> {
+              std::unordered_map<int64_t, std::shared_ptr<arrow::RecordBatch>> all_rbs;
+              for (size_t i = 0; i < all_results.size(); ++i) {
+                auto& try_result = all_results[i];
+                if (try_result.hasException()) {
+                  return arrow::Status::IOError(try_result.exception().what().toStdString());
+                }
+
+                ARROW_ASSIGN_OR_RAISE(auto rbs, std::move(try_result.value()));
+                const auto& chunk_list = task_chunk_lists[i];
+                if (rbs.size() != chunk_list.size()) {
+                  return arrow::Status::Invalid(
+                      fmt::format("Async chunk task returned {} batches for {} chunks", rbs.size(), chunk_list.size()));
+                }
+                for (size_t j = 0; j < rbs.size(); ++j) {
+                  all_rbs[chunk_list[j]] = std::move(rbs[j]);
+                }
+              }
+
+              RecordBatchVector result;
+              result.reserve(chunk_indices.size());
+              for (auto idx : chunk_indices) {
+                auto it = all_rbs.find(idx);
+                if (it == all_rbs.end()) {
+                  return arrow::Status::Invalid(fmt::format("Missing async chunk result for chunk {}", idx));
+                }
+                result.push_back(it->second);
+              }
+              return result;
+            });
+      });
+}
+
 arrow::Result<std::vector<uint64_t>> ChunkReaderImpl::get_chunk_size() {
   const auto total_chunks = total_number_of_chunks();
   std::vector<uint64_t> result(total_chunks);
@@ -671,6 +787,26 @@ arrow::Result<std::vector<uint64_t>> ChunkReaderImpl::get_chunk_rows() {
   }
 
   return result;
+}
+
+void ChunkReaderImpl::split_chunk_tasks(std::vector<ChunkTask>& tasks, size_t target_count) {
+  split_largest_tasks_to_target_count(
+      tasks, target_count, [](const ChunkTask& task) { return task.chunk_indices.size(); },
+      [this](ChunkTask& left) -> ChunkTask {
+        const size_t mid = left.chunk_indices.size() / 2;
+        const auto& mid_info = chunk_reader_->get_chunk_info(left.chunk_indices[mid]);
+
+        ChunkTask right{
+            .file_index = left.file_index,
+            .chunk_indices = std::vector<int64_t>(left.chunk_indices.begin() + mid, left.chunk_indices.end()),
+            .range_start = mid_info.row_offset_in_file,
+            .range_end = left.range_end,
+        };
+
+        left.chunk_indices.resize(mid);
+        left.range_end = mid_info.row_offset_in_file;
+        return right;
+      });
 }
 
 // ==================== ReaderImpl Implementation ====================
@@ -785,6 +921,39 @@ class ReaderImpl : public Reader {
     return chunk_reader;
   }
 
+  [[nodiscard]] folly::SemiFuture<arrow::Result<std::unique_ptr<ChunkReader>>> get_chunk_reader_async(
+      int64_t column_group_index,
+      const std::shared_ptr<std::vector<std::string>>& needed_columns = nullptr) const override {
+    if (column_group_index < 0 || static_cast<size_t>(column_group_index) >= cgs_->size()) {
+      return folly::makeSemiFuture(arrow::Result<std::unique_ptr<ChunkReader>>(arrow::Status::Invalid(
+          fmt::format("Failed to get chunk reader, column group index out of range: {} (size: {})", column_group_index,
+                      cgs_->size()))));
+    }
+
+    auto column_group = (*cgs_)[column_group_index];
+    if (!column_group) {
+      return folly::makeSemiFuture(arrow::Result<std::unique_ptr<ChunkReader>>(arrow::Status::Invalid(
+          fmt::format("Failed to get chunk reader, column group at index {} is null", column_group_index))));
+    }
+
+    auto resolved_columns_result = resolve_needed_columns(schema_, effective_needed_columns(needed_columns));
+    if (!resolved_columns_result.ok()) {
+      return folly::makeSemiFuture(arrow::Result<std::unique_ptr<ChunkReader>>(resolved_columns_result.status()));
+    }
+
+    auto metadata_cache = get_metadata_cache();
+    auto chunk_reader =
+        std::make_unique<ChunkReaderImpl>(schema_, column_group, resolved_columns_result.MoveValueUnsafe(), properties_,
+                                          key_retriever_callback_, std::move(metadata_cache));
+    auto* chunk_reader_ptr = chunk_reader.get();
+    return chunk_reader_ptr->open_async().deferValue(
+        [chunk_reader =
+             std::move(chunk_reader)](arrow::Status status) mutable -> arrow::Result<std::unique_ptr<ChunkReader>> {
+          ARROW_RETURN_NOT_OK(status);
+          return std::move(chunk_reader);
+        });
+  }
+
   /**
    * @brief Extracts specific rows by their global indices with parallel processing
    */
@@ -877,6 +1046,16 @@ class ReaderImpl : public Reader {
     }
 
     return arrow::Table::Make(arrow::schema(out_fields), out_arrays, static_cast<int64_t>(row_indices.size()));
+  }
+
+  [[nodiscard]] folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> take_async(
+      const std::vector<int64_t>& row_indices,
+      const AsyncReadOptions& options = {},
+      const std::shared_ptr<std::vector<std::string>>& needed_columns = nullptr) override {
+    return submit_to_materialize_executor<arrow::Result<std::shared_ptr<arrow::Table>>>(
+        options, [this, row_indices, options, needed_columns]() {
+          return take(row_indices, options.read_parallelism, needed_columns);
+        });
   }
 
   private:
