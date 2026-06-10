@@ -20,6 +20,8 @@
 #include <arrow/status.h>
 #include <arrow/result.h>
 #include <arrow/record_batch.h>
+#include <arrow/table.h>
+#include <folly/futures/Future.h>
 
 #include "milvus-storage/properties.h"
 #include "milvus-storage/common/config.h"
@@ -55,6 +57,10 @@ class FormatReader {
   // `open` is typically used to open the file's footer.
   [[nodiscard]] virtual arrow::Status open() = 0;
 
+  // Async version of open. Default implementation wraps open() via ThreadPoolHolder.
+  // Subclasses with native async metadata loading may override.
+  [[nodiscard]] virtual folly::SemiFuture<arrow::Status> open_async();
+
   // get the row group infos
   [[nodiscard]] virtual arrow::Result<std::vector<RowGroupInfo>> get_row_group_infos() = 0;
 
@@ -77,6 +83,18 @@ class FormatReader {
   [[nodiscard]] virtual arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> read_with_range(
       const uint64_t& start_offset, const uint64_t& end_offset) = 0;
 
+  // Async version of read_with_range. Must be called on a cloned reader.
+  // Default implementation wraps the sync method via ThreadPoolHolder.
+  // Subclasses with native async I/O support may override.
+  [[nodiscard]] virtual folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>>
+  read_with_range_async(uint64_t start_offset, uint64_t end_offset);
+
+  // Async version of take. Must be called on a cloned reader.
+  // Default implementation wraps the sync method via ThreadPoolHolder.
+  // Subclasses with native async I/O support may override.
+  [[nodiscard]] virtual folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> take_async(
+      const std::vector<int64_t>& row_indices);
+
   // clone itself for multi-threading
   // if the reader is not thread-safe, then it should be cloned
   // if the reader is thread-safe, then return itself
@@ -90,6 +108,16 @@ class FormatReader {
 
   // create format reader
   static arrow::Result<std::shared_ptr<FormatReader>> create(
+      const std::shared_ptr<arrow::Schema>& read_schema,
+      const std::string& format,
+      const api::ColumnGroupFile& file,
+      const api::Properties& properties,
+      const std::vector<std::string>& needed_columns,
+      const std::function<std::string(const std::string&)>& key_retriever);
+
+  // Async wrapper for the current factory path. Today Format::create_reader()
+  // creates and opens the reader, so this keeps that work out of the caller thread.
+  static folly::SemiFuture<arrow::Result<std::shared_ptr<FormatReader>>> create_async(
       const std::shared_ptr<arrow::Schema>& read_schema,
       const std::string& format,
       const api::ColumnGroupFile& file,

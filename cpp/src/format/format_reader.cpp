@@ -16,6 +16,7 @@
 
 #include <sstream>
 
+#include "milvus-storage/thread_pool.h"
 #include "milvus-storage/format/format.h"
 
 namespace milvus_storage {
@@ -36,6 +37,42 @@ arrow::Result<std::shared_ptr<FormatReader>> FormatReader::create(
     const std::function<std::string(const std::string&)>& key_retriever) {
   ARROW_ASSIGN_OR_RAISE(auto* fmt, Format::get(format));
   return fmt->create_reader(read_schema, file, properties, needed_columns, key_retriever);
+}
+
+folly::SemiFuture<arrow::Status> FormatReader::open_async() {
+  auto executor = ThreadPoolHolder::GetThreadPool(1);
+  return folly::via(executor.get(), [this, executor]() { return open(); });
+}
+
+folly::SemiFuture<arrow::Result<std::shared_ptr<FormatReader>>> FormatReader::create_async(
+    const std::shared_ptr<arrow::Schema>& read_schema,
+    const std::string& format,
+    const api::ColumnGroupFile& file,
+    const api::Properties& properties,
+    const std::vector<std::string>& needed_columns,
+    const std::function<std::string(const std::string&)>& key_retriever) {
+  auto executor = ThreadPoolHolder::GetThreadPool(1);
+  return folly::via(executor.get(), [read_schema, format, file, properties, needed_columns, key_retriever, executor]() {
+    return FormatReader::create(read_schema, format, file, properties, needed_columns, key_retriever);
+  });
+}
+
+folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>> FormatReader::read_with_range_async(
+    uint64_t start_offset, uint64_t end_offset) {
+  auto executor = ThreadPoolHolder::GetThreadPool(1);
+  return folly::via(
+      executor.get(),
+      [this, start_offset, end_offset, executor]() -> arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> {
+        return read_with_range(start_offset, end_offset);
+      });
+}
+
+folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> FormatReader::take_async(
+    const std::vector<int64_t>& row_indices) {
+  auto executor = ThreadPoolHolder::GetThreadPool(1);
+  return folly::via(executor.get(), [this, row_indices, executor]() -> arrow::Result<std::shared_ptr<arrow::Table>> {
+    return take(row_indices);
+  });
 }
 
 }  // namespace milvus_storage

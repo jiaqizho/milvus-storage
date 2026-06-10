@@ -16,7 +16,9 @@
 
 #include <arrow/filesystem/filesystem.h>
 #include <arrow/record_batch.h>
+#include <arrow/table.h>
 #include <arrow/type.h>
+#include <folly/futures/Future.h>
 
 #include "milvus-storage/column_groups.h"
 #include "milvus-storage/common/row_offset_heap.h"
@@ -86,6 +88,14 @@ class ChunkReader {
    */
   [[nodiscard]] virtual arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> get_chunks(
       const std::vector<int64_t>& chunk_indices, size_t parallelism = 1) = 0;
+
+  /**
+   * @brief Retrieves multiple chunks asynchronously by their indices.
+   *
+   * The returned future completes with the same ordered result as get_chunks().
+   */
+  [[nodiscard]] virtual folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>>
+  get_chunks_async(const std::vector<int64_t>& chunk_indices, size_t parallelism = 1) = 0;
 
   /**
    * @brief Retrieves the metadata of chunks
@@ -252,6 +262,15 @@ class Reader {
       int64_t column_group_index, const std::shared_ptr<std::vector<std::string>>& needed_columns = nullptr) const = 0;
 
   /**
+   * @brief Asynchronously get a chunk reader for a specific column group.
+   *
+   * The returned future includes the format-reader open/footer work needed to
+   * initialize the chunk reader.
+   */
+  [[nodiscard]] virtual folly::SemiFuture<arrow::Result<std::unique_ptr<ChunkReader>>> get_chunk_reader_async(
+      int64_t column_group_index, const std::shared_ptr<std::vector<std::string>>& needed_columns = nullptr) const = 0;
+
+  /**
    * @brief Extracts specific rows by their global indices with parallel processing
    *
    * Efficiently retrieves rows at the specified global indices from across all
@@ -275,6 +294,16 @@ class Reader {
    *       or using scan() with appropriate filtering for range-based access.
    */
   [[nodiscard]] virtual arrow::Result<std::shared_ptr<arrow::Table>> take(
+      const std::vector<int64_t>& row_indices,
+      size_t parallelism = 1,
+      const std::shared_ptr<std::vector<std::string>>& needed_columns = nullptr) = 0;
+
+  /**
+   * @brief Asynchronously extracts specific rows by their global indices.
+   *
+   * The returned future completes with the same ordered table as take().
+   */
+  [[nodiscard]] virtual folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> take_async(
       const std::vector<int64_t>& row_indices,
       size_t parallelism = 1,
       const std::shared_ptr<std::vector<std::string>>& needed_columns = nullptr) = 0;
