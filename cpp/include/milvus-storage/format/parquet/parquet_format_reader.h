@@ -63,6 +63,12 @@ class ParquetFormatReader final : public FormatReader {
 
   [[nodiscard]] arrow::Result<std::shared_ptr<FormatReader>> clone_reader() override;
 
+  [[nodiscard]] folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>> read_with_range_async(
+      uint64_t start_offset, uint64_t end_offset) override;
+
+  [[nodiscard]] folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> take_async(
+      const std::vector<int64_t>& row_indices) override;
+
   [[nodiscard]] std::shared_ptr<arrow::Schema> get_schema() const override;
 
   private:
@@ -71,7 +77,7 @@ class ParquetFormatReader final : public FormatReader {
   [[nodiscard]] arrow::Result<std::vector<RowGroupInfo>> create_row_group_infos(
       const std::shared_ptr<::parquet::FileMetaData>& metadata);
 
-  ParquetFormatReader(const ParquetFormatReader& other, std::unique_ptr<::parquet::arrow::FileReader> file_reader);
+  ParquetFormatReader(const ParquetFormatReader& other, std::shared_ptr<::parquet::arrow::FileReader> file_reader);
 
   std::string path_;
   std::shared_ptr<arrow::fs::FileSystem> fs_;
@@ -85,7 +91,7 @@ class ParquetFormatReader final : public FormatReader {
   // init after open()
   std::vector<int> needed_column_indices_;
   std::vector<RowGroupInfo> row_group_infos_;
-  std::unique_ptr<::parquet::arrow::FileReader> file_reader_;
+  std::shared_ptr<::parquet::arrow::FileReader> file_reader_;
 };  // ParquetFormatReader
 
 }  // namespace milvus_storage::parquet

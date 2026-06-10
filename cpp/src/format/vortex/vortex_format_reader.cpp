@@ -17,6 +17,7 @@
 #include "milvus-storage/format/vortex/vortex_planner.h"
 #include "vortex_bridge.h"
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -30,6 +31,7 @@
 #include <arrow/status.h>
 #include <arrow/result.h>
 #include <fmt/format.h>
+#include <folly/futures/Promise.h>
 
 namespace milvus_storage::vortex {
 
@@ -533,6 +535,125 @@ arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> VortexFormatReader::rea
     const uint64_t& start_offset, const uint64_t& end_offset) {
   assert(vxfile_);
   return streaming_read(start_offset, end_offset);
+}
+
+template <typename T>
+struct VortexAsyncContext {
+  folly::Promise<arrow::Result<T>> promise;
+  ArrowArrayStream stream;
+};
+
+static void vortex_take_async_callback(void* ctx_raw, ArrowArrayStream* /*out_stream*/, const char* error_msg) {
+  std::unique_ptr<VortexAsyncContext<std::shared_ptr<arrow::Table>>> ctx(
+      static_cast<VortexAsyncContext<std::shared_ptr<arrow::Table>>*>(ctx_raw));
+
+  if (error_msg) {
+    ctx->promise.setValue(arrow::Status::IOError(std::string(error_msg)));
+    vortex_free_error_string(const_cast<char*>(error_msg));
+    return;
+  }
+
+  auto result = arrow::ImportChunkedArray(&ctx->stream);
+  if (!result.ok()) {
+    ctx->promise.setValue(result.status());
+    return;
+  }
+
+  auto chunked_array = result.ValueUnsafe();
+  if (chunked_array->num_chunks() == 0) {
+    ctx->promise.setValue(arrow::Status::Invalid("take_async: empty result"));
+    return;
+  }
+
+  std::vector<std::shared_ptr<arrow::RecordBatch>> rbs;
+  rbs.reserve(chunked_array->num_chunks());
+  for (int i = 0; i < chunked_array->num_chunks(); ++i) {
+    auto rb = arrow::RecordBatch::FromStructArray(chunked_array->chunk(i));
+    if (!rb.ok()) {
+      ctx->promise.setValue(rb.status());
+      return;
+    }
+    rbs.emplace_back(rb.ValueUnsafe());
+  }
+
+  ctx->promise.setValue(arrow::Table::FromRecordBatches(rbs));
+}
+
+static void vortex_read_range_async_callback(void* ctx_raw, ArrowArrayStream* /*out_stream*/, const char* error_msg) {
+  std::unique_ptr<VortexAsyncContext<std::shared_ptr<arrow::RecordBatchReader>>> ctx(
+      static_cast<VortexAsyncContext<std::shared_ptr<arrow::RecordBatchReader>>*>(ctx_raw));
+
+  if (error_msg) {
+    ctx->promise.setValue(arrow::Status::IOError(std::string(error_msg)));
+    vortex_free_error_string(const_cast<char*>(error_msg));
+    return;
+  }
+
+  ctx->promise.setValue(arrow::ImportRecordBatchReader(&ctx->stream));
+}
+
+folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> VortexFormatReader::take_async(
+    const std::vector<int64_t>& row_indices) {
+  assert(vxfile_);
+
+  auto scan_builder = vxfile_->CreateScanBuilder();
+  if (!proj_cols_.empty()) {
+    scan_builder.WithProjection(build_projection(proj_cols_));
+  }
+
+  if (read_schema_) {
+    auto c_schema_result = export_c_arrow_schema(read_schema_);
+    if (!c_schema_result.ok()) {
+      return folly::makeSemiFuture(arrow::Result<std::shared_ptr<arrow::Table>>(c_schema_result.status()));
+    }
+    auto c_schema = c_schema_result.MoveValueUnsafe();
+    scan_builder.WithOutputSchema(c_schema);
+  }
+
+  scan_builder.WithIncludeByIndex(reinterpret_cast<const uint64_t*>(row_indices.data()), row_indices.size());
+
+  uintptr_t handle = std::move(scan_builder).IntoRawHandle();
+
+  auto ctx = std::make_unique<VortexAsyncContext<std::shared_ptr<arrow::Table>>>();
+  auto semi_future = ctx->promise.getSemiFuture();
+  auto* raw_ctx = ctx.release();
+
+  vortex_scan_collect_async(handle, &raw_ctx->stream, vortex_take_async_callback, static_cast<void*>(raw_ctx));
+  return semi_future;
+}
+
+folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>> VortexFormatReader::read_with_range_async(
+    uint64_t start_offset, uint64_t end_offset) {
+  assert(vxfile_);
+
+  auto scan_builder = vxfile_->CreateScanBuilder();
+  if (!proj_cols_.empty()) {
+    scan_builder.WithProjection(build_projection(proj_cols_));
+  }
+
+  if (read_schema_) {
+    auto c_schema_result = export_c_arrow_schema(read_schema_);
+    if (!c_schema_result.ok()) {
+      return folly::makeSemiFuture(arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>(c_schema_result.status()));
+    }
+    auto c_schema = c_schema_result.MoveValueUnsafe();
+    scan_builder.WithOutputSchema(c_schema);
+  }
+
+  if (parsed_predicate_) {
+    scan_builder.WithFilter(*parsed_predicate_);
+  }
+
+  scan_builder.WithRowRange(start_offset, end_offset);
+
+  uintptr_t handle = std::move(scan_builder).IntoRawHandle();
+
+  auto ctx = std::make_unique<VortexAsyncContext<std::shared_ptr<arrow::RecordBatchReader>>>();
+  auto semi_future = ctx->promise.getSemiFuture();
+  auto* raw_ctx = ctx.release();
+
+  vortex_scan_collect_async(handle, &raw_ctx->stream, vortex_read_range_async_callback, static_cast<void*>(raw_ctx));
+  return semi_future;
 }
 
 uint64_t VortexFormatReader::total_mem_usage() {

@@ -36,6 +36,7 @@
 #include <fmt/format.h>
 #include <glog/logging.h>
 #include <folly/executors/IOThreadPoolExecutor.h>
+#include <folly/futures/Future.h>
 
 #include "milvus-storage/common/config.h"
 #include "milvus-storage/thread_pool.h"
@@ -45,6 +46,19 @@
 #include "milvus-storage/common/macro.h"
 
 namespace milvus_storage::api {
+
+// Splits the largest task repeatedly until task count reaches target_count.
+template <typename Task, typename SizeFn, typename SplitFn>
+static void split_tasks_to_fill(std::vector<Task>& tasks, size_t target_count, SizeFn get_size, SplitFn do_split) {
+  while (tasks.size() < target_count) {
+    auto it = std::max_element(tasks.begin(), tasks.end(),
+                               [&](const Task& a, const Task& b) { return get_size(a) < get_size(b); });
+    if (it == tasks.end() || get_size(*it) <= 1) {
+      break;
+    }
+    tasks.push_back(do_split(*it));
+  }
+}
 
 class PackedRecordBatchReader final : public arrow::RecordBatchReader {
   public:
@@ -511,10 +525,17 @@ class ChunkReaderImpl : public ChunkReader {
   [[nodiscard]] arrow::Result<std::shared_ptr<arrow::RecordBatch>> get_chunk(int64_t chunk_index) override;
   [[nodiscard]] arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> get_chunks(
       const std::vector<int64_t>& chunk_indices, size_t parallelism) override;
+  [[nodiscard]] folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>> get_chunks_async(
+      const std::vector<int64_t>& chunk_indices, size_t parallelism) override;
   [[nodiscard]] arrow::Result<std::vector<uint64_t>> get_chunk_size() override;
   [[nodiscard]] arrow::Result<std::vector<uint64_t>> get_chunk_rows() override;
 
   private:
+  [[nodiscard]] arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> get_chunks_sync(
+      const std::vector<int64_t>& chunk_indices);
+
+  void split_chunk_tasks(std::vector<ChunkTask>& tasks, size_t target_count);
+
   std::shared_ptr<arrow::Schema> schema_;
   std::shared_ptr<ColumnGroup> column_group_;  ///< Column group metadata and configuration
   std::vector<std::string> needed_columns_;    ///< Subset of columns to read (empty = all columns)
@@ -579,8 +600,16 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> ChunkReaderImpl::get_chunk(in
 
 arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> ChunkReaderImpl::get_chunks(
     const std::vector<int64_t>& chunk_indices, size_t parallelism) {
+  if (parallelism <= 1) {
+    return get_chunks_sync(chunk_indices);
+  }
+  return std::move(get_chunks_async(chunk_indices, parallelism)).get();
+}
+
+arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> ChunkReaderImpl::get_chunks_sync(
+    const std::vector<int64_t>& chunk_indices) {
   std::vector<std::shared_ptr<arrow::RecordBatch>> results;
-  ARROW_ASSIGN_OR_RAISE(results, chunk_reader_->get_chunks(chunk_indices, parallelism));
+  ARROW_ASSIGN_OR_RAISE(results, chunk_reader_->get_chunks(chunk_indices));
 
   // no need to slice
   if (results.size() == chunk_indices.size()) {
@@ -632,6 +661,74 @@ arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> ChunkReaderImpl:
   return sliced_results;
 }
 
+folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>> ChunkReaderImpl::get_chunks_async(
+    const std::vector<int64_t>& chunk_indices, size_t parallelism) {
+  std::vector<int64_t> unique_chunk_indices(chunk_indices.begin(), chunk_indices.end());
+  std::sort(unique_chunk_indices.begin(), unique_chunk_indices.end());
+  unique_chunk_indices.erase(std::unique(unique_chunk_indices.begin(), unique_chunk_indices.end()),
+                             unique_chunk_indices.end());
+
+  auto total_chunks = chunk_reader_->total_number_of_chunks();
+  for (auto idx : unique_chunk_indices) {
+    if (UNLIKELY(idx < 0 || static_cast<size_t>(idx) >= total_chunks)) {
+      return folly::makeSemiFuture(arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>(
+          arrow::Status::Invalid(fmt::format("Chunk index out of range: {} out of {}", idx, total_chunks))));
+    }
+  }
+  if (unique_chunk_indices.empty()) {
+    return folly::makeSemiFuture(arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>(
+        std::vector<std::shared_ptr<arrow::RecordBatch>>{}));
+  }
+
+  auto all_tasks = chunk_reader_->get_natural_tasks(unique_chunk_indices);
+  auto executor = milvus_storage::ThreadPoolHolder::GetThreadPool(std::max<size_t>(parallelism, 1));
+  split_chunk_tasks(all_tasks, executor->numThreads());
+
+  std::vector<folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>>> futures;
+  std::vector<std::vector<int64_t>> task_chunk_lists;
+  futures.reserve(all_tasks.size());
+  task_chunk_lists.reserve(all_tasks.size());
+
+  for (auto& task : all_tasks) {
+    task_chunk_lists.push_back(task.chunk_indices);
+    futures.push_back(chunk_reader_->get_chunks_async(task));
+  }
+
+  return folly::collectAll(std::move(futures))
+      .deferValue([chunk_indices, task_chunk_lists = std::move(task_chunk_lists)](
+                      auto&& all_results) mutable
+                  -> arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> {
+        std::unordered_map<int64_t, std::shared_ptr<arrow::RecordBatch>> all_rbs;
+        for (size_t i = 0; i < all_results.size(); ++i) {
+          auto& tryResult = all_results[i];
+          if (tryResult.hasException()) {
+            return arrow::Status::IOError(tryResult.exception().what().toStdString());
+          }
+          ARROW_ASSIGN_OR_RAISE(auto rbs, std::move(tryResult.value()));
+
+          auto& chunk_list = task_chunk_lists[i];
+          if (rbs.size() != chunk_list.size()) {
+            return arrow::Status::Invalid(
+                fmt::format("Async chunk task returned {} batches for {} chunks", rbs.size(), chunk_list.size()));
+          }
+          for (size_t j = 0; j < rbs.size(); ++j) {
+            all_rbs[chunk_list[j]] = std::move(rbs[j]);
+          }
+        }
+
+        std::vector<std::shared_ptr<arrow::RecordBatch>> result;
+        result.reserve(chunk_indices.size());
+        for (auto idx : chunk_indices) {
+          auto it = all_rbs.find(idx);
+          if (it == all_rbs.end()) {
+            return arrow::Status::Invalid(fmt::format("Missing async chunk result for chunk {}", idx));
+          }
+          result.push_back(it->second);
+        }
+        return result;
+      });
+}
+
 arrow::Result<std::vector<uint64_t>> ChunkReaderImpl::get_chunk_size() {
   const auto total_chunks = total_number_of_chunks();
   std::vector<uint64_t> result(total_chunks);
@@ -654,6 +751,25 @@ arrow::Result<std::vector<uint64_t>> ChunkReaderImpl::get_chunk_rows() {
   }
 
   return result;
+}
+
+void ChunkReaderImpl::split_chunk_tasks(std::vector<ChunkTask>& tasks, size_t target_count) {
+  split_tasks_to_fill(
+      tasks, target_count, [](const ChunkTask& t) { return t.chunk_indices.size(); },
+      [this](ChunkTask& left) -> ChunkTask {
+        size_t mid = left.chunk_indices.size() / 2;
+        const auto& mid_info = chunk_reader_->get_chunk_info(left.chunk_indices[mid]);
+
+        ChunkTask right;
+        right.file_index = left.file_index;
+        right.chunk_indices.assign(left.chunk_indices.begin() + mid, left.chunk_indices.end());
+        right.range_start = mid_info.row_offset_in_file;
+        right.range_end = left.range_end;
+
+        left.chunk_indices.resize(mid);
+        left.range_end = mid_info.row_offset_in_file;
+        return right;
+      });
 }
 
 // ==================== ReaderImpl Implementation ====================
@@ -770,7 +886,6 @@ class ReaderImpl : public Reader {
       const std::vector<int64_t>& row_indices,
       size_t parallelism = 1,
       const std::shared_ptr<std::vector<std::string>>& needed_columns = nullptr) override {
-    std::vector<std::shared_ptr<arrow::Table>> tables;
     // empty input row indices
     if (row_indices.empty()) {
       if (schema_) {
@@ -786,76 +901,85 @@ class ReaderImpl : public Reader {
 
     ARROW_ASSIGN_OR_RAISE(auto resolved_columns,
                           resolve_needed_columns(schema_, effective_needed_columns(needed_columns)));
+    ARROW_ASSIGN_OR_RAISE(auto lazy_readers, create_lazy_readers(resolved_columns));
 
-    auto needed_column_groups = collect_required_column_groups(resolved_columns);
-
-    // Create lazy readers fresh each call (no caching since projection may differ)
-    std::vector<std::unique_ptr<ColumnGroupLazyReader>> lazy_readers(needed_column_groups.size());
-    for (size_t i = 0; i < needed_column_groups.size(); ++i) {
-      if (!needed_column_groups[i]) {
-        return arrow::Status::Invalid(fmt::format("Failed to call take, column group at index {} is empty", i));
-      }
-      ARROW_ASSIGN_OR_RAISE(lazy_readers[i],
-                            ColumnGroupLazyReader::create(schema_, needed_column_groups[i], properties_,
-                                                          resolved_columns, key_retriever_callback_));
+    std::vector<std::shared_ptr<arrow::Table>> tables;
+    if (parallelism <= 1) {
+      ARROW_ASSIGN_OR_RAISE(tables, take_sync(row_indices, *lazy_readers));
+    } else {
+      ARROW_ASSIGN_OR_RAISE(tables, std::move(take_tables_async(row_indices, lazy_readers, parallelism)).get());
     }
 
-    for (const auto& lazy_reader : lazy_readers) {
-      ARROW_ASSIGN_OR_RAISE(auto table, lazy_reader->take(row_indices, parallelism));
-      tables.emplace_back(table);
+    return build_take_table(tables, row_indices, resolved_columns, schema_);
+  }
+
+  [[nodiscard]] folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> take_async(
+      const std::vector<int64_t>& row_indices,
+      size_t parallelism = 1,
+      const std::shared_ptr<std::vector<std::string>>& needed_columns = nullptr) override {
+    if (row_indices.empty()) {
+      if (!schema_) {
+        return folly::makeSemiFuture(arrow::Result<std::shared_ptr<arrow::Table>>(
+            arrow::Status::Invalid("Cannot create empty table without a schema")));
+      }
+      auto empty_table = arrow::Table::MakeEmpty(schema_);
+      if (!empty_table.ok()) {
+        return folly::makeSemiFuture(arrow::Result<std::shared_ptr<arrow::Table>>(empty_table.status()));
+      }
+      return folly::makeSemiFuture(
+          arrow::Result<std::shared_ptr<arrow::Table>>(empty_table.MoveValueUnsafe()));
     }
 
-    std::vector<std::shared_ptr<arrow::Field>> fields;
-    std::vector<std::shared_ptr<arrow::Field>> out_fields;
-    std::vector<std::shared_ptr<arrow::ChunkedArray>> columns;
-    std::vector<std::shared_ptr<arrow::ChunkedArray>> out_arrays;
-    std::unordered_map<std::string_view, size_t> colname_to_index;
-
-    // align the column groups
-    uint64_t last_row_counts = UINT64_MAX;
-    for (const auto& table : tables) {
-      assert(table);
-      if (last_row_counts == UINT64_MAX) {
-        last_row_counts = table->num_rows();
-      } else if (last_row_counts != table->num_rows()) {
-        return arrow::Status::Invalid("Logical error, different row counts in column groups");
-      }
-
-      const auto& table_schema = table->schema();
-      for (int i = 0; i < table->num_columns(); ++i) {
-        colname_to_index[table_schema->field(i)->name()] = fields.size();
-        fields.emplace_back(table_schema->field(i));
-        columns.emplace_back(table->column(i));
-      }
-    }
-    assert(fields.size() == columns.size());
-
-    // projection
-    out_arrays.reserve(resolved_columns.size());
-    for (const auto& colname : resolved_columns) {
-      auto it = colname_to_index.find(colname);
-      if (it == colname_to_index.end()) {
-        // fill null column (requires schema for type information)
-        if (!schema_) {
-          return arrow::Status::Invalid(fmt::format(
-              "Column '{}' not found in any column group and no schema provided for null filling", colname));
-        }
-        auto missing_field = schema_->GetFieldByName(colname);
-        ARROW_ASSIGN_OR_RAISE(auto null_array,
-                              arrow::MakeArrayOfNull(missing_field->type(), static_cast<int64_t>(row_indices.size())));
-        out_fields.emplace_back(missing_field);
-        out_arrays.emplace_back(
-            std::make_shared<arrow::ChunkedArray>(arrow::ArrayVector{std::move(null_array)}, missing_field->type()));
-      } else {
-        out_fields.emplace_back(fields[it->second]);
-        out_arrays.emplace_back(columns[it->second]);
-      }
+    if (cgs_->empty()) {
+      return folly::makeSemiFuture(arrow::Result<std::shared_ptr<arrow::Table>>(
+          arrow::Status::Invalid("Empty column groups without empty input row indices")));
     }
 
-    return arrow::Table::Make(arrow::schema(out_fields), out_arrays, static_cast<int64_t>(row_indices.size()));
+    auto resolved_columns_result = resolve_needed_columns(schema_, effective_needed_columns(needed_columns));
+    if (!resolved_columns_result.ok()) {
+      return folly::makeSemiFuture(
+          arrow::Result<std::shared_ptr<arrow::Table>>(resolved_columns_result.status()));
+    }
+    auto resolved_columns = resolved_columns_result.MoveValueUnsafe();
+
+    auto lazy_readers_result = create_lazy_readers(resolved_columns);
+    if (!lazy_readers_result.ok()) {
+      return folly::makeSemiFuture(arrow::Result<std::shared_ptr<arrow::Table>>(lazy_readers_result.status()));
+    }
+    auto lazy_readers = lazy_readers_result.MoveValueUnsafe();
+
+    return take_tables_async(row_indices, lazy_readers, parallelism)
+        .deferValue([row_indices, resolved_columns = std::move(resolved_columns), schema = schema_,
+                     lazy_readers](auto&& tables_result) mutable -> arrow::Result<std::shared_ptr<arrow::Table>> {
+          ARROW_ASSIGN_OR_RAISE(auto tables, std::move(tables_result));
+          return build_take_table(tables, row_indices, resolved_columns, schema);
+        });
   }
 
   private:
+  struct TaggedTask {
+    size_t cg_idx;
+    TakeTask take_task;
+  };
+
+  [[nodiscard]] arrow::Result<std::vector<std::shared_ptr<arrow::Table>>> take_sync(
+      const std::vector<int64_t>& row_indices, std::vector<std::unique_ptr<ColumnGroupLazyReader>>& lazy_readers);
+  [[nodiscard]] folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::Table>>>> take_tables_async(
+      const std::vector<int64_t>& row_indices,
+      std::shared_ptr<std::vector<std::unique_ptr<ColumnGroupLazyReader>>> lazy_readers,
+      size_t parallelism);
+
+  [[nodiscard]] arrow::Result<std::shared_ptr<std::vector<std::unique_ptr<ColumnGroupLazyReader>>>> create_lazy_readers(
+      const std::vector<std::string>& resolved_columns) const;
+
+  [[nodiscard]] static arrow::Result<std::shared_ptr<arrow::Table>> build_take_table(
+      const std::vector<std::shared_ptr<arrow::Table>>& tables,
+      const std::vector<int64_t>& row_indices,
+      const std::vector<std::string>& resolved_columns,
+      const std::shared_ptr<arrow::Schema>& schema);
+
+  static void split_tagged_tasks(std::vector<TaggedTask>& tasks, size_t target_count);
+
   std::shared_ptr<ColumnGroups> cgs_;                         ///< Dataset column groups with metadata and layout info
   std::shared_ptr<arrow::Schema> schema_;                     ///< Logical Arrow schema defining data structure
   std::shared_ptr<std::vector<std::string>> needed_columns_;  ///< Column projection (nullptr = all columns)
@@ -964,6 +1088,181 @@ class ReaderImpl : public Reader {
     key_retriever_callback_ = callback;
   }
 };
+
+arrow::Result<std::shared_ptr<std::vector<std::unique_ptr<ColumnGroupLazyReader>>>> ReaderImpl::create_lazy_readers(
+    const std::vector<std::string>& resolved_columns) const {
+  auto needed_column_groups = collect_required_column_groups(resolved_columns);
+
+  auto lazy_readers =
+      std::make_shared<std::vector<std::unique_ptr<ColumnGroupLazyReader>>>(needed_column_groups.size());
+  for (size_t i = 0; i < needed_column_groups.size(); ++i) {
+    if (!needed_column_groups[i]) {
+      return arrow::Status::Invalid(fmt::format("Failed to call take, column group at index {} is empty", i));
+    }
+    ARROW_ASSIGN_OR_RAISE((*lazy_readers)[i],
+                          ColumnGroupLazyReader::create(schema_, needed_column_groups[i], properties_,
+                                                        resolved_columns, key_retriever_callback_));
+  }
+  return lazy_readers;
+}
+
+arrow::Result<std::shared_ptr<arrow::Table>> ReaderImpl::build_take_table(
+    const std::vector<std::shared_ptr<arrow::Table>>& tables,
+    const std::vector<int64_t>& row_indices,
+    const std::vector<std::string>& resolved_columns,
+    const std::shared_ptr<arrow::Schema>& schema) {
+  std::vector<std::shared_ptr<arrow::Field>> fields;
+  std::vector<std::shared_ptr<arrow::Field>> out_fields;
+  std::vector<std::shared_ptr<arrow::ChunkedArray>> columns;
+  std::vector<std::shared_ptr<arrow::ChunkedArray>> out_arrays;
+  std::unordered_map<std::string_view, size_t> colname_to_index;
+
+  uint64_t last_row_counts = UINT64_MAX;
+  for (const auto& table : tables) {
+    assert(table);
+    if (last_row_counts == UINT64_MAX) {
+      last_row_counts = table->num_rows();
+    } else if (last_row_counts != table->num_rows()) {
+      return arrow::Status::Invalid("Logical error, different row counts in column groups");
+    }
+
+    const auto& table_schema = table->schema();
+    for (int i = 0; i < table->num_columns(); ++i) {
+      colname_to_index[table_schema->field(i)->name()] = fields.size();
+      fields.emplace_back(table_schema->field(i));
+      columns.emplace_back(table->column(i));
+    }
+  }
+  assert(fields.size() == columns.size());
+
+  out_arrays.reserve(resolved_columns.size());
+  for (const auto& colname : resolved_columns) {
+    auto it = colname_to_index.find(colname);
+    if (it == colname_to_index.end()) {
+      if (!schema) {
+        return arrow::Status::Invalid(
+            fmt::format("Column '{}' not found in any column group and no schema provided for null filling", colname));
+      }
+      auto missing_field = schema->GetFieldByName(colname);
+      ARROW_ASSIGN_OR_RAISE(auto null_array,
+                            arrow::MakeArrayOfNull(missing_field->type(), static_cast<int64_t>(row_indices.size())));
+      out_fields.emplace_back(missing_field);
+      out_arrays.emplace_back(
+          std::make_shared<arrow::ChunkedArray>(arrow::ArrayVector{std::move(null_array)}, missing_field->type()));
+    } else {
+      out_fields.emplace_back(fields[it->second]);
+      out_arrays.emplace_back(columns[it->second]);
+    }
+  }
+
+  return arrow::Table::Make(arrow::schema(out_fields), out_arrays, static_cast<int64_t>(row_indices.size()));
+}
+
+void ReaderImpl::split_tagged_tasks(std::vector<TaggedTask>& tasks, size_t target_count) {
+  split_tasks_to_fill(
+      tasks, target_count, [](const TaggedTask& t) { return t.take_task.row_indices.size(); },
+      [](TaggedTask& left) -> TaggedTask {
+        size_t mid = left.take_task.row_indices.size() / 2;
+        TaggedTask right{
+            left.cg_idx,
+            TakeTask{left.take_task.file_index,
+                     {left.take_task.row_indices.begin() + mid, left.take_task.row_indices.end()},
+                     {left.take_task.original_positions.begin() + mid, left.take_task.original_positions.end()}}};
+        left.take_task.row_indices.resize(mid);
+        left.take_task.original_positions.resize(mid);
+        return right;
+      });
+}
+
+arrow::Result<std::vector<std::shared_ptr<arrow::Table>>> ReaderImpl::take_sync(
+    const std::vector<int64_t>& row_indices, std::vector<std::unique_ptr<ColumnGroupLazyReader>>& lazy_readers) {
+  std::vector<std::shared_ptr<arrow::Table>> tables;
+  tables.reserve(lazy_readers.size());
+  for (const auto& lazy_reader : lazy_readers) {
+    ARROW_ASSIGN_OR_RAISE(auto table, lazy_reader->take(row_indices));
+    tables.emplace_back(std::move(table));
+  }
+  return tables;
+}
+
+folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::Table>>>> ReaderImpl::take_tables_async(
+    const std::vector<int64_t>& row_indices,
+    std::shared_ptr<std::vector<std::unique_ptr<ColumnGroupLazyReader>>> lazy_readers,
+    size_t parallelism) {
+  std::vector<TaggedTask> all_tasks;
+  auto& readers = *lazy_readers;
+
+  for (size_t i = 0; i < readers.size(); ++i) {
+    auto natural_result = readers[i]->get_natural_tasks(row_indices);
+    if (!natural_result.ok()) {
+      return folly::makeSemiFuture(
+          arrow::Result<std::vector<std::shared_ptr<arrow::Table>>>(natural_result.status()));
+    }
+    auto natural = natural_result.MoveValueUnsafe();
+    for (auto& task : natural) {
+      all_tasks.push_back({i, std::move(task)});
+    }
+  }
+
+  auto executor = milvus_storage::ThreadPoolHolder::GetThreadPool(std::max<size_t>(parallelism, 1));
+  split_tagged_tasks(all_tasks, executor->numThreads());
+
+  std::vector<size_t> task_cg_indices;
+  std::vector<std::vector<size_t>> task_positions;
+  std::vector<folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>>> futures;
+  task_cg_indices.reserve(all_tasks.size());
+  task_positions.reserve(all_tasks.size());
+  futures.reserve(all_tasks.size());
+
+  for (auto& task : all_tasks) {
+    task_cg_indices.push_back(task.cg_idx);
+    task_positions.push_back(std::move(task.take_task.original_positions));
+    futures.push_back(readers[task.cg_idx]->take_async(task.take_task));
+  }
+
+  return folly::collectAll(std::move(futures))
+      .deferValue([row_indices, lazy_readers, task_cg_indices = std::move(task_cg_indices),
+                   task_positions = std::move(task_positions)](
+                      auto&& all_results) mutable -> arrow::Result<std::vector<std::shared_ptr<arrow::Table>>> {
+        std::vector<std::vector<std::shared_ptr<arrow::Table>>> per_cg_tables(lazy_readers->size());
+        std::vector<std::vector<size_t>> per_cg_positions(lazy_readers->size());
+
+        for (size_t i = 0; i < all_results.size(); ++i) {
+          auto& tryResult = all_results[i];
+          if (tryResult.hasException()) {
+            return arrow::Status::IOError(tryResult.exception().what().toStdString());
+          }
+          ARROW_ASSIGN_OR_RAISE(auto table, std::move(tryResult.value()));
+          size_t cg_idx = task_cg_indices[i];
+          per_cg_tables[cg_idx].push_back(std::move(table));
+          per_cg_positions[cg_idx].insert(per_cg_positions[cg_idx].end(), task_positions[i].begin(),
+                                          task_positions[i].end());
+        }
+
+        std::vector<std::shared_ptr<arrow::Table>> tables;
+        tables.reserve(lazy_readers->size());
+        for (size_t cg = 0; cg < lazy_readers->size(); ++cg) {
+          if (per_cg_tables[cg].empty()) {
+            continue;
+          }
+          ARROW_ASSIGN_OR_RAISE(auto concatenated, arrow::ConcatenateTables(per_cg_tables[cg]));
+
+          auto& positions = per_cg_positions[cg];
+          if (positions.size() != row_indices.size()) {
+            return arrow::Status::Invalid(fmt::format("Async take returned {} row positions for {} requested rows",
+                                                      positions.size(), row_indices.size()));
+          }
+          std::vector<int64_t> reorder(row_indices.size());
+          for (size_t i = 0; i < positions.size(); ++i) {
+            reorder[positions[i]] = static_cast<int64_t>(i);
+          }
+          auto indices_array = std::make_shared<arrow::Int64Array>(row_indices.size(), arrow::Buffer::Wrap(reorder));
+          ARROW_ASSIGN_OR_RAISE(auto reordered, arrow::compute::Take(concatenated, indices_array));
+          tables.push_back(reordered.table());
+        }
+        return tables;
+      });
+}
 
 // ==================== Factory Function Implementation ====================
 
