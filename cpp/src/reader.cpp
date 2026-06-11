@@ -49,7 +49,10 @@ namespace milvus_storage::api {
 
 // Splits the largest task repeatedly until task count reaches target_count.
 template <typename Task, typename SizeFn, typename SplitFn>
-static void split_tasks_to_fill(std::vector<Task>& tasks, size_t target_count, SizeFn get_size, SplitFn do_split) {
+static void split_largest_tasks_to_target_count(std::vector<Task>& tasks,
+                                                size_t target_count,
+                                                SizeFn get_size,
+                                                SplitFn do_split) {
   while (tasks.size() < target_count) {
     auto it = std::max_element(tasks.begin(), tasks.end(),
                                [&](const Task& a, const Task& b) { return get_size(a) < get_size(b); });
@@ -773,7 +776,7 @@ arrow::Result<std::vector<uint64_t>> ChunkReaderImpl::get_chunk_rows() {
 }
 
 void ChunkReaderImpl::split_chunk_tasks(std::vector<ChunkTask>& tasks, size_t target_count) {
-  split_tasks_to_fill(
+  split_largest_tasks_to_target_count(
       tasks, target_count, [](const ChunkTask& t) { return t.chunk_indices.size(); },
       [this](ChunkTask& left) -> ChunkTask {
         size_t mid = left.chunk_indices.size() / 2;
@@ -956,7 +959,7 @@ class ReaderImpl : public Reader {
 
     std::vector<std::shared_ptr<arrow::Table>> tables;
     if (parallelism <= 1) {
-      ARROW_ASSIGN_OR_RAISE(tables, take_sync(row_indices, *lazy_readers));
+      ARROW_ASSIGN_OR_RAISE(tables, take_tables_sync(row_indices, *lazy_readers));
     } else {
       ARROW_ASSIGN_OR_RAISE(tables, std::move(take_tables_async(row_indices, lazy_readers, parallelism)).get());
     }
@@ -1006,12 +1009,12 @@ class ReaderImpl : public Reader {
   }
 
   private:
-  struct TaggedTask {
-    size_t cg_idx;
+  struct ColumnGroupTakeTask {
+    size_t reader_index;
     TakeTask take_task;
   };
 
-  [[nodiscard]] arrow::Result<std::vector<std::shared_ptr<arrow::Table>>> take_sync(
+  [[nodiscard]] arrow::Result<std::vector<std::shared_ptr<arrow::Table>>> take_tables_sync(
       const std::vector<int64_t>& row_indices, std::vector<std::unique_ptr<ColumnGroupLazyReader>>& lazy_readers);
   [[nodiscard]] folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::Table>>>> take_tables_async(
       const std::vector<int64_t>& row_indices,
@@ -1027,7 +1030,7 @@ class ReaderImpl : public Reader {
       const std::vector<std::string>& resolved_columns,
       const std::shared_ptr<arrow::Schema>& schema);
 
-  static void split_tagged_tasks(std::vector<TaggedTask>& tasks, size_t target_count);
+  static void split_column_group_take_tasks(std::vector<ColumnGroupTakeTask>& tasks, size_t target_count);
 
   std::shared_ptr<ColumnGroups> cgs_;                         ///< Dataset column groups with metadata and layout info
   std::shared_ptr<arrow::Schema> schema_;                     ///< Logical Arrow schema defining data structure
@@ -1207,13 +1210,13 @@ arrow::Result<std::shared_ptr<arrow::Table>> ReaderImpl::build_take_table(
   return arrow::Table::Make(arrow::schema(out_fields), out_arrays, static_cast<int64_t>(row_indices.size()));
 }
 
-void ReaderImpl::split_tagged_tasks(std::vector<TaggedTask>& tasks, size_t target_count) {
-  split_tasks_to_fill(
-      tasks, target_count, [](const TaggedTask& t) { return t.take_task.row_indices.size(); },
-      [](TaggedTask& left) -> TaggedTask {
+void ReaderImpl::split_column_group_take_tasks(std::vector<ColumnGroupTakeTask>& tasks, size_t target_count) {
+  split_largest_tasks_to_target_count(
+      tasks, target_count, [](const ColumnGroupTakeTask& t) { return t.take_task.row_indices.size(); },
+      [](ColumnGroupTakeTask& left) -> ColumnGroupTakeTask {
         size_t mid = left.take_task.row_indices.size() / 2;
-        TaggedTask right{
-            left.cg_idx,
+        ColumnGroupTakeTask right{
+            left.reader_index,
             TakeTask{left.take_task.file_index,
                      {left.take_task.row_indices.begin() + mid, left.take_task.row_indices.end()},
                      {left.take_task.original_positions.begin() + mid, left.take_task.original_positions.end()}}};
@@ -1223,7 +1226,7 @@ void ReaderImpl::split_tagged_tasks(std::vector<TaggedTask>& tasks, size_t targe
       });
 }
 
-arrow::Result<std::vector<std::shared_ptr<arrow::Table>>> ReaderImpl::take_sync(
+arrow::Result<std::vector<std::shared_ptr<arrow::Table>>> ReaderImpl::take_tables_sync(
     const std::vector<int64_t>& row_indices, std::vector<std::unique_ptr<ColumnGroupLazyReader>>& lazy_readers) {
   std::vector<std::shared_ptr<arrow::Table>> tables;
   tables.reserve(lazy_readers.size());
@@ -1238,7 +1241,7 @@ folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::Table>>>> Rea
     const std::vector<int64_t>& row_indices,
     std::shared_ptr<std::vector<std::unique_ptr<ColumnGroupLazyReader>>> lazy_readers,
     size_t parallelism) {
-  std::vector<TaggedTask> all_tasks;
+  std::vector<ColumnGroupTakeTask> all_tasks;
   auto& readers = *lazy_readers;
 
   for (size_t i = 0; i < readers.size(); ++i) {
@@ -1253,7 +1256,7 @@ folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::Table>>>> Rea
   }
 
   auto executor = milvus_storage::ThreadPoolHolder::GetThreadPool(std::max<size_t>(parallelism, 1));
-  split_tagged_tasks(all_tasks, executor->numThreads());
+  split_column_group_take_tasks(all_tasks, executor->numThreads());
 
   std::vector<size_t> task_cg_indices;
   std::vector<std::vector<size_t>> task_positions;
@@ -1263,9 +1266,9 @@ folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::Table>>>> Rea
   futures.reserve(all_tasks.size());
 
   for (auto& task : all_tasks) {
-    task_cg_indices.push_back(task.cg_idx);
+    task_cg_indices.push_back(task.reader_index);
     task_positions.push_back(std::move(task.take_task.original_positions));
-    futures.push_back(readers[task.cg_idx]->take_async(task.take_task));
+    futures.push_back(readers[task.reader_index]->take_async(task.take_task));
   }
 
   return folly::collectAll(std::move(futures))
