@@ -1650,6 +1650,7 @@ class S3FileSystem::Impl : public std::enable_shared_from_this<S3FileSystem::Imp
   const arrow::io::IOContext io_context_;
   std::shared_ptr<S3ClientHolder> holder_;
 #ifdef WITH_CRT
+  bool use_crt_async_reads_ = false;
   ClientBuilder<Aws::S3Crt::S3CrtClient> crt_builder_;
   std::shared_ptr<S3CrtClientHolder> crt_holder_;
 #endif
@@ -1664,6 +1665,7 @@ class S3FileSystem::Impl : public std::enable_shared_from_this<S3FileSystem::Imp
         io_context_(std::move(io_context))
 #ifdef WITH_CRT
         ,
+        use_crt_async_reads_(options.use_crt_async_reads),
         crt_builder_(std::move(options))
 #endif
   {
@@ -1676,6 +1678,9 @@ class S3FileSystem::Impl : public std::enable_shared_from_this<S3FileSystem::Imp
     }
     ARROW_RETURN_NOT_OK(std::move(result).Value(&holder_));
 #ifdef WITH_CRT
+    if (!use_crt_async_reads_) {
+      return arrow::Status::OK();
+    }
     std::shared_ptr<FilesystemMetrics> metrics;
     {
       ARROW_ASSIGN_OR_RAISE(auto client_lock, holder_->Lock());
@@ -2443,10 +2448,13 @@ class S3FileSystem::Impl : public std::enable_shared_from_this<S3FileSystem::Imp
     ARROW_RETURN_NOT_OK(CheckS3Initialized());
 
 #ifdef WITH_CRT
-    auto ptr = std::make_shared<ObjectCrtInputFile>(crt_holder_, fs->io_context(), path);
-#else
-    auto ptr = std::make_shared<ObjectInputFile>(holder_, fs->io_context(), path);
+    if (use_crt_async_reads_) {
+      auto ptr = std::make_shared<ObjectCrtInputFile>(crt_holder_, fs->io_context(), path);
+      ARROW_RETURN_NOT_OK(ptr->Init());
+      return std::static_pointer_cast<arrow::io::RandomAccessFile>(ptr);
+    }
 #endif
+    auto ptr = std::make_shared<ObjectInputFile>(holder_, fs->io_context(), path);
     ARROW_RETURN_NOT_OK(ptr->Init());
     return std::static_pointer_cast<arrow::io::RandomAccessFile>(ptr);
   }
@@ -2466,21 +2474,25 @@ class S3FileSystem::Impl : public std::enable_shared_from_this<S3FileSystem::Imp
     ARROW_RETURN_NOT_OK(CheckS3Initialized());
 
 #ifdef WITH_CRT
-    auto ptr = std::make_shared<ObjectCrtInputFile>(crt_holder_, fs->io_context(), path, info.size());
-#else
-    auto ptr = std::make_shared<ObjectInputFile>(holder_, fs->io_context(), path, info.size());
+    if (use_crt_async_reads_) {
+      auto ptr = std::make_shared<ObjectCrtInputFile>(crt_holder_, fs->io_context(), path, info.size());
+      ARROW_RETURN_NOT_OK(ptr->Init());
+      return std::static_pointer_cast<arrow::io::RandomAccessFile>(ptr);
+    }
 #endif
+    auto ptr = std::make_shared<ObjectInputFile>(holder_, fs->io_context(), path, info.size());
     ARROW_RETURN_NOT_OK(ptr->Init());
     return std::static_pointer_cast<arrow::io::RandomAccessFile>(ptr);
   }
 
   arrow::Result<std::shared_ptr<FilesystemMetrics>> GetMetrics() {
 #ifdef WITH_CRT
-    return {crt_holder_->GetMetrics()};
-#else
+    if (use_crt_async_reads_) {
+      return {crt_holder_->GetMetrics()};
+    }
+#endif
     ARROW_ASSIGN_OR_RAISE(auto client_lock, holder_->Lock());
     return {client_lock.Move()->GetMetrics()};
-#endif
   }
 };
 
