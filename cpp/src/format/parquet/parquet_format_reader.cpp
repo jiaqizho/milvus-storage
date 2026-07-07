@@ -15,6 +15,8 @@
 #include "milvus-storage/format/parquet/parquet_format_reader.h"
 
 #include <cstring>
+#include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -35,6 +37,7 @@
 #include <arrow/util/key_value_metadata.h>
 #include <parquet/arrow/schema.h>
 #include <parquet/metadata.h>
+#include <parquet/properties.h>
 #include <parquet/type_fwd.h>
 
 #include "milvus-storage/format/parquet/key_retriever.h"
@@ -46,6 +49,83 @@
 #include "milvus-storage/filesystem/fs.h"
 
 namespace milvus_storage::parquet {
+
+static arrow::Result<std::shared_ptr<::parquet::FileMetaData>> build_simplest_parquet_file_metadata(
+    const std::shared_ptr<::parquet::FileMetaData>& metadata) {
+  if (!metadata) {
+    return arrow::Status::Invalid("Cannot build simplest parquet metadata from null metadata");
+  }
+  if (metadata->is_encryption_algorithm_set()) {
+    return arrow::Status::NotImplemented("Cannot build simplest parquet metadata for encrypted parquet");
+  }
+
+  ::parquet::WriterProperties::Builder properties_builder;
+  properties_builder.version(metadata->version())->created_by(metadata->created_by())->disable_statistics();
+
+  for (int column_index = 0; column_index < metadata->num_columns(); ++column_index) {
+    std::optional<::parquet::Compression::type> compression;
+    for (int row_group_index = 0; row_group_index < metadata->num_row_groups(); ++row_group_index) {
+      auto row_group = metadata->RowGroup(row_group_index);
+      auto column = row_group->ColumnChunk(column_index);
+      if (!column->file_path().empty()) {
+        return arrow::Status::NotImplemented("Cannot build simplest metadata for external column chunk files");
+      }
+      if (column->crypto_metadata()) {
+        return arrow::Status::NotImplemented("Cannot build simplest metadata for encrypted parquet columns");
+      }
+      if (!compression.has_value()) {
+        compression = column->compression();
+      } else if (*compression != column->compression()) {
+        return arrow::Status::NotImplemented("Cannot build simplest metadata with per-row-group compression changes");
+      }
+    }
+    if (compression.has_value()) {
+      properties_builder.compression(metadata->schema()->Column(column_index)->path(), *compression);
+    }
+  }
+
+  auto properties = properties_builder.build();
+  auto builder = ::parquet::FileMetaDataBuilder::Make(metadata->schema(), std::move(properties));
+  for (int row_group_index = 0; row_group_index < metadata->num_row_groups(); ++row_group_index) {
+    if (row_group_index > std::numeric_limits<int16_t>::max()) {
+      return arrow::Status::NotImplemented("Cannot build simplest metadata with more than int16 max row groups");
+    }
+
+    auto source_row_group = metadata->RowGroup(row_group_index);
+    auto compact_row_group = builder->AppendRowGroup();
+    compact_row_group->set_num_rows(source_row_group->num_rows());
+    for (int column_index = 0; column_index < source_row_group->num_columns(); ++column_index) {
+      auto source_column = source_row_group->ColumnChunk(column_index);
+      std::map<::parquet::Encoding::type, int32_t> dict_encoding_stats;
+      std::map<::parquet::Encoding::type, int32_t> data_encoding_stats;
+      for (const auto encoding : source_column->encodings()) {
+        if (encoding == ::parquet::Encoding::RLE || encoding == ::parquet::Encoding::BIT_PACKED) {
+          continue;
+        }
+        if (encoding == ::parquet::Encoding::PLAIN && source_column->has_dictionary_page()) {
+          dict_encoding_stats[encoding] = 1;
+        } else {
+          data_encoding_stats[encoding] = 1;
+        }
+      }
+
+      compact_row_group->NextColumnChunk()->Finish(source_column->num_values(),
+                                                   source_column->has_dictionary_page()
+                                                       ? source_column->dictionary_page_offset()
+                                                       : 0,
+                                                   -1 /* index_page_offset */, source_column->data_page_offset(),
+                                                   source_column->total_compressed_size(),
+                                                   source_column->total_uncompressed_size(),
+                                                   source_column->has_dictionary_page(),
+                                                   false /* dictionary_fallback */, dict_encoding_stats,
+                                                   data_encoding_stats);
+    }
+    compact_row_group->Finish(source_row_group->total_byte_size(), static_cast<int16_t>(row_group_index));
+  }
+
+  auto simplest_metadata = builder->Finish(nullptr);
+  return std::shared_ptr<::parquet::FileMetaData>(std::move(simplest_metadata));
+}
 
 static arrow::Result<std::vector<RowGroupInfo>> try_build_row_group_infos(
     const std::shared_ptr<::parquet::FileMetaData>& metadata) {
@@ -332,12 +412,29 @@ arrow::Result<ParquetFormatReader::MetaTrait::MetadataPtr> ParquetFormatReader::
 
   ARROW_ASSIGN_OR_RAISE(auto row_group_infos, create_row_group_infos_from_metadata(parquet_metadata, uri.key));
 
+  uint64_t cache_size = parquet_metadata->size();
+  if (!key_retriever) {
+    try {
+      auto simplest_metadata_result = build_simplest_parquet_file_metadata(parquet_metadata);
+      if (simplest_metadata_result.ok()) {
+        auto simplest_metadata = std::move(simplest_metadata_result).ValueOrDie();
+        const auto simplest_size = simplest_metadata->SerializeToString().size();
+        if (simplest_size < cache_size) {
+          cache_size = simplest_size;
+          parquet_metadata = std::move(simplest_metadata);
+        }
+      }
+    } catch (...) {
+      // Keep the original metadata if the simplest FileMetaData path cannot handle the file.
+    }
+  }
+
   auto metadata = std::make_shared<Metadata>();
   metadata->cache_key = cache_key(file);
   metadata->path = uri.key;
   metadata->file_schema = std::move(file_schema);
   metadata->row_group_infos = std::move(row_group_infos);
-  metadata->cache_size = parquet_metadata->size();
+  metadata->cache_size = cache_size;
   metadata->payload.fs = std::move(fs);
   if (!key_retriever) {
     metadata->payload.parquet_metadata = std::move(parquet_metadata);

@@ -40,6 +40,9 @@ using namespace milvus_storage::api;
 
 namespace {
 
+constexpr size_t kOpenManyParquetFooterPaddingBytes = 486 * 1024;
+constexpr const char* kOpenManyParquetFooterPaddingKey = "open_many_format_readers_rss_footer_padding";
+
 class NestedStructExtensionType : public arrow::ExtensionType {
   public:
   explicit NestedStructExtensionType(std::shared_ptr<arrow::DataType> storage_type)
@@ -573,6 +576,52 @@ TEST_P(FormatReaderTest, ParquetCreateFromMetadataSharesParsedMetadata) {
   ASSERT_EQ(second_batch->num_columns(), 1);
   ASSERT_EQ(first_batch->schema()->field(0)->name(), "id");
   ASSERT_EQ(second_batch->schema()->field(0)->name(), "value");
+}
+
+TEST_P(FormatReaderTest, ParquetLoadMetadataCompactsPaddedFooter) {
+  std::string format = GetParam();
+  if (format != LOON_FORMAT_PARQUET) {
+    GTEST_SKIP() << "Test parquet only.";
+  }
+
+  const auto file_path = base_path_ + "/compact_padded_metadata.parquet";
+  ASSERT_AND_ASSIGN(auto sink, fs_->OpenOutputStream(file_path));
+  ASSERT_AND_ASSIGN(auto parquet_writer,
+                    ::parquet::arrow::FileWriter::Open(*schema_, arrow::default_memory_pool(), sink));
+  ASSERT_STATUS_OK(parquet_writer->NewBufferedRowGroup());
+  ASSERT_STATUS_OK(parquet_writer->WriteRecordBatch(*test_batch_));
+  ASSERT_STATUS_OK(parquet_writer->AddKeyValueMetadata(arrow::key_value_metadata(
+      {kOpenManyParquetFooterPaddingKey}, {std::string(kOpenManyParquetFooterPaddingBytes, 'x')})));
+  ASSERT_STATUS_OK(parquet_writer->Close());
+  ASSERT_STATUS_OK(sink->Close());
+
+  const auto raw_metadata = parquet_writer->metadata();
+  ASSERT_NE(nullptr, raw_metadata);
+  ASSERT_NE(nullptr, raw_metadata->key_value_metadata());
+  ASSERT_TRUE(raw_metadata->key_value_metadata()->Contains(kOpenManyParquetFooterPaddingKey));
+  const auto raw_metadata_size = raw_metadata->SerializeToString().size();
+  ASSERT_GT(raw_metadata_size, kOpenManyParquetFooterPaddingBytes);
+
+  api::ColumnGroupFile file{.path = file_path, .start_index = 0, .end_index = test_batch_->num_rows()};
+
+  ASSERT_AND_ASSIGN(auto metadata,
+                    FormatReader::load_metadata<parquet::ParquetFormatReader>(file, properties_, nullptr));
+  ASSERT_NE(nullptr, metadata->payload.parquet_metadata);
+
+  const auto compact_metadata = metadata->payload.parquet_metadata;
+  EXPECT_EQ(nullptr, compact_metadata->key_value_metadata());
+
+  const auto compact_size = compact_metadata->SerializeToString().size();
+  EXPECT_LT(compact_size, raw_metadata_size - kOpenManyParquetFooterPaddingBytes / 2);
+  EXPECT_EQ(metadata->cache_size, compact_size);
+
+  ASSERT_AND_ASSIGN(auto reader, FormatReader::create_from_metadata<parquet::ParquetFormatReader>(
+                                     metadata, file, schema_, {"id", "value"}, ""));
+  ASSERT_AND_ASSIGN(auto actual_batch, reader->get_chunk(0));
+  ASSERT_AND_ASSIGN(auto expected_batch, test_batch_->SelectColumns({0, 2}));
+  ASSERT_TRUE(actual_batch->Equals(*expected_batch)) << "expected:\n"
+                                                     << expected_batch->ToString() << "\nactual:\n"
+                                                     << actual_batch->ToString();
 }
 
 TEST_P(FormatReaderTest, NestedProjectionPreservesTopLevelColumns) {
