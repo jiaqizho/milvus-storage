@@ -121,10 +121,18 @@ class ParquetFormatReader final : public FormatReader, public std::enable_shared
   [[nodiscard]] std::shared_ptr<arrow::Schema> get_schema() const override;
 
   private:
+  // Read the selected row groups into one Arrow table using the current
+  // Parquet leaf-column projection.
   [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Table>> get_chunks_internal(
       const std::vector<int>& rg_indices_in_file);
-  [[nodiscard]] arrow::Result<std::vector<RowGroupInfo>> create_row_group_infos(
-      const std::shared_ptr<::parquet::FileMetaData>& metadata);
+
+  // Validate a completed file reader, then publish its schema, row-group, and
+  // projection state only after all derived values are ready. All failures are
+  // returned as Status.
+  [[nodiscard]] arrow::Status finish_open(std::shared_ptr<::parquet::arrow::FileReader> file_reader);
+
+  // Resolve top-level column names to Parquet leaf indices and commit the
+  // projection. An empty list selects every leaf column.
   [[nodiscard]] arrow::Status set_needed_columns(const std::vector<std::string>& needed_columns);
 
   ParquetFormatReader(const ParquetFormatReader& other, std::shared_ptr<::parquet::arrow::FileReader> file_reader);
@@ -138,7 +146,7 @@ class ParquetFormatReader final : public FormatReader, public std::enable_shared
   uint64_t file_size_ = 0;    ///< Pre-known file size to skip S3 HEAD requests
   uint64_t footer_size_ = 0;  ///< Pre-known footer size for single-IO footer read
 
-  // init after open()
+  // init after open()/open_async()
   // Parquet ReadRowGroup expects leaf-column indices, not top-level Arrow field indices.
   std::vector<int> projected_leaf_column_indices_;
   std::vector<RowGroupInfo> row_group_infos_;

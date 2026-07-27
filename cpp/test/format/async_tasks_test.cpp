@@ -47,6 +47,16 @@ folly::SemiFuture<arrow::Result<int>> assign_or_raise_future(bool ok) {
   return folly::makeSemiFuture(arrow::Result<int>(value + 1));
 }
 
+folly::SemiFuture<arrow::Status> return_not_ok_status_future(bool ok) {
+  FOLLY_ARROW_RETURN_NOT_OK(ok ? arrow::Status::OK() : arrow::Status::Invalid("bad status future"));
+  return folly::makeSemiFuture(arrow::Status::OK());
+}
+
+folly::SemiFuture<arrow::Status> assign_or_raise_status_future(bool ok) {
+  FOLLY_ARROW_ASSIGN_OR_RAISE(auto value, maybe_int(ok));
+  return folly::makeSemiFuture(value == 41 ? arrow::Status::OK() : arrow::Status::UnknownError("bad value"));
+}
+
 }  // namespace
 
 TEST(AsyncTasksTest, FollyArrowReturnNotOkPropagatesStatusToSemiFutureResult) {
@@ -68,6 +78,26 @@ TEST(AsyncTasksTest, FollyArrowAssignOrRaiseExposesAssignedValueOnSuccess) {
 
   ASSERT_TRUE(result.ok()) << result.status().ToString();
   EXPECT_EQ(result.ValueUnsafe(), 42);
+}
+
+TEST(AsyncTasksTest, FollyArrowReturnNotOkPropagatesStatusToStatusSemiFuture) {
+  auto status = std::move(return_not_ok_status_future(false)).get();
+
+  ASSERT_FALSE(status.ok());
+  EXPECT_NE(status.ToString().find("bad status future"), std::string::npos);
+}
+
+TEST(AsyncTasksTest, FollyArrowAssignOrRaisePropagatesResultStatusToStatusSemiFuture) {
+  auto status = std::move(assign_or_raise_status_future(false)).get();
+
+  ASSERT_FALSE(status.ok());
+  EXPECT_NE(status.ToString().find("bad int"), std::string::npos);
+}
+
+TEST(AsyncTasksTest, FollyArrowAssignOrRaiseSupportsSuccessfulStatusSemiFuture) {
+  auto status = std::move(assign_or_raise_status_future(true)).get();
+
+  EXPECT_TRUE(status.ok()) << status.ToString();
 }
 
 TEST(AsyncTasksTest, ChunkTaskBuildGroupsByFileAndMergesContiguousRanges) {

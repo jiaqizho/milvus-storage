@@ -32,11 +32,10 @@ namespace milvus_storage {
 
 namespace detail {
 
-// Converts an Arrow status into a ready error future for any
-// folly::SemiFuture<arrow::Result<T>> return type.
+// Converts an Arrow status into a ready future whose value carries the error.
 class FollyArrowErrorFuture {
   public:
-  // Store the setup failure until the enclosing function's Result<T> is inferred.
+  // Store the setup failure until the enclosing future's value type is inferred.
   explicit FollyArrowErrorFuture(arrow::Status status) : status_(std::move(status)) {}
 
   // Materialize a ready error future without requiring callers to spell T.
@@ -44,6 +43,8 @@ class FollyArrowErrorFuture {
   operator folly::SemiFuture<arrow::Result<T>>() && {
     return folly::makeSemiFuture(arrow::Result<T>(std::move(status_)));
   }
+
+  operator folly::SemiFuture<arrow::Status>() && { return folly::makeSemiFuture(std::move(status_)); }
 
   private:
   arrow::Status status_;
@@ -92,7 +93,7 @@ arrow::Result<std::string> GetEnvVar(const std::string& name);
 }  // namespace milvus_storage
 
 // Async counterparts of Arrow's early-return helpers. They keep validation and
-// setup failures on the same Result-bearing future path as backend failures.
+// setup failures on the same Arrow Status/Result future path as backend failures.
 #define FOLLY_ARROW_RETURN_NOT_OK(status_expr)                                                \
   do {                                                                                        \
     auto _folly_arrow_status = (status_expr);                                                 \
