@@ -43,7 +43,11 @@ use lance::session::Session;
 use lance_io::object_store::{ObjectStoreRegistry, StorageOptionsAccessor};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
-use crate::azure_sas_provider::{AzureBrokerConfig, AzureSasStorageOptionsProvider};
+use crate::azure_sas_provider::AzureBrokerConfig;
+use crate::cloud_credential_cache::{
+    AssumeRoleConfig, CACHE_KEY, cached_aws_credentials, cached_azure_sas_provider,
+    cached_gcp_credential_provider,
+};
 use crate::gcp_impersonation::{ImpersonatingGcsStoreProvider, REFRESH_OFFSET_SECS};
 
 const CLOUD_PROVIDER_KEY: &str = "cloud_provider";
@@ -329,78 +333,6 @@ impl BlockingDataset {
 
 use crate::iceberg_bridgeimpl::vec_to_hashmap;
 
-/// Configuration for AWS STS AssumeRole credentials.
-struct AssumeRoleConfig {
-    role_arn: String,
-    session_name: String,
-    external_id: String,
-    credential_refresh_secs: u64,
-}
-
-impl AssumeRoleConfig {
-    /// Parse from raw parameters. Returns None if role_arn is empty.
-    /// Returns Err if credential_refresh_secs is out of range [900, 43200].
-    /// 43200s (12h) is AWS STS `AssumeRole`'s hard upper bound on
-    /// `DurationSeconds`, reachable only when the target IAM role's
-    /// `MaxSessionDuration` is raised from the 3600s default.
-    fn parse(
-        role_arn: &str,
-        session_name: &str,
-        external_id: &str,
-        credential_refresh_secs: u64,
-    ) -> Result<Option<Self>> {
-        if role_arn.is_empty() {
-            return Ok(None);
-        }
-        if credential_refresh_secs < 900 || credential_refresh_secs > 43200 {
-            return Err(LanceError::invalid_input(
-                format!(
-                    "credential_refresh_secs must be in [900, 43200], got {}",
-                    credential_refresh_secs
-                ),
-            ));
-        }
-        Ok(Some(Self {
-            role_arn: role_arn.to_string(),
-            session_name: session_name.to_string(),
-            external_id: external_id.to_string(),
-            credential_refresh_secs,
-        }))
-    }
-
-    /// Build AWS credentials by calling STS AssumeRole.
-    async fn build_credentials(&self) -> Result<object_store::aws::AwsCredentialProvider> {
-        use aws_config::sts::AssumeRoleProvider;
-        use lance_io::object_store::providers::aws::AwsCredentialAdapter;
-
-        // session_length = STS token TTL (credential_refresh_secs, e.g. 900s).
-        // refresh_offset = how early before expiry AwsCredentialAdapter triggers a
-        //   refresh.  Must be strictly less than session_length, otherwise the cache
-        //   is considered expired immediately after issuance and every credential
-        //   check triggers a new STS call (credential thrashing).
-        //   Use a fixed 300s offset to leave enough safety margin.
-        const REFRESH_OFFSET_SECS: u64 = 300;
-
-        let mut builder = AssumeRoleProvider::builder(&self.role_arn)
-            .session_length(std::time::Duration::from_secs(self.credential_refresh_secs));
-
-        if !self.session_name.is_empty() {
-            builder = builder.session_name(&self.session_name);
-        }
-        if !self.external_id.is_empty() {
-            builder = builder.external_id(&self.external_id);
-        }
-
-        // build() auto-loads base credentials from the default chain (IAM / IRSA / env vars)
-        let assume_role_provider = builder.build().await;
-
-        Ok(Arc::new(AwsCredentialAdapter::new(
-            Arc::new(assume_role_provider),
-            std::time::Duration::from_secs(REFRESH_OFFSET_SECS),
-        )))
-    }
-}
-
 /// GCP cross-tenant impersonation parameters extracted from `storage_options`.
 ///
 /// The C++ side (`lance::ToStorageOptions` in `lance_common.cpp`) stamps these
@@ -460,17 +392,23 @@ impl GcpImpersonationConfig {
 /// A fresh `Session` is built per call so that two concurrent opens with
 /// different target SAs cannot collide on a shared registry. Cache sizes
 /// remain zero because index/metadata caches are managed by the caller.
-fn build_gcp_impersonation_session(config: &GcpImpersonationConfig) -> Arc<Session> {
+fn build_gcp_impersonation_session(
+    config: &GcpImpersonationConfig,
+    cache_key: Option<&str>,
+) -> Result<Arc<Session>> {
+    let credential_provider = TOKIO_RT.block_on(cached_gcp_credential_provider(
+        cache_key,
+        config.target_sa.clone(),
+        std::time::Duration::from_secs(config.token_lifetime_secs),
+        std::time::Duration::from_secs(REFRESH_OFFSET_SECS),
+    ))
+    .map_err(|error| LanceError::invalid_input(error.to_string()))?;
     let registry = ObjectStoreRegistry::default();
     registry.insert(
         "gs",
-        Arc::new(ImpersonatingGcsStoreProvider::new(
-            config.target_sa.clone(),
-            std::time::Duration::from_secs(config.token_lifetime_secs),
-            std::time::Duration::from_secs(REFRESH_OFFSET_SECS),
-        )),
+        Arc::new(ImpersonatingGcsStoreProvider::new(credential_provider)),
     );
-    Arc::new(Session::new(0, 0, Arc::new(registry)))
+    Ok(Arc::new(Session::new(0, 0, Arc::new(registry))))
 }
 
 pub fn open_dataset(
@@ -479,6 +417,7 @@ pub fn open_dataset(
     storage_options_values: Vec<String>,
 ) -> Result<Box<BlockingDataset>> {
     let mut storage_options = vec_to_hashmap(storage_options_keys, storage_options_values);
+    let credential_cache_key = storage_options.remove(CACHE_KEY);
     let cloud_provider = storage_options.remove(CLOUD_PROVIDER_KEY);
     if let Some(cloud_provider) = cloud_provider.as_deref()
         && !matches!(cloud_provider, "aws" | "azure" | "gcp" | "aliyun")
@@ -497,6 +436,7 @@ pub fn open_dataset(
         Some("aws") => {
             // Lance accepts a refreshable AWS credential provider directly.
             let role_arn = storage_options.remove("aws_role_arn").unwrap_or_default();
+            let region = storage_options.get("aws_region").cloned().unwrap_or_default();
             let session_name = storage_options
                 .remove("aws_session_name")
                 .unwrap_or_default();
@@ -507,12 +447,16 @@ pub fn open_dataset(
             let credential_refresh_secs: u64 = refresh_secs_str.parse().unwrap_or(0);
             let assume_role = AssumeRoleConfig::parse(
                 &role_arn,
+                &region,
                 &session_name,
                 &external_id,
                 credential_refresh_secs,
             )?;
             store_params.aws_credentials = match &assume_role {
-                Some(config) => Some(TOKIO_RT.block_on(config.build_credentials())?),
+                Some(config) => Some(TOKIO_RT.block_on(cached_aws_credentials(
+                    credential_cache_key.as_deref(),
+                    config,
+                ))?),
                 None => None,
             };
         }
@@ -533,10 +477,12 @@ pub fn open_dataset(
                     );
                     storage_options
                         .insert("azure_skip_signature".to_string(), "false".to_string());
-                    let provider = Arc::new(
-                        AzureSasStorageOptionsProvider::new(config)
-                            .map_err(|error| LanceError::invalid_input(error.to_string()))?,
-                    );
+                    let provider = TOKIO_RT
+                        .block_on(cached_azure_sas_provider(
+                            credential_cache_key.as_deref(),
+                            config,
+                        ))
+                        .map_err(|error| LanceError::invalid_input(error.to_string()))?;
                     // Preserve the static Azure settings and overlay refreshed SAS
                     // values returned by the provider.
                     Some(Arc::new(StorageOptionsAccessor::with_initial_and_provider(
@@ -551,10 +497,16 @@ pub fn open_dataset(
             // Lance's stock GCS provider cannot refresh impersonated access
             // tokens, so replace the `gs` provider for this dataset only.
             custom_session = GcpImpersonationConfig::extract(&mut storage_options)?
-                .map(|config| build_gcp_impersonation_session(&config));
+                .map(|config| {
+                    build_gcp_impersonation_session(&config, credential_cache_key.as_deref())
+                })
+                .transpose()?;
         }
         Some("aliyun") if storage_options.contains_key("oss_role_arn") => {
             // Lance's stock OSS provider does not forward the role ARN options.
+            if let Some(cache_key) = credential_cache_key.as_ref() {
+                storage_options.insert(CACHE_KEY.to_string(), cache_key.clone());
+            }
             custom_session = Some(crate::aliyun_oss_provider::build_aliyun_oss_session());
         }
         _ => {}
@@ -591,6 +543,7 @@ pub unsafe fn write_dataset(
     data_storage_format: LanceDataStorageFormat,
 ) -> Result<Box<BlockingDataset>> {
     let mut storage_options = vec_to_hashmap(storage_options_keys, storage_options_values);
+    let credential_cache_key = storage_options.remove(CACHE_KEY);
     let cloud_provider = storage_options.remove(CLOUD_PROVIDER_KEY);
     if let Some(cloud_provider) = cloud_provider.as_deref()
         && !matches!(cloud_provider, "aws" | "azure" | "gcp" | "aliyun")
@@ -605,6 +558,7 @@ pub unsafe fn write_dataset(
     match cloud_provider.as_deref() {
         Some("aws") => {
             let role_arn = storage_options.remove("aws_role_arn").unwrap_or_default();
+            let region = storage_options.get("aws_region").cloned().unwrap_or_default();
             let session_name = storage_options
                 .remove("aws_session_name")
                 .unwrap_or_default();
@@ -615,12 +569,16 @@ pub unsafe fn write_dataset(
             let credential_refresh_secs: u64 = refresh_secs_str.parse().unwrap_or(0);
             let assume_role = AssumeRoleConfig::parse(
                 &role_arn,
+                &region,
                 &session_name,
                 &external_id,
                 credential_refresh_secs,
             )?;
             store_params.aws_credentials = match &assume_role {
-                Some(config) => Some(TOKIO_RT.block_on(config.build_credentials())?),
+                Some(config) => Some(TOKIO_RT.block_on(cached_aws_credentials(
+                    credential_cache_key.as_deref(),
+                    config,
+                ))?),
                 None => None,
             };
         }
@@ -637,10 +595,12 @@ pub unsafe fn write_dataset(
                     );
                     storage_options
                         .insert("azure_skip_signature".to_string(), "false".to_string());
-                    let provider = Arc::new(
-                        AzureSasStorageOptionsProvider::new(config)
-                            .map_err(|error| LanceError::invalid_input(error.to_string()))?,
-                    );
+                    let provider = TOKIO_RT
+                        .block_on(cached_azure_sas_provider(
+                            credential_cache_key.as_deref(),
+                            config,
+                        ))
+                        .map_err(|error| LanceError::invalid_input(error.to_string()))?;
                     Some(Arc::new(StorageOptionsAccessor::with_initial_and_provider(
                         storage_options.clone(),
                         provider,
@@ -651,9 +611,15 @@ pub unsafe fn write_dataset(
         }
         Some("gcp") => {
             custom_session = GcpImpersonationConfig::extract(&mut storage_options)?
-                .map(|config| build_gcp_impersonation_session(&config));
+                .map(|config| {
+                    build_gcp_impersonation_session(&config, credential_cache_key.as_deref())
+                })
+                .transpose()?;
         }
         Some("aliyun") if storage_options.contains_key("oss_role_arn") => {
+            if let Some(cache_key) = credential_cache_key.as_ref() {
+                storage_options.insert(CACHE_KEY.to_string(), cache_key.clone());
+            }
             custom_session = Some(crate::aliyun_oss_provider::build_aliyun_oss_session());
         }
         _ => {}

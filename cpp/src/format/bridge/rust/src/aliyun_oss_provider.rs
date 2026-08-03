@@ -78,11 +78,17 @@ use object_store::{
     PutResult, Result as ObjectStoreResult, path::Path,
 };
 use object_store_opendal::OpendalStore;
+use opendal::layers::HttpClientLayer;
+use opendal::raw::{HttpBody, HttpClient, HttpFetch};
 use opendal::{Operator, services::Oss};
+use reqsign_aliyun_oss::{Credential as AliyunCredential, RequestSigner};
+use reqsign_core::{Context as SigningContext, SignRequest};
 use serde::{Deserialize, Serialize};
 use snafu::location;
 use tokio::sync::RwLock;
 use url::Url;
+
+use crate::cloud_credential_cache::{CACHE_KEY, cached_aliyun_oss_store};
 
 use lance::session::Session;
 use lance::{Error as LanceError, Result as LanceResult};
@@ -295,15 +301,7 @@ pub(crate) fn build_oss_config_from_iceberg_opts(
 /// On success the chain hand-off matches `ram::apply_credentials`: static
 /// creds + `security_token` injected into `config_map`, `role_arn` stripped
 /// so reqsign's own AssumeRoleWithOIDC path cannot re-fire.
-pub(crate) async fn apply_oidc_chain_if_requested(
-    config_map: &mut HashMap<String, String>,
-) -> Result<(), String> {
-    apply_oidc_chain_if_requested_with_expiration(config_map)
-        .await
-        .map(|_| ())
-}
-
-async fn apply_oidc_chain_if_requested_with_expiration(
+async fn apply_oidc_chain_if_requested(
     config_map: &mut HashMap<String, String>,
 ) -> Result<Option<u64>, String> {
     // RAM mode owns this config_map; do not double-resolve.
@@ -432,17 +430,10 @@ async fn call_assume_role_with_oidc(
 /// callers, plain AK/SK callers, and any caller without the env var flipped
 /// fall straight through. Lance `role_arn` stores wrap this one-shot swap in
 /// [`RefreshableAliyunOssStore`] so long-lived scans rebuild the opendal store
-/// on the configured refresh interval. Iceberg intentionally calls this from
-/// `create_operator()` for each I/O operation instead of keeping a cache.
-pub(crate) async fn apply_ram_mode_if_requested(
-    config_map: &mut HashMap<String, String>,
-) -> Result<(), String> {
-    apply_ram_mode_if_requested_with_expiration(config_map)
-        .await
-        .map(|_| ())
-}
-
-async fn apply_ram_mode_if_requested_with_expiration(
+/// on the configured refresh interval. Iceberg uses the same refreshable source
+/// to sign every OSS request, with global reuse when a filesystem cache key is
+/// available.
+async fn apply_ram_mode_if_requested(
     config_map: &mut HashMap<String, String>,
 ) -> Result<Option<u64>, String> {
     if std::env::var(ram::AUTH_MODE_ENV).as_deref() != Ok(ram::AUTH_MODE_RAM) {
@@ -527,21 +518,29 @@ fn aliyun_object_store_error(message: impl Into<String>) -> object_store::Error 
     }
 }
 
+fn aliyun_opendal_error(
+    message: &'static str,
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> opendal::Error {
+    opendal::Error::new(opendal::ErrorKind::Unexpected, message).set_source(source)
+}
+
 #[derive(Clone)]
 struct CachedAliyunOssStore {
+    config_map: HashMap<String, String>,
     store: Arc<dyn OSObjectStore>,
     refreshed_at_ms: u64,
 }
 
 #[derive(Clone)]
-struct RefreshableAliyunOssStore {
+pub(crate) struct RefreshableAliyunOssStore {
     base_config: HashMap<String, String>,
     refresh_interval: Duration,
     cache: Arc<RwLock<Option<CachedAliyunOssStore>>>,
 }
 
 impl RefreshableAliyunOssStore {
-    fn new(base_config: HashMap<String, String>, refresh_interval: Duration) -> Self {
+    pub(crate) fn new(base_config: HashMap<String, String>, refresh_interval: Duration) -> Self {
         Self {
             base_config,
             refresh_interval,
@@ -591,15 +590,25 @@ impl RefreshableAliyunOssStore {
         Ok(Some(store))
     }
 
+    async fn current_config(&self) -> ObjectStoreResult<HashMap<String, String>> {
+        self.current_store().await?;
+        let cached = self.cache.read().await;
+        Ok(cached
+            .as_ref()
+            .expect("current_store initializes the Aliyun OSS cache")
+            .config_map
+            .clone())
+    }
+
     async fn refresh_store(&self) -> ObjectStoreResult<CachedAliyunOssStore> {
         let mut config_map = self.base_config.clone();
 
-        let ram_expires_at_ms = apply_ram_mode_if_requested_with_expiration(&mut config_map)
+        let ram_expires_at_ms = apply_ram_mode_if_requested(&mut config_map)
             .await
             .map_err(|e| {
                 aliyun_object_store_error(format!("Aliyun RAM-mode credential refresh failed: {e}"))
             })?;
-        let oidc_expires_at_ms = apply_oidc_chain_if_requested_with_expiration(&mut config_map)
+        let oidc_expires_at_ms = apply_oidc_chain_if_requested(&mut config_map)
             .await
             .map_err(|e| {
                 aliyun_object_store_error(format!(
@@ -620,16 +629,106 @@ impl RefreshableAliyunOssStore {
         )
         .map_err(aliyun_object_store_error)?;
 
-        let operator = Operator::from_iter::<Oss>(config_map)
+        let operator = Operator::from_iter::<Oss>(config_map.clone())
             .map_err(|e| {
                 aliyun_object_store_error(format!("Failed to create OSS operator: {e:?}"))
             })?
             .finish();
         Ok(CachedAliyunOssStore {
+            config_map,
             store: Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>,
             refreshed_at_ms,
         })
     }
+}
+
+impl RefreshableAliyunOssStore {
+    async fn current_credential(&self) -> opendal::Result<AliyunCredential> {
+        let config = self
+            .current_config()
+            .await
+            .map_err(|error| aliyun_opendal_error("Aliyun OSS credential refresh failed", error))?;
+        let required = |key: &'static str| {
+            config
+                .get(key)
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .ok_or_else(|| {
+                    opendal::Error::new(
+                        opendal::ErrorKind::ConfigInvalid,
+                        format!("refreshed Aliyun OSS credential is missing {key}"),
+                    )
+                })
+        };
+        Ok(AliyunCredential {
+            access_key_id: required("access_key_id")?,
+            access_key_secret: required("access_key_secret")?,
+            security_token: Some(required("security_token")?),
+            expires_in: None,
+        })
+    }
+}
+
+/// OpenDAL's OSS service can replace its HTTP transport but cannot accept a
+/// custom credential provider. Build the service in anonymous mode and sign
+/// every outgoing request here so range reads and every multipart request use
+/// the current cached STS credential.
+struct RefreshingAliyunHttpClient {
+    bucket: String,
+    credentials: Arc<RefreshableAliyunOssStore>,
+    client: HttpClient,
+}
+
+impl RefreshingAliyunHttpClient {
+    fn new(bucket: String, credentials: Arc<RefreshableAliyunOssStore>) -> Self {
+        Self {
+            bucket,
+            credentials,
+            client: HttpClient::default(),
+        }
+    }
+}
+
+async fn sign_aliyun_request(
+    bucket: &str,
+    request: http::Request<opendal::Buffer>,
+    credential: &AliyunCredential,
+) -> opendal::Result<http::Request<opendal::Buffer>> {
+    let (mut parts, body) = request.into_parts();
+    RequestSigner::new(bucket)
+        .sign_request(&SigningContext::new(), &mut parts, Some(credential), None)
+        .await
+        .map_err(|error| aliyun_opendal_error("Aliyun OSS request signing failed", error))?;
+    Ok(http::Request::from_parts(parts, body))
+}
+
+impl HttpFetch for RefreshingAliyunHttpClient {
+    async fn fetch(
+        &self,
+        request: http::Request<opendal::Buffer>,
+    ) -> opendal::Result<http::Response<HttpBody>> {
+        let credential = self.credentials.current_credential().await?;
+        self.client
+            .fetch(sign_aliyun_request(&self.bucket, request, &credential).await?)
+            .await
+    }
+}
+
+fn unsigned_oss_config(mut config: HashMap<String, String>) -> HashMap<String, String> {
+    for key in [
+        "access_key_id",
+        "access_key_secret",
+        "security_token",
+        "role_arn",
+        "role_session_name",
+        "external_id",
+        "oidc_provider_arn",
+        "oidc_token_file",
+    ] {
+        config.remove(key);
+    }
+    config.insert("allow_anonymous".to_string(), "true".to_string());
+    config
 }
 
 impl fmt::Debug for RefreshableAliyunOssStore {
@@ -773,14 +872,20 @@ impl ObjectStoreProvider for AliyunOssStoreProvider {
             .ok_or_else(|| LanceError::invalid_input("OSS URL must contain bucket name"))?
             .to_string();
 
-        let config_map = build_oss_config_from_lance_opts(bucket, &base_path, &storage_options.0)
+        let config_map = build_oss_config_from_lance_opts(bucket.clone(), &base_path, &storage_options.0)
             .map_err(LanceError::invalid_input)?;
 
         let inner = if config_map.contains_key("role_arn") {
             let refresh_interval = parse_oss_credential_refresh_interval(&storage_options.0)
                 .map_err(LanceError::invalid_input)?;
-            let refreshable =
-                Arc::new(RefreshableAliyunOssStore::new(config_map, refresh_interval));
+            let refreshable = cached_aliyun_oss_store(
+                storage_options.0.get(CACHE_KEY).map(String::as_str),
+                &bucket,
+                config_map,
+                refresh_interval,
+            )
+            .await
+            .map_err(|error| LanceError::invalid_input(error.to_string()))?;
             refreshable
                 .current_store()
                 .await
@@ -896,34 +1001,54 @@ impl AliyunOssStorage {
             })?
             .to_string();
 
-        let mut config_map = build_oss_config_from_iceberg_opts(bucket, &url, &self.props)
+        let config_map = build_oss_config_from_iceberg_opts(bucket.clone(), &url, &self.props)
             .map_err(|e| IcebergError::new(IcebergErrorKind::DataInvalid, e))?;
 
-        apply_ram_mode_if_requested(&mut config_map)
+        let op = if config_map.contains_key("role_arn") {
+            let refresh_interval = parse_oss_credential_refresh_interval(&self.props)
+                .map_err(|e| IcebergError::new(IcebergErrorKind::DataInvalid, e))?;
+            let credentials = cached_aliyun_oss_store(
+                self.props.get(CACHE_KEY).map(String::as_str),
+                &bucket,
+                config_map.clone(),
+                refresh_interval,
+            )
             .await
-            .map_err(|e| {
+            .map_err(|error| {
                 IcebergError::new(
                     IcebergErrorKind::Unexpected,
-                    format!("Aliyun RAM-mode credential resolution failed: {e}"),
+                    "Aliyun OSS credential cache initialization failed",
                 )
+                .with_source(error)
             })?;
-        apply_oidc_chain_if_requested(&mut config_map)
-            .await
-            .map_err(|e| {
+            credentials.current_store().await.map_err(|e| {
                 IcebergError::new(
                     IcebergErrorKind::Unexpected,
-                    format!("Aliyun OIDC chain credential resolution failed: {e}"),
+                    "Aliyun OSS credential resolution failed",
                 )
+                .with_source(e)
             })?;
-
-        let op = Operator::from_iter::<Oss>(config_map)
-            .map_err(|e| {
-                IcebergError::new(
-                    IcebergErrorKind::Unexpected,
-                    format!("Failed to create OSS operator: {e}"),
-                )
-            })?
-            .finish();
+            let http_client =
+                HttpClient::with(RefreshingAliyunHttpClient::new(bucket.clone(), credentials));
+            Operator::from_iter::<Oss>(unsigned_oss_config(config_map))
+                .map_err(|e| {
+                    IcebergError::new(
+                        IcebergErrorKind::Unexpected,
+                        format!("Failed to create OSS operator: {e}"),
+                    )
+                })?
+                .layer(HttpClientLayer::new(http_client))
+                .finish()
+        } else {
+            Operator::from_iter::<Oss>(config_map)
+                .map_err(|e| {
+                    IcebergError::new(
+                        IcebergErrorKind::Unexpected,
+                        format!("Failed to create OSS operator: {e}"),
+                    )
+                })?
+                .finish()
+        };
 
         let prefix = format!("oss://{}/", op.info().name());
         let relative = path
@@ -1400,6 +1525,69 @@ mod tests {
         kvs.iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn signs_every_http_request_with_the_current_sts_credential() {
+        let sign = |access_key_id: &str, access_key_secret: &str, security_token: &str| {
+            AliyunCredential {
+                access_key_id: access_key_id.to_string(),
+                access_key_secret: access_key_secret.to_string(),
+                security_token: Some(security_token.to_string()),
+                expires_in: None,
+            }
+        };
+        let first = sign_aliyun_request(
+            "bucket",
+            http::Request::get("https://bucket.oss-cn-hangzhou.aliyuncs.com/first")
+                .body(opendal::Buffer::new())
+                .unwrap(),
+            &sign("first-ak", "first-secret", "first-token"),
+        )
+        .await
+        .unwrap();
+        let second = sign_aliyun_request(
+            "bucket",
+            http::Request::get("https://bucket.oss-cn-hangzhou.aliyuncs.com/second")
+                .body(opendal::Buffer::new())
+                .unwrap(),
+            &sign("second-ak", "second-secret", "second-token"),
+        )
+        .await
+        .unwrap();
+
+        assert!(first.headers()[http::header::AUTHORIZATION]
+            .to_str()
+            .unwrap()
+            .starts_with("OSS first-ak:"));
+        assert_eq!(first.headers()["x-oss-security-token"], "first-token");
+        assert!(second.headers()[http::header::AUTHORIZATION]
+            .to_str()
+            .unwrap()
+            .starts_with("OSS second-ak:"));
+        assert_eq!(second.headers()["x-oss-security-token"], "second-token");
+    }
+
+    #[test]
+    fn unsigned_oss_config_removes_credential_material() {
+        let config = unsigned_oss_config(opts(&[
+            ("bucket", "bucket"),
+            ("endpoint", "oss-cn-hangzhou.aliyuncs.com"),
+            ("access_key_id", "ak"),
+            ("access_key_secret", "secret"),
+            ("security_token", "token"),
+            ("role_arn", "role"),
+        ]));
+
+        assert_eq!(config.get("bucket").map(String::as_str), Some("bucket"));
+        assert_eq!(
+            config.get("allow_anonymous").map(String::as_str),
+            Some("true")
+        );
+        assert!(!config.contains_key("access_key_id"));
+        assert!(!config.contains_key("access_key_secret"));
+        assert!(!config.contains_key("security_token"));
+        assert!(!config.contains_key("role_arn"));
     }
 
     #[test]

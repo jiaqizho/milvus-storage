@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright Zilliz
 
-//! GCP Service Account Impersonation for lance-io.
+//! GCP Service Account Impersonation for Lance and Iceberg.
 //!
 //! Neither `object_store` (lance-io's default GCS backend) nor `opendal`
 //! natively supports the "VM default SA → IAM `generateAccessToken` →
@@ -11,17 +11,16 @@
 //! This module plugs the missing piece in by implementing two traits:
 //!
 //! * [`ImpersonatingGcsCredentialProvider`] — `object_store::CredentialProvider`
-//!   that, on each `get_credential()` call, returns a cached impersonated
-//!   token and refreshes it ahead of expiry.
+//!   shared by Lance and Iceberg that returns a cached impersonated token and
+//!   refreshes it ahead of expiry on request.
 //! * [`ImpersonatingGcsStoreProvider`] — `lance_io::object_store::ObjectStoreProvider`
 //!   that builds a `GoogleCloudStorageBuilder` wired to the credential
 //!   provider above, and is registered against the `gs` scheme to override
 //!   lance-io's default GCS provider for opens that opt in.
 //!
-//! Wiring lives in `lance_bridgeimpl.rs`, which extracts the bridge-private
-//! `gcp_target_service_account` and `gcp_credential_refresh_secs` keys from
-//! `storage_options` and installs this provider into a per-call `Session`'s
-//! `ObjectStoreRegistry`.
+//! Wiring lives in `lance_bridgeimpl.rs` and `iceberg_bridgeimpl.rs`; both
+//! extract bridge-private impersonation options before constructing their
+//! object stores.
 //!
 //! # Why the two Google endpoint URLs are inlined here
 //!
@@ -143,13 +142,13 @@ struct GenerateAccessTokenResponse {
 }
 
 /// Neutral store name used in `object_store::Error::Generic` from the shared
-/// token-fetch helper; keeps error messages meaningful across both Lance
-/// (cached provider) and iceberg (one-shot) callers.
+/// token-fetch helper; keeps error messages meaningful across both Lance and
+/// Iceberg callers.
 const IMPERSONATION_STORE_NAME: &str = "gcp_impersonation";
 
 /// Run the VM-SA → IAM `generateAccessToken(target_sa)` exchange end-to-end
-/// and return the raw `accessToken` + `expireTime`. Shared by the cached
-/// Lance `CredentialProvider` and the one-shot iceberg bridge path.
+/// and return the raw `accessToken` + `expireTime` for the shared dynamic
+/// credential provider.
 async fn fetch_impersonated_access_token(
     http_client: &reqwest::Client,
     target_sa: &str,
@@ -203,25 +202,6 @@ async fn fetch_impersonated_access_token(
         store: IMPERSONATION_STORE_NAME,
         source: format!("generateAccessToken response was not valid JSON: {e}").into(),
     })
-}
-
-/// One-shot impersonated bearer fetch (no caching, no refresh).
-///
-/// Used by the iceberg bridge's `plan_files` path: iceberg-rust's
-/// `gcs_config_parse` doesn't recognize `gcs.service-account` as an
-/// impersonation target, so the bridge intercepts the key, calls this, and
-/// swaps it for `gcs.oauth2.token` (opendal bakes that into `GcsConfig.token`
-/// with `usize::MAX` expiry). A 1-hour token is plenty for a transient
-/// metadata/manifest read sweep — see
-/// `docs/iceberg-gcp-impersonation-analysis.md` for why refresh isn't needed
-/// here, in contrast to long-lived Lance scans.
-pub async fn fetch_impersonated_bearer(
-    target_sa: &str,
-    token_lifetime: Duration,
-) -> ObjectStoreResult<String> {
-    let client = build_http_client();
-    let resp = fetch_impersonated_access_token(&client, target_sa, token_lifetime).await?;
-    Ok(resp.access_token)
 }
 
 #[derive(Clone)]
@@ -375,18 +355,12 @@ fn parse_rfc3339_to_ms(s: &str) -> Result<u64, String> {
 /// for that registry only — other schemes and other registries are unaffected.
 #[derive(Debug)]
 pub struct ImpersonatingGcsStoreProvider {
-    target_sa: String,
-    token_lifetime: Duration,
-    refresh_offset: Duration,
+    credential_provider: Arc<ImpersonatingGcsCredentialProvider>,
 }
 
 impl ImpersonatingGcsStoreProvider {
-    pub fn new(target_sa: String, token_lifetime: Duration, refresh_offset: Duration) -> Self {
-        Self {
-            target_sa,
-            token_lifetime,
-            refresh_offset,
-        }
+    pub fn new(credential_provider: Arc<ImpersonatingGcsCredentialProvider>) -> Self {
+        Self { credential_provider }
     }
 }
 
@@ -432,11 +406,7 @@ impl ObjectStoreProvider for ImpersonatingGcsStoreProvider {
         }
 
         let credential_provider: Arc<dyn CredentialProvider<Credential = GcpCredential>> =
-            Arc::new(ImpersonatingGcsCredentialProvider::new(
-                self.target_sa.clone(),
-                self.token_lifetime,
-                self.refresh_offset,
-            ));
+            self.credential_provider.clone();
         builder = builder.with_credentials(credential_provider);
 
         let built = builder.build().map_err(|e| LanceError::IO {

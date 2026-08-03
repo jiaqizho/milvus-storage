@@ -53,7 +53,7 @@ const BROKER_KEYS: [&str; 8] = [
 
 /// Typed Azure credential broker configuration produced from bridge-private
 /// storage options populated by the C++ Lance and Iceberg adapters.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub(crate) struct AzureBrokerConfig {
     endpoint: String,
     client_id: String,
@@ -108,6 +108,14 @@ impl AzureBrokerConfig {
         }
 
         Ok(Some(config))
+    }
+
+    pub(crate) fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    pub(crate) fn account_name(&self) -> &str {
+        &self.account_name
     }
 
     fn provider_id(&self) -> String {
@@ -337,7 +345,17 @@ impl StorageOptionsProvider for AzureSasStorageOptionsProvider {
             return Ok(Some(Self::to_options(credential)));
         }
 
-        match self.fetcher.fetch(now).await {
+        let refresh_result = self.fetcher.fetch(now).await;
+        now = (self.clock)();
+        let refresh_result = refresh_result.and_then(|credential| {
+            if credential.expires_at <= now {
+                Err(anyhow!("expired_credential"))
+            } else {
+                Ok(credential)
+            }
+        });
+
+        match refresh_result {
             Ok(credential) => {
                 let options = Self::to_options(&credential);
                 *cached = Some(credential);
@@ -351,11 +369,12 @@ impl StorageOptionsProvider for AzureSasStorageOptionsProvider {
                     .unwrap_or(false);
                 eprintln!(
                     "Warning: Azure SAS credential broker refresh failed: {}, has_cached_sas={}, cached_expired={}",
-                    error,
-                    has_cached_sas,
-                    cached_expired
+                    error, has_cached_sas, cached_expired
                 );
-                if let Some(credential) = cached.as_ref() {
+                if let Some(credential) = cached
+                    .as_ref()
+                    .filter(|credential| credential.expires_at > now)
+                {
                     Ok(Some(Self::to_options(credential)))
                 } else {
                     Err(Self::lance_error(&error))
@@ -366,6 +385,43 @@ impl StorageOptionsProvider for AzureSasStorageOptionsProvider {
 
     fn provider_id(&self) -> String {
         self.provider_id.clone()
+    }
+}
+
+#[async_trait]
+impl object_store::CredentialProvider for AzureSasStorageOptionsProvider {
+    type Credential = object_store::azure::AzureCredential;
+
+    async fn get_credential(
+        &self,
+    ) -> object_store::Result<Arc<object_store::azure::AzureCredential>> {
+        let options = <Self as StorageOptionsProvider>::fetch_storage_options(self)
+            .await
+            .map_err(|error| object_store::Error::Generic {
+                store: "azure_sas_broker",
+                source: Box::new(std::io::Error::other(error.to_string())),
+            })?
+            .ok_or_else(|| object_store::Error::Generic {
+                store: "azure_sas_broker",
+                source: Box::new(std::io::Error::other(
+                    "Azure SAS provider returned no credential",
+                )),
+            })?;
+        let token =
+            options
+                .get("azure_storage_sas_token")
+                .ok_or_else(|| object_store::Error::Generic {
+                    store: "azure_sas_broker",
+                    source: Box::new(std::io::Error::other(
+                        "Azure SAS provider returned no token",
+                    )),
+                })?;
+        let query_pairs = url::form_urlencoded::parse(token.as_bytes())
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        Ok(Arc::new(object_store::azure::AzureCredential::SASToken(
+            query_pairs,
+        )))
     }
 }
 
@@ -417,6 +473,25 @@ mod tests {
                 .pop_front()
                 .unwrap_or(Err("no_response"))
                 .map_err(|error| anyhow!(error))
+        }
+    }
+
+    struct ClockAdvancingFetcher {
+        responses: Mutex<VecDeque<(chrono::Duration, Result<AzureSasCredential, &'static str>)>>,
+        clock: Arc<Mutex<DateTime<Utc>>>,
+    }
+
+    #[async_trait]
+    impl AzureSasFetcher for ClockAdvancingFetcher {
+        async fn fetch(&self, _now: DateTime<Utc>) -> AnyResult<AzureSasCredential> {
+            let (advance, response) = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("missing fetch response");
+            *self.clock.lock().unwrap() += advance;
+            response.map_err(|error| anyhow!(error))
         }
     }
 
@@ -563,6 +638,91 @@ mod tests {
         let fetcher = Arc::new(MockFetcher::new(vec![Err("transport_error")]));
         let provider =
             AzureSasStorageOptionsProvider::with_fetcher(config(), fetcher, Arc::new(move || now));
+        assert!(provider.fetch_storage_options().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fails_closed_when_cached_token_is_expired() {
+        let now = Arc::new(Mutex::new(Utc::now()));
+        let initial_now = *now.lock().unwrap();
+        let fetcher = Arc::new(MockFetcher::new(vec![
+            Ok(AzureSasCredential {
+                token: "sv=1&sig=old".to_string(),
+                expires_at: initial_now + chrono::Duration::seconds(120),
+            }),
+            Err("transport_error"),
+        ]));
+        let clock_now = now.clone();
+        let provider = AzureSasStorageOptionsProvider::with_fetcher(
+            config(),
+            fetcher.clone(),
+            Arc::new(move || *clock_now.lock().unwrap()),
+        );
+
+        assert!(provider.fetch_storage_options().await.is_ok());
+        *now.lock().unwrap() += chrono::Duration::seconds(120);
+
+        assert!(provider.fetch_storage_options().await.is_err());
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn fails_closed_when_cached_token_expires_during_refresh() {
+        let now = Arc::new(Mutex::new(Utc::now()));
+        let initial_now = *now.lock().unwrap();
+        let fetcher = Arc::new(ClockAdvancingFetcher {
+            responses: Mutex::new(
+                vec![
+                    (
+                        chrono::Duration::zero(),
+                        Ok(AzureSasCredential {
+                            token: "sv=1&sig=old".to_string(),
+                            expires_at: initial_now + chrono::Duration::seconds(120),
+                        }),
+                    ),
+                    (chrono::Duration::seconds(60), Err("transport_error")),
+                ]
+                .into(),
+            ),
+            clock: now.clone(),
+        });
+        let clock_now = now.clone();
+        let provider = AzureSasStorageOptionsProvider::with_fetcher(
+            config(),
+            fetcher,
+            Arc::new(move || *clock_now.lock().unwrap()),
+        );
+
+        assert!(provider.fetch_storage_options().await.is_ok());
+        *now.lock().unwrap() += chrono::Duration::seconds(61);
+
+        assert!(provider.fetch_storage_options().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_credential_that_expires_during_refresh() {
+        let now = Arc::new(Mutex::new(Utc::now()));
+        let initial_now = *now.lock().unwrap();
+        let fetcher = Arc::new(ClockAdvancingFetcher {
+            responses: Mutex::new(
+                vec![(
+                    chrono::Duration::seconds(2),
+                    Ok(AzureSasCredential {
+                        token: "sv=1&sig=stale".to_string(),
+                        expires_at: initial_now + chrono::Duration::seconds(1),
+                    }),
+                )]
+                .into(),
+            ),
+            clock: now.clone(),
+        });
+        let clock_now = now.clone();
+        let provider = AzureSasStorageOptionsProvider::with_fetcher(
+            config(),
+            fetcher,
+            Arc::new(move || *clock_now.lock().unwrap()),
+        );
+
         assert!(provider.fetch_storage_options().await.is_err());
     }
 

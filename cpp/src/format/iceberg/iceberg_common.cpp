@@ -67,6 +67,7 @@ std::unordered_map<std::string, std::string> ToStorageOptions(const ArrowFileSys
     if (endpoint.find("http://") == 0)
       options["allow_http"] = "true";
   };
+  auto set_credential_cache_key = [&]() { options["milvus_fs_cache_key"] = config.GetCacheKey(); };
 
   const auto& provider = config.cloud_provider;
   // Bridge-private dispatch key. The Rust entry point removes it before
@@ -84,6 +85,7 @@ std::unordered_map<std::string, std::string> ToStorageOptions(const ArrowFileSys
       !config.azure_credential_endpoint.empty());
   if (provider == kCloudProviderAWS) {
     if (!config.role_arn.empty()) {
+      set_credential_cache_key();
       // AssumeRole: set ARN fields + region/endpoint; do NOT set AKSK so opendal
       // uses the default credential chain (EC2 metadata / env vars) as base
       // credential for the STS AssumeRole call.
@@ -92,6 +94,9 @@ std::unordered_map<std::string, std::string> ToStorageOptions(const ArrowFileSys
       set("client.assume-role.arn", config.role_arn);
       set("client.assume-role.session-name", config.session_name);
       set("client.assume-role.external-id", config.external_id);
+      if (config.load_frequency > 0) {
+        options["aws_credential_refresh_secs"] = std::to_string(config.load_frequency);
+      }
     } else {
       // Explicit AKSK or IAM
       if (!config.use_iam) {
@@ -107,6 +112,7 @@ std::unordered_map<std::string, std::string> ToStorageOptions(const ArrowFileSys
     // Azure DFS endpoint (account.dfs.suffix) from scheme://container/path URIs.
     set("adls.endpoint-suffix", config.address);
     if (config.IsAzureCredentialBrokerEnabled()) {
+      set_credential_cache_key();
       set("azure_broker_endpoint", config.azure_credential_endpoint);
       set("azure_broker_client_id", config.azure_client_id);
       set("azure_broker_tenant_id", config.azure_tenant_id);
@@ -126,18 +132,21 @@ std::unordered_map<std::string, std::string> ToStorageOptions(const ArrowFileSys
       set("adls.account-key", config.access_key_value);
     }
   } else if (provider == kCloudProviderGCP) {
-    if (!config.gcp_target_service_account.empty()) {
+    if (config.use_iam && !config.gcp_target_service_account.empty()) {
+      set_credential_cache_key();
       // Bridge-private: iceberg-rust 0.8's gcs_config_parse doesn't recognize
       // this key as an impersonation target (it would be silently dropped).
-      // Instead, iceberg_bridgeimpl.rs::iceberg_plan_files intercepts it,
-      // fetches a token via VM-SA → IAM.generateAccessToken, and swaps it for
-      // `gcs.oauth2.token` before building the FileIO. See
-      // `docs/iceberg-gcp-impersonation-analysis.md`.
+      // The Rust bridge intercepts it and installs a request-time credential
+      // provider that refreshes VM-SA → IAM.generateAccessToken credentials.
       set("gcs.service-account", config.gcp_target_service_account);
+      if (config.load_frequency > 0) {
+        options["gcp_credential_refresh_secs"] = std::to_string(config.load_frequency);
+      }
     }
     // Otherwise uses default credentials (VM metadata)
   } else if (provider == kCloudProviderAliyun) {
     if (!config.role_arn.empty()) {
+      set_credential_cache_key();
       // Per-tenant AssumeRoleWithOIDC. Machine identity (oidc_token_file,
       // oidc_provider_arn) stays in process env — opendal picks it up via the
       // env sweep inside `AliyunOssStorage::create_operator`. Do NOT emit
@@ -156,6 +165,9 @@ std::unordered_map<std::string, std::string> ToStorageOptions(const ArrowFileSys
       set("oss.role-arn", config.role_arn);
       set("oss.role-session-name", config.session_name);
       set("oss.external-id", config.external_id);
+      if (config.load_frequency > 0) {
+        options["oss_credential_refresh_secs"] = std::to_string(config.load_frequency);
+      }
     } else {
       // Explicit AKSK. iceberg 0.9 `OSS_*` constants in the `iceberg` crate
       // map to these three dotted keys.

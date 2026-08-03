@@ -15,6 +15,7 @@ s3-crt-async = []
 # common dependencies
 anyhow = "1.0.99"
 futures = "0.3.31"
+lru = "0.16"
 paste = "1.0.15"
 take_mut = "0.2.2"
 async-compat = "0.2.5"
@@ -82,7 +83,7 @@ uuid = { version = "1", features = ["v7"] }
 # AWS SDK (for Lance AssumeRole credential provider)
 aws-config = "1"
 aws-credential-types = "1"
-object_store = { version = "0.13", features = ["aws", "gcp"] }
+object_store = { version = "0.13", features = ["aws", "azure", "gcp"] }
 
 # HTTP client for the GCP Service Account Impersonation flow in
 # gcp_impersonation.rs (calls metadata.google.internal + iamcredentials.googleapis.com).
@@ -93,6 +94,13 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # `url::Url` is named in lance-io's ObjectStoreProvider::new_store signature
 # we implement; keep as a direct dep rather than leaning on transitive re-export.
 url = "2"
+
+# OpenDAL's OSS builder does not expose a credential-provider hook. The custom
+# HTTP layer signs each OSS request with the refreshable cross-account STS
+# credential instead, including every multipart request.
+http = "1"
+reqsign-aliyun-oss = "3.1.1"
+reqsign-core = "3.1.0"
 
 # Crypto + encoding for Aliyun POP v1 signing in aliyun_oss_provider.rs
 # (ECS IMDS → sts:AssumeRole fallback when OIDC machine identity is absent).

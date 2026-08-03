@@ -261,6 +261,11 @@ arrow::Status ArrowFileSystemConfig::create_file_system_config(const milvus_stor
       return arrow::Status::Invalid("fs.azure_credential_endpoint must be a valid HTTP(S) URL");
     }
   }
+  if (result.cloud_provider == kCloudProviderGCP && !result.gcp_target_service_account.empty() && !result.use_iam) {
+    return arrow::Status::Invalid(
+        "GCP service-account impersonation requires fs.use_iam=true when "
+        "fs.gcp_target_service_account is set");
+  }
   return arrow::Status::OK();
 }
 

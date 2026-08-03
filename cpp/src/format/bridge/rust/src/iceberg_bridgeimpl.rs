@@ -23,14 +23,46 @@ use iceberg::TableIdent;
 use iceberg::io::{FileIOBuilder, LocalFsStorageFactory, MemoryStorageFactory, StorageFactory};
 use iceberg::scan::FileScanTask;
 use iceberg::table::StaticTable;
-use iceberg_storage_opendal::OpenDalStorageFactory;
+use iceberg_storage_opendal::{
+    AwsCredential, AwsCredentialLoad, CustomAwsCredentialLoader, OpenDalStorageFactory,
+};
 
 use crate::aliyun_oss_provider::AliyunOssStorageFactory;
-use crate::azure_sas_provider::{AzureBrokerClient, AzureBrokerConfig};
-use crate::gcp_impersonation::{DEFAULT_TOKEN_LIFETIME_SECS, fetch_impersonated_bearer};
+use crate::azure_sas_provider::AzureBrokerConfig;
+use crate::cloud_credential_cache::{AssumeRoleConfig, CACHE_KEY, cached_aws_credentials};
+use crate::gcp_impersonation::DEFAULT_TOKEN_LIFETIME_SECS;
+use crate::iceberg_cloud_storage::RefreshingCloudStorageFactory;
 use crate::iceberg_ffi::IcebergFileInfo;
 
 const CLOUD_PROVIDER_KEY: &str = "cloud_provider";
+
+#[derive(Clone)]
+struct ObjectStoreAwsCredentialLoader {
+    provider: object_store::aws::AwsCredentialProvider,
+}
+
+#[async_trait::async_trait]
+impl AwsCredentialLoad for ObjectStoreAwsCredentialLoader {
+    async fn load_credential(
+        &self,
+        _client: reqwest::Client,
+    ) -> anyhow::Result<Option<AwsCredential>> {
+        let credential = self
+            .provider
+            .get_credential()
+            .await
+            .map_err(|error| anyhow::anyhow!("AWS credential provider failed: {error}"))?;
+        Ok(Some(AwsCredential {
+            access_key_id: credential.key_id.clone(),
+            secret_access_key: credential.secret_key.clone(),
+            session_token: credential.token.clone(),
+            // The object_store provider owns expiration and refresh. OpenDAL
+            // calls this loader for every signed request, so it always receives
+            // the provider's current credential.
+            expires_in: None,
+        }))
+    }
+}
 
 /// Internal representation for a delete file reference, serialized to JSON.
 #[derive(serde::Serialize)]
@@ -49,51 +81,15 @@ pub(crate) fn vec_to_hashmap(keys: Vec<String>, values: Vec<String>) -> HashMap<
     keys.into_iter().zip(values.into_iter()).collect()
 }
 
-/// Consumes the bridge-private cloud provider and resolves any credentials
-/// that Iceberg/OpenDAL cannot obtain directly from the remaining options.
+/// Consumes the bridge-private cloud-provider selector after the factory has
+/// extracted any refreshable credential configuration.
 pub(crate) async fn prepare_cloud_storage_options(
     props: &mut HashMap<String, String>,
 ) -> anyhow::Result<()> {
     let cloud_provider = props.remove(CLOUD_PROVIDER_KEY);
 
     match cloud_provider.as_deref() {
-        Some("azure") => {
-            if let Some(config) = AzureBrokerConfig::extract(props)? {
-                let client = AzureBrokerClient::new(config)?;
-                let credential = match client.fetch(chrono::Utc::now()).await {
-                    Ok(credential) => credential,
-                    Err(error) => {
-                        eprintln!(
-                            "Warning: Azure SAS credential broker fetch failed: {}, has_cached_sas=false, cached_expired=false",
-                            error
-                        );
-                        return Err(error);
-                    }
-                };
-                props.insert("adls.sas-token".to_string(), credential.token);
-            }
-        }
-        Some("gcp") => {
-            // iceberg-rust does not treat `gcs.service-account` as an
-            // impersonation target. Replace it with a pre-fetched bearer for
-            // this short-lived operation.
-            if let Some(target_sa) = props.remove("gcs.service-account")
-                && !target_sa.is_empty()
-            {
-                let bearer = fetch_impersonated_bearer(
-                    &target_sa,
-                    std::time::Duration::from_secs(DEFAULT_TOKEN_LIFETIME_SECS),
-                )
-                .await?;
-                props.insert("gcs.oauth2.token".to_string(), bearer);
-            }
-        }
-        Some("aws") => {
-            // OpenDAL consumes the S3 and STS options directly.
-        }
-        Some("aliyun") => {
-            // AliyunOssStorageFactory consumes the OSS role options.
-        }
+        Some("azure" | "gcp" | "aws" | "aliyun") => {}
         None => {
             // Local files do not carry a cloud provider.
         }
@@ -105,13 +101,96 @@ pub(crate) async fn prepare_cloud_storage_options(
 
 /// Scheme → `iceberg-storage-opendal` variant. Hand-written because 0.9
 /// ships no `from_scheme` helper; collapse when upstream adds one.
-fn upstream_opendal_factory(scheme: &str) -> anyhow::Result<Arc<dyn StorageFactory>> {
+async fn upstream_opendal_factory(
+    scheme: &str,
+    props: &mut HashMap<String, String>,
+) -> anyhow::Result<Arc<dyn StorageFactory>> {
+    let cache_key = props.remove(CACHE_KEY).filter(|key| !key.is_empty());
+    let cloud_provider = props.get(CLOUD_PROVIDER_KEY).cloned();
+    let mut aws_loader = None;
+    let mut refreshing_factory: Option<Arc<dyn StorageFactory>> = None;
+
+    match cloud_provider.as_deref() {
+        Some("azure") => {
+            if let Some(config) = AzureBrokerConfig::extract(props)? {
+                refreshing_factory = Some(Arc::new(RefreshingCloudStorageFactory::azure(
+                    cache_key.clone(),
+                    config,
+                )));
+            }
+        }
+        Some("gcp") => {
+            let target_sa = props
+                .remove("gcs.service-account")
+                .filter(|target_sa| !target_sa.is_empty());
+            let token_lifetime = props.remove("gcp_credential_refresh_secs");
+            if let Some(target_sa) = target_sa {
+                let token_lifetime_secs = match token_lifetime {
+                    Some(value) => value.parse::<u64>().map_err(|error| {
+                        anyhow::anyhow!("gcp_credential_refresh_secs must be an integer: {error}")
+                    })?,
+                    None => DEFAULT_TOKEN_LIFETIME_SECS,
+                };
+                if !(900..=3600).contains(&token_lifetime_secs) {
+                    anyhow::bail!(
+                        "gcp_credential_refresh_secs must be in [900, 3600], got {token_lifetime_secs}"
+                    );
+                }
+                refreshing_factory = Some(Arc::new(RefreshingCloudStorageFactory::gcp(
+                    cache_key.clone(),
+                    target_sa,
+                    token_lifetime_secs,
+                )));
+            } else if token_lifetime.is_some() {
+                anyhow::bail!(
+                    "gcp_credential_refresh_secs requires a non-empty gcs.service-account"
+                );
+            }
+        }
+        Some("aws") if props.contains_key("client.assume-role.arn") => {
+            let role_arn = props.remove("client.assume-role.arn").unwrap_or_default();
+            let region = props.get("s3.region").cloned().unwrap_or_default();
+            let session_name = props
+                .remove("client.assume-role.session-name")
+                .unwrap_or_default();
+            let external_id = props
+                .remove("client.assume-role.external-id")
+                .unwrap_or_default();
+            let credential_refresh_secs = props
+                .remove("aws_credential_refresh_secs")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            if let Some(config) = AssumeRoleConfig::parse(
+                &role_arn,
+                &region,
+                &session_name,
+                &external_id,
+                credential_refresh_secs,
+            )? {
+                let provider = cached_aws_credentials(cache_key.as_deref(), &config).await?;
+                aws_loader = Some(CustomAwsCredentialLoader::new(Arc::new(
+                    ObjectStoreAwsCredentialLoader { provider },
+                )));
+            }
+        }
+        _ => {}
+    }
+
+    if let Some(factory) = refreshing_factory {
+        return Ok(factory);
+    }
+
     match scheme {
         // The upstream OSS factory does not carry per-tenant `oss.role-arn`.
-        "oss" => Ok(Arc::new(AliyunOssStorageFactory::default())),
+        "oss" => {
+            if let Some(cache_key) = cache_key {
+                props.insert(CACHE_KEY.to_string(), cache_key);
+            }
+            Ok(Arc::new(AliyunOssStorageFactory::default()))
+        }
         "s3" | "s3a" => Ok(Arc::new(OpenDalStorageFactory::S3 {
             configured_scheme: scheme.to_string(),
-            customized_credential_load: None,
+            customized_credential_load: aws_loader,
         })),
         "gs" => Ok(Arc::new(OpenDalStorageFactory::Gcs)),
         "abfs" | "abfss" | "wasb" | "wasbs" => {
@@ -136,13 +215,14 @@ fn upstream_opendal_factory(scheme: &str) -> anyhow::Result<Arc<dyn StorageFacto
     }
 }
 
-pub(crate) fn build_file_io(
+pub(crate) async fn build_file_io(
     scheme: &str,
-    props: &HashMap<String, String>,
+    props: &mut HashMap<String, String>,
 ) -> anyhow::Result<iceberg::io::FileIO> {
-    let factory = upstream_opendal_factory(scheme)?;
+    let factory = upstream_opendal_factory(scheme, props).await?;
+    prepare_cloud_storage_options(props).await?;
     let mut builder = FileIOBuilder::new(factory);
-    for (k, v) in props {
+    for (k, v) in props.iter() {
         builder = builder.with_prop(k, v);
     }
     // `FileIOBuilder::build` became infallible in iceberg 0.9 (was
@@ -317,13 +397,12 @@ pub fn iceberg_plan_files(
 
     TOKIO_RT.block_on(async {
         let mut props = vec_to_hashmap(storage_options_keys, storage_options_values);
-        prepare_cloud_storage_options(&mut props).await?;
 
         // Normalize URI for opendal and detect FileIO scheme in one pass.
         // For Azure ABFSS, expands scheme://container/path to container@endpoint format.
         let (resolved_location, scheme) = normalize_uri(metadata_location, &props);
 
-        let file_io = build_file_io(&scheme, &props)?;
+        let file_io = build_file_io(&scheme, &mut props).await?;
 
         // Load table metadata directly from location (no catalog needed)
         let table_ident = TableIdent::from_strs(["default", "table"])?;
@@ -416,6 +495,47 @@ mod tests {
     fn test_vec_to_hashmap_empty() {
         let map = vec_to_hashmap(vec![], vec![]);
         assert!(map.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_gcp_credential_lifetime() {
+        for cache_key in [Some("fs:test-gcp-invalid"), None] {
+            let mut props = HashMap::from([
+                (CLOUD_PROVIDER_KEY.to_string(), "gcp".to_string()),
+                (
+                    "gcs.service-account".to_string(),
+                    "target@example.com".to_string(),
+                ),
+                (
+                    "gcp_credential_refresh_secs".to_string(),
+                    "invalid".to_string(),
+                ),
+            ]);
+            if let Some(cache_key) = cache_key {
+                props.insert(CACHE_KEY.to_string(), cache_key.to_string());
+            }
+
+            let error = upstream_opendal_factory("gs", &mut props)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("must be an integer"));
+        }
+    }
+
+    #[tokio::test]
+    async fn gcp_without_cache_key_still_uses_refreshing_factory() {
+        let mut props = HashMap::from([
+            (CLOUD_PROVIDER_KEY.to_string(), "gcp".to_string()),
+            (
+                "gcs.service-account".to_string(),
+                "target@example.com".to_string(),
+            ),
+            ("gcp_credential_refresh_secs".to_string(), "900".to_string()),
+        ]);
+
+        upstream_opendal_factory("gs", &mut props).await.unwrap();
+        assert!(!props.contains_key("gcs.service-account"));
+        assert!(!props.contains_key("gcp_credential_refresh_secs"));
     }
 
     #[test]

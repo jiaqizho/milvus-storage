@@ -4814,6 +4814,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lru"
+version = "0.16.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
+dependencies = [
+ "hashbrown 0.16.1",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6673,6 +6682,7 @@ dependencies = [
  "cxx-build",
  "futures",
  "hmac 0.12.1",
+ "http 1.4.0",
  "iceberg",
  "iceberg-storage-opendal",
  "lance",
@@ -6682,11 +6692,14 @@ dependencies = [
  "lance-index",
  "lance-io",
  "lance-table",
+ "lru",
  "object_store",
  "object_store_opendal",
  "opendal 0.56.0",
  "parquet 56.2.0",
  "paste",
+ "reqsign-aliyun-oss",
+ "reqsign-core",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

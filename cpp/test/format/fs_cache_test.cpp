@@ -193,6 +193,19 @@ TEST_F(FileSystemCacheTest, GcpCacheKeyUsesImpersonationIdentityOnly) {
   EXPECT_NE(base.GetCacheKey(), different_target_sa.GetCacheKey());
 }
 
+TEST_F(FileSystemCacheTest, GcpImpersonationRequiresIam) {
+  api::Properties properties;
+  properties[PROPERTY_FS_STORAGE_TYPE] = std::string("remote");
+  properties[PROPERTY_FS_CLOUD_PROVIDER] = std::string(kCloudProviderGCP);
+  properties[PROPERTY_FS_GCP_TARGET_SERVICE_ACCOUNT] =
+      std::string("target@project.iam.gserviceaccount.com");
+
+  ArrowFileSystemConfig config;
+  auto status = ArrowFileSystemConfig::create_file_system_config(properties, config);
+  EXPECT_TRUE(status.IsInvalid());
+  EXPECT_NE(status.message().find("requires fs.use_iam=true"), std::string::npos);
+}
+
 TEST_F(FileSystemCacheTest, AzureBrokerCacheKeyUsesBrokerIdentity) {
   ArrowFileSystemConfig base;
   base.storage_type = "remote";

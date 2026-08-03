@@ -14,7 +14,9 @@
 
 mod aliyun_oss_provider;
 mod azure_sas_provider;
+mod cloud_credential_cache;
 mod gcp_impersonation;
+mod iceberg_cloud_storage;
 mod iceberg_bridgeimpl;
 mod iceberg_testutil;
 mod lance_bridgeimpl;
