@@ -28,8 +28,6 @@ use iceberg::io::{
 };
 use iceberg::{Error as IcebergError, ErrorKind as IcebergErrorKind, Result as IcebergResult};
 use iceberg_storage_opendal::OpenDalStorageFactory;
-use lance_core::error::{Error as LanceError, Result as LanceResult};
-use lance_io::object_store::StorageOptionsProvider;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -45,7 +43,7 @@ pub(crate) const AZURE_BROKER_REQUEST_TIMEOUT_MS: &str = "azure_broker_request_t
 const REFRESH_OFFSET_SECONDS: i64 = 60;
 
 // These options are private to the C++/Rust bridge. They must be consumed
-// before the remaining storage options are passed to Lance or OpenDAL.
+// before the remaining storage options are passed to OpenDAL.
 const BROKER_KEYS: [&str; 8] = [
     AZURE_BROKER_ENDPOINT,
     AZURE_BROKER_CLIENT_ID,
@@ -58,7 +56,7 @@ const BROKER_KEYS: [&str; 8] = [
 ];
 
 /// Typed Azure credential broker configuration produced from bridge-private
-/// storage options populated by the C++ Lance and Iceberg adapters.
+/// storage options populated by the C++ Iceberg adapter.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct AzureBrokerConfig {
     endpoint: String,
@@ -117,8 +115,7 @@ impl AzureBrokerConfig {
     }
 
     fn provider_id(&self) -> String {
-        // Lance uses this opaque ID to distinguish providers without embedding
-        // the raw broker configuration in the identifier.
+        // Keep diagnostic/cache identity free of raw broker configuration.
         let mut hasher = DefaultHasher::new();
         self.hash(&mut hasher);
         format!("azure_sas_broker_{:016x}", hasher.finish())
@@ -253,16 +250,16 @@ impl AzureSasFetcher for AzureBrokerClient {
 
 type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 
-pub(crate) struct AzureSasStorageOptionsProvider {
+pub(crate) struct AzureSasCredentialProvider {
     provider_id: String,
     fetcher: Arc<dyn AzureSasFetcher>,
     clock: Clock,
     cached: RwLock<Option<AzureSasCredential>>,
 }
 
-impl fmt::Debug for AzureSasStorageOptionsProvider {
+impl fmt::Debug for AzureSasCredentialProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AzureSasStorageOptionsProvider")
+        f.debug_struct("AzureSasCredentialProvider")
             .field("provider_id", &self.provider_id)
             .field(
                 "has_cached_sas",
@@ -272,7 +269,7 @@ impl fmt::Debug for AzureSasStorageOptionsProvider {
     }
 }
 
-impl AzureSasStorageOptionsProvider {
+impl AzureSasCredentialProvider {
     pub(crate) fn new(config: AzureBrokerConfig) -> AnyResult<Self> {
         let provider_id = config.provider_id();
         let fetcher = Arc::new(AzureBrokerClient::new(config)?);
@@ -300,25 +297,6 @@ impl AzureSasStorageOptionsProvider {
 
     fn is_fresh(credential: &AzureSasCredential, now: DateTime<Utc>) -> bool {
         credential.expires_at - now > chrono::Duration::seconds(REFRESH_OFFSET_SECONDS)
-    }
-
-    fn to_options(credential: &AzureSasCredential) -> HashMap<String, String> {
-        HashMap::from([
-            (
-                "azure_storage_sas_token".to_string(),
-                credential.token.clone(),
-            ),
-            (
-                "expires_at_millis".to_string(),
-                credential.expires_at.timestamp_millis().to_string(),
-            ),
-        ])
-    }
-
-    fn lance_error(error: &anyhow::Error) -> LanceError {
-        LanceError::io_source(Box::new(std::io::Error::other(format!(
-            "Azure SAS credential broker failure: {error}"
-        ))))
     }
 
     pub(crate) async fn current_credential(&self) -> AnyResult<AzureSasCredential> {
@@ -361,20 +339,6 @@ impl AzureSasStorageOptionsProvider {
     }
 }
 
-#[async_trait]
-impl StorageOptionsProvider for AzureSasStorageOptionsProvider {
-    async fn fetch_storage_options(&self) -> LanceResult<Option<HashMap<String, String>>> {
-        self.current_credential()
-            .await
-            .map(|credential| Some(Self::to_options(&credential)))
-            .map_err(|error| Self::lance_error(&error))
-    }
-
-    fn provider_id(&self) -> String {
-        self.provider_id.clone()
-    }
-}
-
 fn azure_iceberg_credential_error(error: anyhow::Error) -> IcebergError {
     IcebergError::new(
         IcebergErrorKind::Unexpected,
@@ -386,7 +350,7 @@ fn azure_iceberg_credential_error(error: anyhow::Error) -> IcebergError {
 pub(crate) struct AzureSasStorageFactory {
     inner: OpenDalStorageFactory,
     #[serde(skip)]
-    provider: Option<Arc<AzureSasStorageOptionsProvider>>,
+    provider: Option<Arc<AzureSasCredentialProvider>>,
 }
 
 impl AzureSasStorageFactory {
@@ -395,7 +359,7 @@ impl AzureSasStorageFactory {
         config: AzureBrokerConfig,
     ) -> IcebergResult<Self> {
         let provider = Arc::new(
-            AzureSasStorageOptionsProvider::new(config).map_err(azure_iceberg_credential_error)?,
+            AzureSasCredentialProvider::new(config).map_err(azure_iceberg_credential_error)?,
         );
         provider
             .current_credential()
@@ -446,7 +410,7 @@ pub(crate) struct AzureSasStorage {
     #[serde(skip)]
     props: Arc<HashMap<String, String>>,
     #[serde(skip)]
-    provider: Option<Arc<AzureSasStorageOptionsProvider>>,
+    provider: Option<Arc<AzureSasCredentialProvider>>,
     #[serde(skip)]
     cached_storage: Arc<RwLock<Option<CachedAzureSasStorage>>>,
 }
@@ -543,20 +507,6 @@ impl IcebergStorage for AzureSasStorage {
     }
 }
 
-pub(crate) async fn build_lance_provider(
-    config: AzureBrokerConfig,
-) -> LanceResult<Arc<AzureSasStorageOptionsProvider>> {
-    let provider = Arc::new(
-        AzureSasStorageOptionsProvider::new(config)
-            .map_err(|error| LanceError::invalid_input(error.to_string()))?,
-    );
-    provider
-        .current_credential()
-        .await
-        .map_err(|error| AzureSasStorageOptionsProvider::lance_error(&error))?;
-    Ok(provider)
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -648,8 +598,8 @@ mod tests {
     fn test_provider(
         fetcher: Arc<dyn AzureSasFetcher>,
         now: DateTime<Utc>,
-    ) -> Arc<AzureSasStorageOptionsProvider> {
-        Arc::new(AzureSasStorageOptionsProvider::with_fetcher(
+    ) -> Arc<AzureSasCredentialProvider> {
+        Arc::new(AzureSasCredentialProvider::with_fetcher(
             config(),
             fetcher,
             Arc::new(move || now),
@@ -831,7 +781,7 @@ mod tests {
             }),
         ]));
         let clock_now = now.clone();
-        let provider = AzureSasStorageOptionsProvider::with_fetcher(
+        let provider = AzureSasCredentialProvider::with_fetcher(
             config(),
             fetcher.clone(),
             Arc::new(move || *clock_now.lock().unwrap()),
@@ -861,7 +811,7 @@ mod tests {
         let now = Utc::now();
         let fetcher = Arc::new(MockFetcher::new(vec![Err("transport_error")]));
         let provider =
-            AzureSasStorageOptionsProvider::with_fetcher(config(), fetcher, Arc::new(move || now));
+            AzureSasCredentialProvider::with_fetcher(config(), fetcher, Arc::new(move || now));
         assert!(provider.current_credential().await.is_err());
     }
 
@@ -880,7 +830,7 @@ mod tests {
             fetch_started.clone(),
             release_fetch.clone(),
         ));
-        let provider = Arc::new(AzureSasStorageOptionsProvider::with_fetcher(
+        let provider = Arc::new(AzureSasCredentialProvider::with_fetcher(
             config(),
             fetcher.clone(),
             Arc::new(move || now),
@@ -928,45 +878,6 @@ mod tests {
                 .all(|credential| credential.token == "sv=1&sig=single-flight")
         );
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn lance_provider_warms_once() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let requests = Arc::new(AtomicUsize::new(0));
-        let server_requests = requests.clone();
-        let response_body = serde_json::json!({
-            "success": true,
-            "credentials": {
-                "tempAk": "account",
-                "sessionToken": "sv=1&sig=warmed",
-                "expiredAt": (Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
-            }
-        })
-        .to_string();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            server_requests.fetch_add(1, Ordering::SeqCst);
-            let mut request = [0_u8; 4096];
-            socket.read(&mut request).await.unwrap();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                response_body.len(),
-                response_body
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-        });
-
-        let mut broker_config = config();
-        broker_config.endpoint = format!("http://{address}");
-        let provider = build_lance_provider(broker_config).await.unwrap();
-        server.await.unwrap();
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
-
-        let options = provider.fetch_storage_options().await.unwrap().unwrap();
-        assert_eq!(options["azure_storage_sas_token"], "sv=1&sig=warmed");
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
     #[test]

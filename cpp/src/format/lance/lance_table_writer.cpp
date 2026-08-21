@@ -18,7 +18,6 @@
 
 #include <string>
 #include <iostream>
-#include <unordered_set>
 #include <utility>
 
 #include <arrow/chunked_array.h>  // keep this line before other arrow header
@@ -43,8 +42,7 @@ LanceTableWriter::LanceTableWriter(const std::string& base_path,
       base_path_(base_path),
       schema_(std::move(schema)),
       properties_(properties),
-      data_storage_format_(data_storage_format),
-      dataset_(nullptr) {
+      data_storage_format_(data_storage_format) {
   assert(schema_);
 }
 
@@ -82,31 +80,6 @@ arrow::Status LanceTableWriter::Write(const std::shared_ptr<arrow::RecordBatch> 
 
 arrow::Status LanceTableWriter::Flush() { return arrow::Status::OK(); }
 
-bool fids_contains(const std::vector<uint64_t>& origin, const std::vector<uint64_t>& current) {
-  assert(current.size() > origin.size());
-  std::unordered_set<uint64_t> current_set(current.begin(), current.end());
-  for (uint64_t elem : origin) {
-    if (current_set.find(elem) == current_set.end()) {
-      return false;
-    }
-  }
-  return true;
-}
-
-std::vector<uint64_t> fids_diff(const std::vector<uint64_t>& origin, const std::vector<uint64_t>& current) {
-  assert(current.size() > origin.size());
-
-  std::unordered_set<uint64_t> origin_set(origin.begin(), origin.end());
-  std::vector<uint64_t> diff;
-
-  for (uint64_t elem : current) {
-    if (origin_set.find(elem) == origin_set.end()) {
-      diff.emplace_back(elem);
-    }
-  }
-  return diff;
-}
-
 arrow::Result<api::ColumnGroupFile> LanceTableWriter::Close() {
   assert(!closed_);
   struct ArrowArrayStream array_stream;
@@ -117,58 +90,27 @@ arrow::Result<api::ColumnGroupFile> LanceTableWriter::Close() {
   // Get storage options from properties for cloud storage support
   ArrowFileSystemConfig fs_config;
   ARROW_RETURN_NOT_OK(ArrowFileSystemConfig::create_file_system_config(properties_, fs_config));
-  auto storage_options = ToStorageOptions(fs_config);
+  auto storage_options = ToWriterOptions(fs_config);
 
   // Build full Lance URI from relative path
   ARROW_ASSIGN_OR_RAISE(auto lance_uri, BuildLanceBaseUri(fs_config, base_path_));
 
-  if (!dataset_) {
-    try {
-      dataset_ = BlockingDataset::OpenUnique(lance_uri, storage_options);
-      origin_fids_ = dataset_->GetAllFragmentIds();
-      dataset_->WriteArrowArrayStream(&array_stream);
-    } catch (std::exception& e) {
-      // dataset does not exist
-      origin_fids_.clear();
-      dataset_ = BlockingDataset::WriteDataset(lance_uri, &array_stream, storage_options, data_storage_format_);
-    }
-  } else {
-    dataset_->WriteArrowArrayStream(&array_stream);
-  }
+  ARROW_ASSIGN_OR_RAISE(auto written_fragment_ids,
+                        BlockingDataset::WriteDataset(lance_uri, &array_stream, storage_options, data_storage_format_));
   record_batches_.clear();
-
-  std::vector<uint64_t> append_fids;
-  std::vector<uint64_t> current_fids;
-  current_fids = dataset_->GetAllFragmentIds();
-
-  if (current_fids.size() < origin_fids_.size()) {
-    return arrow::Status::Invalid(
-        fmt::format("LanceTableWriter: current fragment ids size is less than origin fragment ids size [current "
-                    "size={}, origin size={}]",
-                    current_fids.size(),  // NOLINT
-                    origin_fids_.size()));
-  }
 
   // Store Milvus-format URI (scheme://address/bucket/key) in ColumnGroupFile.path
   // so the reader can resolve the right extfs.<alias>.* by address+bucket. The
   // reader strips address back to standard form before handing to Lance.
   auto milvus_lance_uri = ToMilvusLanceUri(lance_uri, fs_config.address);
 
-  if (current_fids.size() == origin_fids_.size()) {
-    return api::ColumnGroupFile{.path = milvus_lance_uri, .start_index = 0, .end_index = written_rows_};
+  if (written_fragment_ids.size() != 1) {
+    return arrow::Status::Invalid(
+        fmt::format("LanceTableWriter expected one new fragment, got {}", written_fragment_ids.size()));
   }
-
-  if (!fids_contains(origin_fids_, current_fids)) {
-    return arrow::Status::Invalid("LanceTableWriter: current fragment ids is not a superset of origin fragment ids");
-  }
-
-  append_fids = fids_diff(origin_fids_, current_fids);
-  assert(append_fids.size() == 1);
-
-  dataset_.reset();
   closed_ = true;
   return api::ColumnGroupFile{
-      .path = MakeLanceUri(milvus_lance_uri, append_fids[0]),
+      .path = MakeLanceUri(milvus_lance_uri, written_fragment_ids[0]),
       .start_index = 0,
       .end_index = written_rows_,
   };

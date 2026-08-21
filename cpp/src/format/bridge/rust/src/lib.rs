@@ -21,6 +21,7 @@ mod iceberg_bridgeimpl;
 mod iceberg_testutil;
 mod lance_bridgeimpl;
 mod lance_memory_estimator;
+mod lance_object_store;
 mod paimon_bridgeimpl;
 mod paimon_split_serde;
 mod paimon_testutil;
@@ -76,6 +77,13 @@ pub mod rust_runtime_ffi {
 
 #[cxx::bridge(namespace = "milvus_storage::lance::ffi")]
 pub mod lance_ffi {
+    unsafe extern "C++" {
+        include!("milvus-storage/filesystem/ffi/filesystem_internal.h");
+
+        #[namespace = ""]
+        type FileSystemWrapper;
+    }
+
     /// Lance data storage format
     #[repr(u8)]
     #[derive(Debug, Clone, Copy)]
@@ -107,6 +115,7 @@ pub mod lance_ffi {
         /// method therefore must not be interpreted as per-dataset accounting.
         pub fn io_stats_incremental(self: &BlockingDataset) -> LanceIOStats;
         pub fn open_dataset(
+            filesystem: SharedPtr<FileSystemWrapper>,
             uri: &str,
             storage_options_keys: Vec<String>,
             storage_options_values: Vec<String>,
@@ -117,11 +126,15 @@ pub mod lance_ffi {
             storage_options_keys: Vec<String>,
             storage_options_values: Vec<String>,
             data_storage_format: LanceDataStorageFormat,
-        ) -> Result<Box<BlockingDataset>>;
+        ) -> Result<Vec<u64>>;
+        pub fn delete_rows(
+            uri: &str,
+            predicate: &str,
+            storage_options_keys: Vec<String>,
+            storage_options_values: Vec<String>,
+        ) -> Result<()>;
 
-        pub unsafe fn write_stream(self: &mut BlockingDataset, stream_ptr: *mut u8) -> Result<()>;
         pub fn get_all_fragment_ids(self: &BlockingDataset) -> Vec<u64>;
-        pub fn dataset_delete_rows(dataset: &mut BlockingDataset, predicate: &str) -> Result<()>;
         pub fn get_fragment_deletion_positions(
             dataset: &BlockingDataset,
             fragment_id: u64,
@@ -204,6 +217,11 @@ pub mod lance_ffi {
 
     }
 } // mod lance_ffi
+
+// FileSystemWrapper is immutable after construction. Its shared Arrow
+// filesystem is already used concurrently by C++ format readers.
+unsafe impl Send for lance_ffi::FileSystemWrapper {}
+unsafe impl Sync for lance_ffi::FileSystemWrapper {}
 
 #[cxx::bridge(namespace = "milvus_storage::paimon::ffi")]
 pub mod paimon_ffi {

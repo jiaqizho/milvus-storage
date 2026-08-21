@@ -15,6 +15,10 @@ option(WITH_FIU "Build with fault injection support (libfiu)." OFF)
 option(WITH_CRT "Build with AWS S3 CRT support." OFF)
 option(ARROW_WITH_JEMALLOC "Build with jemalloc." OFF)
 
+if (WITH_UT OR WITH_BENCHMARK)
+  add_definitions(-DLANCE_BUILD_WITH_WRITER)
+endif()
+
 if (WITH_CRT)
   add_compile_definitions(WITH_CRT)
 endif()

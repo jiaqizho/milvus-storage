@@ -24,10 +24,15 @@
 
 namespace milvus_storage::lance {
 
-/// Convert ArrowFileSystemConfig to Lance storage options.
-/// Key format: aws_access_key_id, aws_secret_access_key, aws_region, aws_endpoint, etc.
-/// @throws std::runtime_error for unsupported providers (Tencent, Huawei)
-StorageOptions ToStorageOptions(const ArrowFileSystemConfig& config);
+/// Convert ArrowFileSystemConfig to credential-free Lance read options.
+/// Authentication and credential refresh remain owned by the bound C++ filesystem.
+StorageOptions ToReaderOptions(const ArrowFileSystemConfig& config);
+
+#ifdef LANCE_BUILD_WITH_WRITER
+/// Convert ArrowFileSystemConfig to native Lance writer options used by tests and benchmarks.
+/// Dynamic role, broker, and impersonation credentials are intentionally unsupported.
+StorageOptions ToWriterOptions(const ArrowFileSystemConfig& config);
+#endif
 
 /// Parse a Lance URI to extract the base path and fragment ID.
 /// URI format: {base_path}?fragment_id={fragment_id}

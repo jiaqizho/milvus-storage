@@ -1076,10 +1076,10 @@ TEST_P(ExternalTableAzureArnTest, ReadWithBrokeredSas) {
   loon_properties_free(&loon_props);
 }
 
-TEST_P(ExternalTableAzureArnTest, ProviderCacheFetchesBrokeredSasOnce) {
+TEST_P(ExternalTableAzureArnTest, CachedReadsFetchBrokeredSasOnce) {
   const auto& format = GetParam();
   if (format != LOON_FORMAT_LANCE_TABLE && format != LOON_FORMAT_ICEBERG_TABLE) {
-    GTEST_SKIP() << "Azure provider cache is used only by Lance and Iceberg";
+    GTEST_SKIP() << "Cache reuse is covered only by Lance and Iceberg";
   }
 
   const uint64_t num_rows = 100;
@@ -1092,7 +1092,7 @@ TEST_P(ExternalTableAzureArnTest, ProviderCacheFetchesBrokeredSasOnce) {
 
   constexpr size_t cache_hit_iterations = 10;
   if (format == LOON_FORMAT_LANCE_TABLE) {
-    auto storage_options = lance::ToStorageOptions(fs_config);
+    auto storage_options = lance::ToReaderOptions(fs_config);
     auto cache_key = storage_options.find("milvus_fs_cache_key");
     ASSERT_NE(cache_key, storage_options.end());
     ASSERT_EQ(cache_key->second, fs_config.GetCacheKey());
@@ -1147,9 +1147,9 @@ INSTANTIATE_TEST_SUITE_P(
 //   * C++ native S3FS path — our-side manifest storage through
 //     S3FileSystemProducer's Aliyun ARN dispatch
 //     (s3_filesystem_producer.cpp), only reached if our_cloud_provider=aliyun.
-//   * Rust Lance bridge path — customer-side Lance data read through
-//     AliyunOssStoreProvider + opendal + reqsign
-//     (aliyun_oss_provider.rs + lance_common.cpp's role_arn branch).
+//   * C++ filesystem path — customer-side Lance reads call the same
+//     S3FileSystemProducer-owned Aliyun credentials through filesystem_c.
+//     Rust adapts those reads to Lance's ObjectStore interface only.
 //
 // Test data is written with explicit AKSK (cloud_provider=aliyun + AK/SK),
 // then read back using only the role_arn. This mirrors the AWS ARN test.
@@ -1226,8 +1226,8 @@ class ExternalTableAliyunArnTest : public ::testing::Test {
     //             on an ECS with a RAM role attached.
     //   - default / "oidc": legacy AssumeRoleWithOIDC. Requires
     //             ALIBABA_CLOUD_OIDC_TOKEN_FILE + _PROVIDER_ARN in process
-    //             env; without them the Rust Lance path would surface a
-    //             generic OSS 401 instead of a clear misconfig.
+    //             env; without them the C++ filesystem path fails fast with
+    //             a clear configuration error.
     const char* auth_mode_env = std::getenv("ALIYUN_ROLE_ARN_AUTH_MODE");
     const bool ram_mode = auth_mode_env != nullptr && std::string(auth_mode_env) == "ram";
     if (!ram_mode) {
@@ -1251,10 +1251,8 @@ class ExternalTableAliyunArnTest : public ::testing::Test {
     api::SetValue(write_props_, PROPERTY_FS_ACCESS_KEY_VALUE, arn_sk_.c_str());
     api::SetValue(write_props_, PROPERTY_FS_USE_SSL, "true");
 
-    // Read properties: role_arn to trigger AssumeRoleWithOIDC. No AKSK on this
-    // branch — see lance_common.cpp's role_arn emission: AK/SK alongside
-    // role_arn would make reqsign's load_via_static win over
-    // load_via_assume_role_with_oidc, silently bypassing the OIDC flow.
+    // Read properties: role_arn selects the C++ filesystem's
+    // AssumeRoleWithOIDC path. No AK/SK are needed on this branch.
     api::SetValue(read_props_, "extfs.arn.storage_type", "remote");
     api::SetValue(read_props_, "extfs.arn.cloud_provider", kCloudProviderAliyun);
     api::SetValue(read_props_, "extfs.arn.address", address_.c_str());
@@ -1447,8 +1445,8 @@ TEST_F(ExternalTableAliyunArnTest, ReadLanceWithArnRole) {
   auto* cg = &out_manifest->column_groups.column_group_array[0];
   ASSERT_EQ(cg->num_of_files, out_num_files);
 
-  // Step 5: Read data using FormatReader with role_arn (AliyunOssStoreProvider
-  // + reqsign AssumeRoleWithOIDC).
+  // Step 5: Read data using FormatReader with role_arn through the C++
+  // S3FileSystemProducer's Aliyun AssumeRoleWithOIDC provider.
   std::vector<std::string> columns = {"id", "name", "value"};
   int64_t total_rows = 0;
   for (uint64_t f = 0; f < cg->num_of_files; ++f) {
@@ -1792,8 +1790,8 @@ TEST_F(ExternalTableAliyunArnTest, ReadVortexWithArnRole) {
 }
 
 // ===========================================================================
-// Aliyun OIDC chain integration test (`AliyunOIDCAssumeRoleChainProvider` on
-// the C++ side, `apply_oidc_chain_if_requested` on the Rust side).
+// Aliyun OIDC chain integration test (`AliyunOIDCAssumeRoleChainProvider` for
+// filesystem-backed formats, `apply_oidc_chain_if_requested` for Iceberg).
 //
 // RAM mode is intentionally NOT covered here; that path stays under
 // `ExternalTableAliyunArnTest` above which exercises both modes via env.
@@ -2014,9 +2012,9 @@ class ExternalTableAliyunOIDCArnTest : public ::testing::Test {
   std::string test_base_;
 };
 
-// Lance + OIDC chain end-to-end. Writes with AKSK, reads back through
-// loon_exttable_explore (Rust AliyunOssStoreProvider on step 2 of the
-// chain) + FormatReader.
+// Lance + OIDC chain end-to-end. Writes with AKSK, then reads back through
+// loon_exttable_explore and FormatReader using the C++ filesystem's OIDC
+// chain.
 TEST_F(ExternalTableAliyunOIDCArnTest, ReadLanceWithOIDCChain) {
   const uint64_t num_rows = 100;
   ASSERT_AND_ASSIGN(auto result, CreateLanceTable(num_rows));
@@ -2099,7 +2097,7 @@ TEST_F(ExternalTableAliyunOIDCArnTest, ReadLanceWithOIDCChain) {
   loon_properties_free(&loon_props);
 }
 
-TEST_F(ExternalTableAliyunOIDCArnTest, LanceProviderCacheHitDoesNotReloadOidcToken) {
+TEST_F(ExternalTableAliyunOIDCArnTest, LanceFilesystemCacheHitDoesNotReloadOidcToken) {
   const uint64_t num_rows = 100;
   ASSERT_AND_ASSIGN(auto result, CreateLanceTable(num_rows));
 
@@ -2108,7 +2106,7 @@ TEST_F(ExternalTableAliyunOIDCArnTest, LanceProviderCacheHitDoesNotReloadOidcTok
   api::SetValue(cache_read_props, "extfs.arn.session_name", session_name.c_str());
 
   ASSERT_AND_ASSIGN(auto fs_config, FilesystemCache::resolve_config(cache_read_props, result.explore_dir.c_str()));
-  auto storage_options = lance::ToStorageOptions(fs_config);
+  auto storage_options = lance::ToReaderOptions(fs_config);
   auto cache_key = storage_options.find("milvus_fs_cache_key");
   ASSERT_NE(cache_key, storage_options.end());
   ASSERT_EQ(cache_key->second, fs_config.GetCacheKey());
