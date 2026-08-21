@@ -200,6 +200,26 @@ static void test_filesystem_get_file_info(void) {
   loon_filesystem_destroy(fs_handle);
 }
 
+static void test_filesystem_get_object_info(void) {
+  FileSystemHandle fs_handle = 0;
+  get_test_filesystem(&fs_handle, TEST_ROOT_PATH);
+  write_single_file(&fs_handle);
+
+  uint64_t size = 0;
+  int64_t mtime_ns = 0;
+  bool is_dir = true;
+  LoonFFIResult rc =
+      loon_filesystem_get_object_info(fs_handle, TEST_FILE_NAME, strlen(TEST_FILE_NAME), &size, &mtime_ns, &is_dir);
+  ck_assert_msg(loon_ffi_is_success(&rc), "%s", loon_ffi_get_errmsg(&rc));
+  ck_assert(size > 0);
+  ck_assert(!is_dir);
+  if (!is_cloud_env()) {
+    ck_assert_int_gt(mtime_ns, 0);
+  }
+
+  loon_filesystem_destroy(fs_handle);
+}
+
 static void test_filesystem_delete_file(void) {
   LoonFFIResult rc;
   FileSystemHandle fs_handle;
@@ -287,16 +307,10 @@ static void test_filesystem_dir_operator(void) {
   {
     LoonFileInfoList file_list;
 
-    if (is_cloud_env()) {
-      // Cloud (S3/MinIO) rejects "." as a path component; list a known subdirectory instead.
-      rc = loon_filesystem_list_dir(fs_handle, "dir4", strlen("dir4"), true, &file_list);
-      ck_assert_msg(loon_ffi_is_success(&rc), "%s", loon_ffi_get_errmsg(&rc));
-      ck_assert_int_gt(file_list.count, 0);
-    } else {
-      rc = loon_filesystem_list_dir(fs_handle, ".", strlen("."), true, &file_list);
-      ck_assert_msg(loon_ffi_is_success(&rc), "%s", loon_ffi_get_errmsg(&rc));
-      ck_assert_int_gt(file_list.count, len_of_valid_path);
-    }
+    const char* root = "";
+    rc = loon_filesystem_list_dir(fs_handle, root, 0, true, &file_list);
+    ck_assert_msg(loon_ffi_is_success(&rc), "%s", loon_ffi_get_errmsg(&rc));
+    ck_assert_int_gt(file_list.count, len_of_valid_path);
 
     // Free the result
     loon_filesystem_free_file_info_list(&file_list);
@@ -510,6 +524,20 @@ static void test_filesystem_file_not_found(void) {
                 rc.err_code, loon_ffi_get_errmsg(&rc));
   loon_ffi_free_result(&rc);
 
+  // --- loon_filesystem_get_object_info ---
+  int64_t out_mtime_ns = 1;
+  bool out_is_dir = true;
+  out_size = 1;
+  rc = loon_filesystem_get_object_info(fs_handle, missing, missing_len, &out_size, &out_mtime_ns, &out_is_dir);
+  ck_assert_msg(!loon_ffi_is_success(&rc), "get_object_info: expected failure on missing file");
+  ck_assert_msg(rc.err_code == loon_errcode_file_not_found,
+                "get_object_info: expected loon_errcode_file_not_found(%d), got %d: %s", loon_errcode_file_not_found,
+                rc.err_code, loon_ffi_get_errmsg(&rc));
+  ck_assert(out_size == 0);
+  ck_assert_int_eq(out_mtime_ns, 0);
+  ck_assert(!out_is_dir);
+  loon_ffi_free_result(&rc);
+
   // --- loon_filesystem_read_file ---
   uint8_t read_buf[16];
   rc = loon_filesystem_read_file(fs_handle, missing, missing_len, 0, sizeof(read_buf), read_buf);
@@ -665,6 +693,29 @@ static void test_filesystem_error_handling(void) {
   loon_ffi_free_result(&rc);
 
   rc = loon_filesystem_get_file_info(fs_handle, NULL, 0, &out_size);
+  ck_assert(!loon_ffi_is_success(&rc));
+  loon_ffi_free_result(&rc);
+
+  // Test loon_filesystem_get_object_info with null arguments
+  int64_t out_mtime_ns;
+  bool out_is_dir;
+  rc = loon_filesystem_get_object_info(0, "path", 4, &out_size, &out_mtime_ns, &out_is_dir);
+  ck_assert(!loon_ffi_is_success(&rc));
+  loon_ffi_free_result(&rc);
+
+  rc = loon_filesystem_get_object_info(fs_handle, NULL, 0, &out_size, &out_mtime_ns, &out_is_dir);
+  ck_assert(!loon_ffi_is_success(&rc));
+  loon_ffi_free_result(&rc);
+
+  rc = loon_filesystem_get_object_info(fs_handle, "path", 4, NULL, &out_mtime_ns, &out_is_dir);
+  ck_assert(!loon_ffi_is_success(&rc));
+  loon_ffi_free_result(&rc);
+
+  rc = loon_filesystem_get_object_info(fs_handle, "path", 4, &out_size, NULL, &out_is_dir);
+  ck_assert(!loon_ffi_is_success(&rc));
+  loon_ffi_free_result(&rc);
+
+  rc = loon_filesystem_get_object_info(fs_handle, "path", 4, &out_size, &out_mtime_ns, NULL);
   ck_assert(!loon_ffi_is_success(&rc));
   loon_ffi_free_result(&rc);
 
@@ -988,6 +1039,7 @@ void run_filesystem_suite(void) {
   RUN_TEST(test_filesystem_write_and_read);
   RUN_TEST(test_filesystem_direct_write_and_read);
   RUN_TEST(test_filesystem_get_file_info);
+  RUN_TEST(test_filesystem_get_object_info);
   RUN_TEST(test_filesystem_delete_file);
   RUN_TEST(test_filesystem_dir_operator);
   RUN_TEST(test_filesystem_metrics);

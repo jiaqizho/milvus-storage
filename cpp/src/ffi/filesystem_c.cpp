@@ -233,6 +233,51 @@ LoonFFIResult loon_filesystem_get_file_info(FileSystemHandle handle,
   RETURN_UNREACHABLE();
 }
 
+LoonFFIResult loon_filesystem_get_object_info(FileSystemHandle handle,
+                                              const char* path_ptr,
+                                              uint32_t path_len,
+                                              uint64_t* out_size,
+                                              int64_t* out_mtime_ns,
+                                              bool* out_is_dir) {
+  try {
+    if (!handle || !path_ptr || path_len == 0 || !out_size || !out_mtime_ns || !out_is_dir) {
+      RETURN_ERROR(LOON_INVALID_ARGS,
+                   "Invalid arguments: handle, path_ptr, path_len, out_size, out_mtime_ns, and out_is_dir must not "
+                   "be null");
+    }
+
+    *out_size = 0;
+    *out_mtime_ns = 0;
+    *out_is_dir = false;
+
+    auto fs = reinterpret_cast<FileSystemWrapper*>(handle)->get();
+    std::string path(path_ptr, path_len);
+    auto info_result = fs->GetFileInfo(path);
+    if (!info_result.ok()) {
+      RETURN_ARROW_ERROR(info_result.status(), LOON_ARROW_ERROR, "Fail to get object info, [path=", path,
+                         "] details: ", info_result.status().ToString());
+    }
+
+    const auto& info = info_result.ValueOrDie();
+    if (info.type() == arrow::fs::FileType::NotFound) {
+      RETURN_ERROR(LOON_FILE_NOT_FOUND, "File not found: ", path);
+    }
+
+    *out_is_dir = info.type() == arrow::fs::FileType::Directory;
+    *out_size = *out_is_dir ? 0 : static_cast<uint64_t>(info.size());
+    auto mtime = info.mtime();
+    if (mtime.time_since_epoch().count() > 0) {
+      *out_mtime_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(mtime.time_since_epoch()).count();
+    }
+
+    RETURN_SUCCESS();
+  } catch (const std::exception& e) {
+    RETURN_EXCEPTION(e.what());
+  }
+
+  RETURN_UNREACHABLE();
+}
+
 LoonFFIResult loon_filesystem_read_file(FileSystemHandle handle,
                                         const char* path_ptr,
                                         uint32_t path_len,
@@ -256,9 +301,6 @@ LoonFFIResult loon_filesystem_read_file(FileSystemHandle handle,
 
     input_file_result = fs->OpenInputFile(path);
     if (!input_file_result.ok()) {
-      if (::arrow::internal::ErrnoFromStatus(input_file_result.status()) == ENOENT) {
-        RETURN_ERROR(LOON_FILE_NOT_FOUND, "File not found: ", input_file_result.status().ToString());
-      }
       RETURN_ARROW_ERROR(input_file_result.status(), LOON_ARROW_ERROR, "Fail to open input stream, [path=", path,
                          "] details: ", input_file_result.status().ToString());
     }
@@ -318,9 +360,6 @@ LoonFFIResult loon_filesystem_open_reader(FileSystemHandle handle,
       input_file_result = fs->OpenInputFile(path);
     }
     if (!input_file_result.ok()) {
-      if (::arrow::internal::ErrnoFromStatus(input_file_result.status()) == ENOENT) {
-        RETURN_ERROR(LOON_FILE_NOT_FOUND, "File not found: ", input_file_result.status().ToString());
-      }
       RETURN_ARROW_ERROR(input_file_result.status(), LOON_ARROW_ERROR, input_file_result.status().ToString());
     }
 
@@ -490,9 +529,6 @@ LoonFFIResult loon_filesystem_get_file_stats(FileSystemHandle handle,
     // Open input file to read size and metadata
     auto input_result = fs->OpenInputFile(path);
     if (!input_result.ok()) {
-      if (::arrow::internal::ErrnoFromStatus(input_result.status()) == ENOENT) {
-        RETURN_ERROR(LOON_FILE_NOT_FOUND, "File not found: ", input_result.status().ToString());
-      }
       RETURN_ARROW_ERROR(input_result.status(), LOON_ARROW_ERROR,
                          "Failed to open input file: ", input_result.status().ToString());
     }
@@ -627,9 +663,6 @@ LoonFFIResult loon_filesystem_read_file_all(
     // Open input file
     auto input_result = fs->OpenInputFile(path);
     if (!input_result.ok()) {
-      if (::arrow::internal::ErrnoFromStatus(input_result.status()) == ENOENT) {
-        RETURN_ERROR(LOON_FILE_NOT_FOUND, "File not found: ", input_result.status().ToString());
-      }
       RETURN_ARROW_ERROR(input_result.status(), LOON_ARROW_ERROR,
                          "Failed to open input file: ", input_result.status().ToString());
     }
@@ -902,7 +935,7 @@ void loon_filesystem_free_file_info_list(LoonFileInfoList* list) {
 LoonFFIResult loon_filesystem_list_dir(
     FileSystemHandle handle, const char* path_ptr, uint32_t path_len, bool recursive, LoonFileInfoList* out_list) {
   try {
-    if (!handle || !path_ptr || path_len == 0 || !out_list) {
+    if (!handle || !path_ptr || !out_list) {
       RETURN_ERROR(LOON_INVALID_ARGS, "Invalid arguments: handle, path_ptr and out_list must not be null");
     }
 
@@ -922,9 +955,6 @@ LoonFFIResult loon_filesystem_list_dir(
     // Get file info list
     auto file_info_result = fs->GetFileInfo(selector);
     if (!file_info_result.ok()) {
-      if (::arrow::internal::ErrnoFromStatus(file_info_result.status()) == ENOENT) {
-        RETURN_ERROR(LOON_FILE_NOT_FOUND, "Directory not found: ", file_info_result.status().ToString());
-      }
       RETURN_ARROW_ERROR(file_info_result.status(), LOON_ARROW_ERROR,
                          "Failed to list directory: ", file_info_result.status().ToString());
     }

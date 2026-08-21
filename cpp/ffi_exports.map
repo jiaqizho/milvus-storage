@@ -19,6 +19,7 @@
     loon_errcode_fault_inject;
     loon_errcode_not_support;
     loon_errcode_file_not_found;
+    loon_errcode_permission_denied;
     loon_errcode_aws_no_such_upload;
     loon_errcode_aws_conflict;
     loon_errcode_aws_precondition_failed;

@@ -15,10 +15,102 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <unordered_map>
+
+#include <arrow/result.h>
+#include <arrow/status.h>
+
 #include "rust/cxx.h"
 
 namespace milvus_storage {
+
+inline constexpr std::string_view kFFIErrorCodeMarker = "__LOON_FFI_ERRCODE__=";
+
+arrow::Status MakeBridgeErrorStatus(std::string_view message);
+arrow::Status MakeBridgeErrorStatus(std::string_view context, std::string_view message);
+arrow::Status MakeBridgeErrorStatus(std::string_view context, const arrow::Status& status);
+
+using RustErrorMapper = arrow::Status (*)(std::string_view);
+
+template <typename T, typename Fn>
+arrow::Result<T> CatchRustResult(Fn&& fn) {
+  try {
+    return fn();
+  } catch (const rust::cxxbridge1::Error& e) {
+    return MakeBridgeErrorStatus(e.what());
+  }
+}
+
+template <typename T, typename Fn>
+arrow::Result<T> CatchRustResult(RustErrorMapper error_mapper, Fn&& fn) {
+  try {
+    return fn();
+  } catch (const rust::cxxbridge1::Error& e) {
+    return error_mapper(e.what());
+  }
+}
+
+template <typename T, typename Fn>
+arrow::Result<T> CatchRustResult(std::string_view context, Fn&& fn) {
+  try {
+    return fn();
+  } catch (const rust::cxxbridge1::Error& e) {
+    return MakeBridgeErrorStatus(context, e.what());
+  }
+}
+
+template <typename Fn>
+arrow::Status CatchRustStatus(Fn&& fn) {
+  try {
+    fn();
+    return arrow::Status::OK();
+  } catch (const rust::cxxbridge1::Error& e) {
+    return MakeBridgeErrorStatus(e.what());
+  }
+}
+
+template <typename Fn>
+arrow::Status CatchRustStatus(RustErrorMapper error_mapper, Fn&& fn) {
+  try {
+    fn();
+    return arrow::Status::OK();
+  } catch (const rust::cxxbridge1::Error& e) {
+    return error_mapper(e.what());
+  }
+}
+
+template <typename Fn>
+arrow::Status CatchRustStatus(std::string_view context, Fn&& fn) {
+  try {
+    fn();
+    return arrow::Status::OK();
+  } catch (const rust::cxxbridge1::Error& e) {
+    return MakeBridgeErrorStatus(context, e.what());
+  }
+}
+
+/// Releases an Arrow C Data Interface object on scope exit unless ownership
+/// has been transferred and Disarm() has been called. T must provide a
+/// `release(T*)` callback field, such as ArrowSchema, ArrowArray, or
+/// ArrowArrayStream.
+template <typename T>
+class ArrowCDataReleaseGuard {
+  public:
+  explicit ArrowCDataReleaseGuard(T* data) : data_(data) {}
+
+  ~ArrowCDataReleaseGuard() {
+    if (armed_ && data_ != nullptr && data_->release != nullptr) {
+      data_->release(data_);
+    }
+  }
+
+  void Disarm() { armed_ = false; }
+
+  private:
+  T* data_;
+  bool armed_ = true;
+};
 
 inline void ConvertStorageOptions(const std::unordered_map<std::string, std::string>& storage_options,
                                   rust::Vec<rust::String>& keys,
