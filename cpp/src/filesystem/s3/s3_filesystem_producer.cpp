@@ -36,6 +36,7 @@
 #include <aws/s3/model/HeadObjectRequest.h>
 #include <aws/s3/model/ListObjectsRequest.h>
 #include <aws/s3/model/PutObjectRequest.h>
+#include <aws/sts/STSClient.h>
 
 #include <arrow/status.h>
 #include <arrow/util/uri.h>
@@ -187,8 +188,14 @@ arrow::Result<S3Options> S3FileSystemProducer::CreateS3Options() {
                        << ", external_id_set=" << (config_.external_id.empty() ? "false" : "true")
                        << ", load_frequency=" << config_.load_frequency;
     if (config_.cloud_provider == kCloudProviderAWS) {
+      std::shared_ptr<Aws::STS::STSClient> sts_client;
+      if (!config_.region.empty()) {
+        Aws::Client::ClientConfiguration sts_config;
+        sts_config.region = config_.region.c_str();
+        sts_client = Aws::MakeShared<Aws::STS::STSClient>("S3FileSystemProducer", sts_config);
+      }
       options.ConfigureAssumeRoleCredentials(config_.role_arn, config_.session_name, config_.external_id,
-                                             config_.load_frequency);
+                                             config_.load_frequency, sts_client);
     } else if (config_.cloud_provider == kCloudProviderAliyun) {
       // Two Aliyun AssumeRole flows are supported; the dispatcher picks one
       // explicitly via ALIYUN_ROLE_ARN_AUTH_MODE. No auto-
