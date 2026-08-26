@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
@@ -41,6 +42,7 @@
 #include "milvus-storage/filesystem/s3/provider/AliyunRAMSTSClient.h"
 #include "milvus-storage/filesystem/s3/provider/TencentCloudCredentialsProvider.h"
 #include "milvus-storage/filesystem/s3/provider/HuaweiCloudCredentialsProvider.h"
+#include "milvus-storage/filesystem/s3/s3_filesystem_producer.h"
 #include "milvus-storage/filesystem/s3/s3_global.h"
 #include "milvus-storage/common/arrow_util.h"
 #include "test_env.h"
@@ -1196,7 +1198,96 @@ constexpr const char* kSTSSuccessXml = R"(<?xml version='1.0' encoding='UTF-8'?>
   </Credentials>
 </AssumeRoleResponse>)";
 
+constexpr const char* kAwsStsSuccessXml = R"(<?xml version="1.0" encoding="UTF-8"?>
+<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+  <AssumeRoleResult>
+    <Credentials>
+      <AccessKeyId>ASSUMED_AK</AccessKeyId>
+      <SecretAccessKey>ASSUMED_SK</SecretAccessKey>
+      <SessionToken>ASSUMED_TOKEN</SessionToken>
+      <Expiration>2099-12-31T23:59:59Z</Expiration>
+    </Credentials>
+    <AssumedRoleUser>
+      <Arn>arn:aws:sts::123456789012:assumed-role/reader-role/reader-session</Arn>
+      <AssumedRoleId>AROATEST:reader-session</AssumedRoleId>
+    </AssumedRoleUser>
+  </AssumeRoleResult>
+  <ResponseMetadata><RequestId>TEST-RID</RequestId></ResponseMetadata>
+</AssumeRoleResponse>)";
+
 }  // namespace
+
+TEST_F(S3ProviderTest, AwsAssumeRoleForwardsFilesystemConfigurationToSts) {
+  ScopedEnvVar set_access_key("AWS_ACCESS_KEY_ID", "BASE_AK");
+  ScopedEnvVar set_secret_key("AWS_SECRET_ACCESS_KEY", "BASE_SK");
+  ScopedEnvUnset unset_session_token("AWS_SESSION_TOKEN");
+  ScopedEnvVar set_default_region("AWS_DEFAULT_REGION", "us-east-1");
+  ScopedEnvVar set_region("AWS_REGION", "us-east-1");
+  ScopedEnvVar disable_imds("AWS_EC2_METADATA_DISABLED", "true");
+
+  mock_client_->EnqueueResponse("sts.", Aws::Http::HttpResponseCode::OK, kAwsStsSuccessXml);
+
+  ArrowFileSystemConfig config;
+  config.cloud_provider = kCloudProviderAWS;
+  config.region = "us-west-2";
+  config.role_arn = "arn:aws:iam::123456789012:role/reader-role";
+  config.session_name = "reader-session";
+  config.external_id = "tenant-external-id";
+  config.load_frequency = 1800;
+
+  S3FileSystemProducer producer(config);
+  ASSERT_AND_ASSIGN(auto options, producer.CreateS3Options());
+  auto credentials = options.credentials_provider->GetAWSCredentials();
+  ASSERT_EQ(credentials.GetAWSAccessKeyId(), "ASSUMED_AK");
+
+  const auto recorded = mock_client_->GetRecordedRequests();
+  auto sts_request = std::find_if(recorded.begin(), recorded.end(), [](const auto& request) {
+    return request->GetURIString().find("sts") != Aws::String::npos;
+  });
+  ASSERT_NE(sts_request, recorded.end());
+
+  ASSERT_TRUE((*sts_request)->HasHeader("Authorization"));
+  const std::string authorization = (*sts_request)->GetHeaderValue("Authorization").c_str();
+  EXPECT_NE(authorization.find("/us-west-2/sts/aws4_request"), std::string::npos) << authorization;
+
+  const auto body = ReadRequestBody(*sts_request);
+  EXPECT_NE(body.find("RoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2Freader-role"), std::string::npos) << body;
+  EXPECT_NE(body.find("RoleSessionName=reader-session"), std::string::npos) << body;
+  EXPECT_NE(body.find("ExternalId=tenant-external-id"), std::string::npos) << body;
+  EXPECT_NE(body.find("DurationSeconds=1800"), std::string::npos) << body;
+}
+
+TEST_F(S3ProviderTest, AwsAssumeRoleFallsBackToAwsRegionWhenFilesystemRegionIsEmpty) {
+  ScopedEnvVar set_access_key("AWS_ACCESS_KEY_ID", "BASE_AK");
+  ScopedEnvVar set_secret_key("AWS_SECRET_ACCESS_KEY", "BASE_SK");
+  ScopedEnvUnset unset_session_token("AWS_SESSION_TOKEN");
+  ScopedEnvVar set_default_region("AWS_DEFAULT_REGION", "us-east-1");
+  ScopedEnvVar set_region("AWS_REGION", "us-east-1");
+  ScopedEnvVar disable_imds("AWS_EC2_METADATA_DISABLED", "true");
+
+  mock_client_->EnqueueResponse("sts.", Aws::Http::HttpResponseCode::OK, kAwsStsSuccessXml);
+
+  ArrowFileSystemConfig config;
+  config.cloud_provider = kCloudProviderAWS;
+  config.region = "";
+  config.role_arn = "arn:aws:iam::123456789012:role/reader-role";
+  config.session_name = "reader-session";
+
+  S3FileSystemProducer producer(config);
+  ASSERT_AND_ASSIGN(auto options, producer.CreateS3Options());
+  auto credentials = options.credentials_provider->GetAWSCredentials();
+  ASSERT_EQ(credentials.GetAWSAccessKeyId(), "ASSUMED_AK");
+
+  const auto recorded = mock_client_->GetRecordedRequests();
+  auto sts_request = std::find_if(recorded.begin(), recorded.end(), [](const auto& request) {
+    return request->GetURIString().find("sts") != Aws::String::npos;
+  });
+  ASSERT_NE(sts_request, recorded.end());
+
+  ASSERT_TRUE((*sts_request)->HasHeader("Authorization"));
+  const std::string authorization = (*sts_request)->GetHeaderValue("Authorization").c_str();
+  EXPECT_NE(authorization.find("/us-east-1/sts/aws4_request"), std::string::npos) << authorization;
+}
 
 TEST_F(S3ProviderTest, TestAliyunRAMSTSClientSuccess) {
   mock_client_->EnqueueResponse("sts.aliyuncs.com", Aws::Http::HttpResponseCode::OK, kSTSSuccessXml);
