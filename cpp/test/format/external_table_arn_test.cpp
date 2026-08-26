@@ -221,10 +221,11 @@ class ExternalTableArnTest : public ::testing::TestWithParam<std::string> {
 
     ArrowFileSystemConfig write_config;
     ARROW_RETURN_NOT_OK(ArrowFileSystemConfig::create_file_system_config(write_props_, write_config));
-    auto storage_options = iceberg::ToStorageOptions(write_config);
+    ARROW_ASSIGN_OR_RAISE(auto storage_options, iceberg::ToWriterOptions(write_config));
 
-    auto table_info = iceberg::CreateTestTable(table_uri, num_rows, false, {}, storage_options);
-    auto file_infos = iceberg::PlanFiles(table_info.metadata_location, table_info.snapshot_id, storage_options);
+    ARROW_ASSIGN_OR_RAISE(auto table_info, iceberg::CreateTestTable(table_uri, num_rows, false, {}, storage_options));
+    ARROW_ASSIGN_OR_RAISE(auto file_infos, iceberg::PlanFiles(table_info.metadata_location, table_info.snapshot_id,
+                                                              write_fs_, iceberg::ToReaderOptions(write_config)));
     if (file_infos.empty()) {
       return arrow::Status::Invalid("PlanFiles returned no files");
     }
@@ -561,9 +562,10 @@ class ExternalTableGcpImpersonationTest : public ::testing::TestWithParam<std::s
 
     ArrowFileSystemConfig write_config;
     ARROW_RETURN_NOT_OK(ArrowFileSystemConfig::create_file_system_config(write_props_, write_config));
-    auto storage_options = iceberg::ToStorageOptions(write_config);
+    ARROW_ASSIGN_OR_RAISE(auto storage_options, iceberg::ToWriterOptions(write_config));
 
-    auto table_info = iceberg::CreateTestTable(table_uri, num_rows, false, {}, storage_options, "gs");
+    ARROW_ASSIGN_OR_RAISE(auto table_info,
+                          iceberg::CreateTestTable(table_uri, num_rows, false, {}, storage_options, "gs"));
 
     auto explore_dir = iceberg::ToMilvusUri(table_info.metadata_location, address_);
     auto milvus_path = iceberg::ToMilvusUri(table_info.data_file_uri, address_);
@@ -954,10 +956,11 @@ class ExternalTableAzureArnTest : public ::testing::TestWithParam<std::string> {
 
     ArrowFileSystemConfig write_config;
     ARROW_RETURN_NOT_OK(ArrowFileSystemConfig::create_file_system_config(write_props_, write_config));
-    auto storage_options = iceberg::ToStorageOptions(write_config);
+    ARROW_ASSIGN_OR_RAISE(auto storage_options, iceberg::ToWriterOptions(write_config));
 
-    auto table_info = iceberg::CreateTestTable(table_uri, num_rows, false, {}, storage_options);
-    auto file_infos = iceberg::PlanFiles(table_info.metadata_location, table_info.snapshot_id, storage_options);
+    ARROW_ASSIGN_OR_RAISE(auto table_info, iceberg::CreateTestTable(table_uri, num_rows, false, {}, storage_options));
+    ARROW_ASSIGN_OR_RAISE(auto file_infos, iceberg::PlanFiles(table_info.metadata_location, table_info.snapshot_id,
+                                                              write_fs_, iceberg::ToReaderOptions(write_config)));
     if (file_infos.empty()) {
       return arrow::Status::Invalid("PlanFiles returned no files");
     }
@@ -965,8 +968,8 @@ class ExternalTableAzureArnTest : public ::testing::TestWithParam<std::string> {
     auto milvus_path = iceberg::ToMilvusUri(file_infos[0].data_file_path, address_);
     api::ColumnGroupFile cg_file{milvus_path, 0, static_cast<int64_t>(file_infos[0].record_count), {}};
     std::cout << "[Azure ARN Test] Iceberg cgfile: " << cg_file.ToString() << std::endl;
-    // Match the Milvus external-source contract. The Rust Iceberg bridge must
-    // translate this alias to a fully-qualified ABFSS URI for OpenDAL.
+    // Match the Milvus external-source contract. The filesystem-backed
+    // Iceberg adapter accepts this alias and maps it to the bound container.
     ARROW_ASSIGN_OR_RAISE(auto explore_uri, StorageUri::Parse(table_info.metadata_location, false));
     explore_uri.scheme = "azure";
     explore_uri.address = address_;
@@ -1117,10 +1120,9 @@ TEST_P(ExternalTableAzureArnTest, CachedReadsFetchBrokeredSasOnce) {
     auto snapshot_id = std::to_string(result.iceberg_snapshot_id);
     api::SetValue(cache_read_props, PROPERTY_ICEBERG_SNAPSHOT_ID, snapshot_id.c_str());
 
-    auto storage_options = iceberg::ToStorageOptions(fs_config);
-    auto cache_key = storage_options.find("milvus_fs_cache_key");
-    ASSERT_NE(cache_key, storage_options.end());
-    ASSERT_EQ(cache_key->second, fs_config.GetCacheKey());
+    auto reader_options = iceberg::ToReaderOptions(fs_config);
+    EXPECT_EQ(reader_options, (std::unordered_map<std::string, std::string>{
+                                  {"milvus_fs_is_local", "false"}, {"milvus_fs_bucket", fs_config.bucket_name}}));
 
     ASSERT_AND_ASSIGN(auto* iceberg_format, Format::get(format));
     for (size_t iteration = 0; iteration < cache_hit_iterations; ++iteration) {
@@ -1154,11 +1156,9 @@ INSTANTIATE_TEST_SUITE_P(
 // Test data is written with explicit AKSK (cloud_provider=aliyun + AK/SK),
 // then read back using only the role_arn. This mirrors the AWS ARN test.
 //
-// Iceberg now works through the bridge-local `AliyunOssStorageFactory`
-// registered in `iceberg_bridgeimpl.rs::upstream_opendal_factory` — stock
-// iceberg-storage-opendal's `OssConfig` still drops `role_arn` /
-// `security_token` / `oidc-*`, which is why we route `oss://` to our own
-// `Storage` impl instead of `OpenDalStorageFactory::Oss`.
+// Iceberg planning now reads through the same cached C++ filesystem as the
+// other filesystem-backed formats. The role and credential refresh lifecycle
+// therefore remains owned by the C++ Aliyun filesystem provider.
 //
 // Required environment variables (all must be set; test is skipped otherwise):
 //
@@ -1331,10 +1331,11 @@ class ExternalTableAliyunArnTest : public ::testing::Test {
 
     ArrowFileSystemConfig write_config;
     ARROW_RETURN_NOT_OK(ArrowFileSystemConfig::create_file_system_config(write_props_, write_config));
-    auto storage_options = iceberg::ToStorageOptions(write_config);
+    ARROW_ASSIGN_OR_RAISE(auto storage_options, iceberg::ToWriterOptions(write_config));
 
-    auto table_info = iceberg::CreateTestTable(table_uri, num_rows, false, {}, storage_options);
-    auto file_infos = iceberg::PlanFiles(table_info.metadata_location, table_info.snapshot_id, storage_options);
+    ARROW_ASSIGN_OR_RAISE(auto table_info, iceberg::CreateTestTable(table_uri, num_rows, false, {}, storage_options));
+    ARROW_ASSIGN_OR_RAISE(auto file_infos, iceberg::PlanFiles(table_info.metadata_location, table_info.snapshot_id,
+                                                              write_fs_, iceberg::ToReaderOptions(write_config)));
     if (file_infos.empty()) {
       return arrow::Status::Invalid("PlanFiles returned no files");
     }
@@ -1941,10 +1942,11 @@ class ExternalTableAliyunOIDCArnTest : public ::testing::Test {
     auto table_uri = "oss://" + arn_bucket_ + "/" + path;
     ArrowFileSystemConfig write_config;
     ARROW_RETURN_NOT_OK(ArrowFileSystemConfig::create_file_system_config(write_props_, write_config));
-    auto storage_options = iceberg::ToStorageOptions(write_config);
+    ARROW_ASSIGN_OR_RAISE(auto storage_options, iceberg::ToWriterOptions(write_config));
 
-    auto table_info = iceberg::CreateTestTable(table_uri, num_rows, false, {}, storage_options);
-    auto file_infos = iceberg::PlanFiles(table_info.metadata_location, table_info.snapshot_id, storage_options);
+    ARROW_ASSIGN_OR_RAISE(auto table_info, iceberg::CreateTestTable(table_uri, num_rows, false, {}, storage_options));
+    ARROW_ASSIGN_OR_RAISE(auto file_infos, iceberg::PlanFiles(table_info.metadata_location, table_info.snapshot_id,
+                                                              write_fs_, iceberg::ToReaderOptions(write_config)));
     if (file_infos.empty()) {
       return arrow::Status::Invalid("PlanFiles returned no files");
     }
@@ -2219,7 +2221,7 @@ TEST_F(ExternalTableAliyunOIDCArnTest, ReadIcebergWithOIDCChain) {
   loon_properties_free(&loon_props);
 }
 
-TEST_F(ExternalTableAliyunOIDCArnTest, IcebergFactoryCacheHitDoesNotReloadOidcToken) {
+TEST_F(ExternalTableAliyunOIDCArnTest, IcebergFilesystemCacheHitDoesNotReloadOidcToken) {
   const uint64_t num_rows = 100;
   ASSERT_AND_ASSIGN(auto result, CreateIcebergTable(num_rows));
 
@@ -2229,10 +2231,9 @@ TEST_F(ExternalTableAliyunOIDCArnTest, IcebergFactoryCacheHitDoesNotReloadOidcTo
   api::SetValue(cache_read_props, PROPERTY_ICEBERG_SNAPSHOT_ID, std::to_string(result.iceberg_snapshot_id).c_str());
 
   ASSERT_AND_ASSIGN(auto fs_config, FilesystemCache::resolve_config(cache_read_props, result.explore_dir.c_str()));
-  auto storage_options = iceberg::ToStorageOptions(fs_config);
-  auto cache_key = storage_options.find("milvus_fs_cache_key");
-  ASSERT_NE(cache_key, storage_options.end());
-  ASSERT_EQ(cache_key->second, fs_config.GetCacheKey());
+  auto reader_options = iceberg::ToReaderOptions(fs_config);
+  EXPECT_EQ(reader_options, (std::unordered_map<std::string, std::string>{
+                                {"milvus_fs_is_local", "false"}, {"milvus_fs_bucket", fs_config.bucket_name}}));
 
   auto props = BaseProps();
   props.emplace_back("extfs.arn.session_name", session_name);
@@ -2282,9 +2283,9 @@ TEST_F(ExternalTableAliyunOIDCArnTest, IcebergFactoryCacheHitDoesNotReloadOidcTo
 
 // Parquet variant — the format that surfaced the original prod bug
 // (PlainFormat::explore goes through the C++ aws-sdk-cpp filesystem, i.e.
-// `AliyunOIDCAssumeRoleChainProvider`, NOT the Rust opendal path that
-// Lance/Iceberg take). A dedicated parquet test makes it impossible for a
-// future refactor to "fix Lance/Iceberg" while leaving the parquet path
+// `AliyunOIDCAssumeRoleChainProvider`, as do filesystem-backed Lance and
+// Iceberg planning reads. A dedicated parquet test makes it impossible for a
+// future refactor to fix table formats while leaving the parquet path
 // regressed.
 TEST_F(ExternalTableAliyunOIDCArnTest, ReadTwoParquetFilesWithOIDCChain) {
   const uint64_t num_files = 2;
@@ -2361,7 +2362,7 @@ TEST_F(ExternalTableAliyunOIDCArnTest, ReadTwoParquetFilesWithOIDCChain) {
 }
 
 // Vortex also uses the native C++ filesystem, so it must exercise the OIDC
-// chain independently of the Rust-backed Lance and Iceberg paths.
+// chain independently of the Lance and Iceberg adapters.
 TEST_F(ExternalTableAliyunOIDCArnTest, ReadVortexWithOIDCChain) {
   const uint64_t num_rows = 100;
 
