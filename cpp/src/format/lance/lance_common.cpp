@@ -40,7 +40,6 @@ StorageOptions ToReaderOptions(const ArrowFileSystemConfig& config) {
   return options;
 }
 
-#ifdef LANCE_BUILD_WITH_WRITER
 arrow::Result<StorageOptions> ToWriterOptions(const ArrowFileSystemConfig& config) {
   StorageOptions options;
   if (config.storage_type == "local") {
@@ -112,7 +111,6 @@ arrow::Result<StorageOptions> ToWriterOptions(const ArrowFileSystemConfig& confi
   }
   return arrow::Status::NotImplemented("Unsupported Lance native writer configuration for cloud provider: ", provider);
 }
-#endif
 
 //------------------------------------------------------------------------------
 // URI Parsing and Construction

@@ -28,11 +28,10 @@ namespace milvus_storage::lance {
 /// Authentication and credential refresh remain owned by the bound C++ filesystem.
 StorageOptions ToReaderOptions(const ArrowFileSystemConfig& config);
 
-#ifdef LANCE_BUILD_WITH_WRITER
+/// Test and benchmark only; production reads use ToReaderOptions with the bound C++ filesystem.
 /// Convert ArrowFileSystemConfig to native Lance writer options used by tests and benchmarks.
 /// Supports AK/SK and IAM credentials; GCP supports IAM only.
 arrow::Result<StorageOptions> ToWriterOptions(const ArrowFileSystemConfig& config);
-#endif
 
 /// Parse a Lance URI to extract the base path and fragment ID.
 /// URI format: {base_path}?fragment_id={fragment_id}
