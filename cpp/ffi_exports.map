@@ -172,6 +172,7 @@
     loon_filesystem_writer_close;
     loon_filesystem_writer_destroy;
     loon_filesystem_get_file_info;
+    loon_filesystem_get_object_info;
     loon_filesystem_read_file;
     loon_filesystem_open_reader;
     loon_filesystem_reader_readat;

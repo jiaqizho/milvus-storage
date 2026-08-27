@@ -408,6 +408,19 @@ TEST(LanceBridgeErrorTest, TranslatesDeferredRecordBatchReaderReadNextError) {
   EXPECT_NE(status.message().find("Injected fault"), std::string::npos);
 }
 
+TEST(LanceBridgeErrorTest, TranslatesDeferredRecordBatchReaderNotSupportedError) {
+  auto inner = std::make_shared<FailingLanceRecordBatchReader>(
+      arrow::Status::Invalid("__LOON_FFI_ERRCODE__=9; unsupported operation"));
+  auto reader = internal::WrapLanceRecordBatchReader(std::move(inner));
+
+  std::shared_ptr<arrow::RecordBatch> batch;
+  auto status = reader->ReadNext(&batch);
+
+  EXPECT_TRUE(status.IsNotImplemented()) << status.ToString();
+  EXPECT_EQ(status.message().find("__LOON_FFI_ERRCODE__="), std::string::npos);
+  EXPECT_NE(status.message().find("unsupported operation"), std::string::npos);
+}
+
 TEST(LanceBridgeErrorTest, TranslatesDeferredRecordBatchReaderCloseError) {
   auto inner = std::make_shared<FailingLanceRecordBatchReader>(
       arrow::Status::IOError("__LOON_FFI_ERRCODE__=108; Injected fault"));

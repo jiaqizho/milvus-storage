@@ -41,21 +41,6 @@ std::string JoinContextAndMessage(std::string_view context, std::string_view mes
   return result;
 }
 
-arrow::Status MakeExtendErrorWithContext(std::string_view context, const arrow::Status& status) {
-  auto detail = ExtendStatusDetail::UnwrapStatus(status);
-  auto full_message = JoinContextAndMessage(context, status.message());
-  return MakeExtendError(detail->code(), full_message, full_message);
-}
-
-arrow::Status MakeIOErrorWithContext(std::string_view context, const arrow::Status& status) {
-  auto result = arrow::Status::IOError(JoinContextAndMessage(context, status.message()));
-  const auto error_number = arrow::internal::ErrnoFromStatus(status);
-  if (error_number != 0) {
-    return result.WithDetail(arrow::internal::StatusDetailFromErrno(error_number));
-  }
-  return result;
-}
-
 }  // namespace
 
 arrow::Status MakeBridgeErrorStatus(std::string_view message) {
@@ -110,27 +95,18 @@ arrow::Status MakeBridgeErrorStatus(std::string_view message) {
 }
 
 arrow::Status MakeBridgeErrorStatus(std::string_view context, std::string_view message) {
-  return MakeBridgeErrorStatus(context, MakeBridgeErrorStatus(message));
+  auto status = MakeBridgeErrorStatus(message);
+  return status.WithMessage(JoinContextAndMessage(context, status.message()));
 }
 
 arrow::Status MakeBridgeErrorStatus(std::string_view context, const arrow::Status& status) {
   if (status.ok()) {
-    return arrow::Status::OK();
+    return status;
   }
-  if (ExtendStatusDetail::UnwrapStatus(status)) {
-    return MakeExtendErrorWithContext(context, status);
+  if (status.message().find(kFFIErrorCodeMarker) != std::string::npos) {
+    return MakeBridgeErrorStatus(context, status.message());
   }
-  if (arrow::internal::ErrnoFromStatus(status) != 0) {
-    return MakeIOErrorWithContext(context, status);
-  }
-  if (status.IsNotImplemented()) {
-    return arrow::Status::NotImplemented(JoinContextAndMessage(context, status.message()));
-  }
-  auto parsed_status = MakeBridgeErrorStatus(status.message());
-  if (ExtendStatusDetail::UnwrapStatus(parsed_status)) {
-    return MakeExtendErrorWithContext(context, parsed_status);
-  }
-  return MakeIOErrorWithContext(context, parsed_status);
+  return status.WithMessage(JoinContextAndMessage(context, status.message()));
 }
 
 }  // namespace milvus_storage

@@ -27,8 +27,16 @@ namespace milvus_storage {
 
 inline constexpr std::string_view kFFIErrorCodeMarker = "__LOON_FFI_ERRCODE__=";
 
+/// Converts a raw Rust/FFI error message to an Arrow status, using an embedded
+/// FFI error-code marker when present and falling back to IOError otherwise.
 arrow::Status MakeBridgeErrorStatus(std::string_view message);
+
+/// Converts a raw Rust/FFI error message to an Arrow status and prepends the
+/// supplied operation context while preserving the mapped status detail.
 arrow::Status MakeBridgeErrorStatus(std::string_view context, std::string_view message);
+
+/// Adds operation context to an Arrow status. Statuses carrying an FFI
+/// error-code marker are decoded; other statuses retain their code and detail.
 arrow::Status MakeBridgeErrorStatus(std::string_view context, const arrow::Status& status);
 
 using RustErrorMapper = arrow::Status (*)(std::string_view);
