@@ -1,0 +1,42 @@
+name: Python Nightly E2E
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+      timezone: Asia/Shanghai
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/nightly-python-e2e.yml'
+      - '.github/actions/setup-python-test/**'
+
+jobs:
+  e2e:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python test environment
+        uses: ./.github/actions/setup-python-test
+        with:
+          python-version: '3.11'
+
+      - name: Install integration and stress test dependencies
+        id: test-dependencies
+        run: uv pip install --python ./python/.venv/bin/python -r ./tests/requirements.txt
+
+      - name: Run integration tests
+        run: ./python/.venv/bin/python -m pytest -c tests/pytest.ini tests/integration/ -v --tb=short
+
+      - name: Run stress tests at 1% scale
+        if: ${{ !cancelled() && steps.test-dependencies.outcome == 'success' }}
+        run: ./python/.venv/bin/python -m pytest -c tests/pytest.ini tests/stress/ -v --tb=short --stress-scale=0.01
+
+      - name: Run stress tests at 10% scale
+        if: ${{ !cancelled() && steps.test-dependencies.outcome == 'success' }}
+        run: ./python/.venv/bin/python -m pytest -c tests/pytest.ini tests/stress/ -v --tb=short --stress-scale=0.1
+
+      - name: Run stress tests at 100% scale
+        if: ${{ !cancelled() && steps.test-dependencies.outcome == 'success' }}
+        run: ./python/.venv/bin/python -m pytest -c tests/pytest.ini tests/stress/ -v --tb=short --stress-scale=1.0

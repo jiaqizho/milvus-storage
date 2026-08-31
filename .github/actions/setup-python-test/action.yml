@@ -1,0 +1,146 @@
+name: Setup Python test environment
+description: Build the native library and install the Python package for tests
+
+inputs:
+  python-version:
+    description: Python version used by the test environment
+    required: false
+    default: '3.11'
+  conan-version:
+    description: Conan version used to build the native library
+    required: false
+    default: '2.25.1'
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python ${{ inputs.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v4
+
+    # libaio-dev: Conan 2.x CMakeDeps doesn't propagate system_libs through shared
+    # library targets, so libaio (required by folly) must be explicitly installed.
+    - name: Install C++ dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake libaio-dev
+        pip install conan==${{ inputs.conan-version }}
+
+    - name: Restore Conan packages
+      id: conan-cache
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.conan2
+        key: conan-cpp-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('./cpp/conanfile.py') }}
+        restore-keys: |
+          conan-cpp-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Setup Conan remote
+      shell: bash
+      run: |
+        conan profile detect --force
+        # Conan 2.x errors if the remote already exists, for example after restoring the cache.
+        conan remote add default-conan-local2 https://milvus01.jfrog.io/artifactory/api/conan/default-conan-local2 || true
+        conan remote list
+
+    - name: Setup Rust
+      id: rust-toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Restore Rust build cache
+      id: rust-cache
+      uses: actions/cache/restore@v4
+      with:
+        path: cpp/build/Release/cargo/build
+        key: storage-bridge-rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('cpp/src/format/bridge/rust/Cargo.lock', 'cpp/src/format/bridge/rust/Cargo.toml') }}
+        restore-keys: |
+          storage-bridge-rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust-toolchain.outputs.cachekey }}-
+
+    - name: Build C++ library for Python
+      shell: bash
+      working-directory: ./cpp
+      run: make python-lib
+
+    - name: Save Conan packages
+      if: github.ref == 'refs/heads/main' && steps.conan-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      continue-on-error: true
+      with:
+        path: ~/.conan2
+        key: ${{ steps.conan-cache.outputs.cache-primary-key }}
+
+    - name: Save Rust build cache
+      if: github.ref == 'refs/heads/main' && steps.rust-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      continue-on-error: true
+      with:
+        path: cpp/build/Release/cargo/build
+        key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+
+    - name: Set library path
+      shell: bash
+      run: |
+        BUILD_DIR="$GITHUB_WORKSPACE/cpp/build/Release"
+        BUILD_LIB_DIR="$BUILD_DIR/libs"
+
+        # Use the dependency libraries copied for this build. Scanning the
+        # whole Conan cache can put stale/incompatible libraries before the
+        # ones that match libmilvus-storage.so.
+        echo "LD_LIBRARY_PATH=$BUILD_LIB_DIR:$BUILD_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
+        # Preload the liblzma copied for this build to override system liblzma.
+        BUILD_LZMA=$(find "$BUILD_LIB_DIR" -name "liblzma.so*" -type f 2>/dev/null | sort | head -n 1)
+        PRELOAD_LIBS=""
+
+        if [ -n "$BUILD_LZMA" ]; then
+          echo "Found build liblzma at: $BUILD_LZMA"
+          echo "Checking symbol in $BUILD_LZMA:"
+          nm -D "$BUILD_LZMA" | grep lzma_index_uncompressed_size || echo "Symbol NOT FOUND in build lib"
+          PRELOAD_LIBS="$BUILD_LZMA"
+        else
+          echo "WARNING: build liblzma.so* not found! Verify xz_utils:shared=True"
+        fi
+
+        echo "Checking system liblzma symbol:"
+        nm -D /usr/lib/x86_64-linux-gnu/liblzma.so.5 2>/dev/null | grep lzma_index_uncompressed_size || echo "Symbol NOT FOUND in system lib"
+
+        # Preload libaio: folly (shared) uses io_submit but doesn't have libaio in DT_NEEDED.
+        LIBAIO=$(find /usr/lib -name "libaio.so*" 2>/dev/null | head -n 1)
+        if [ -n "$LIBAIO" ]; then
+          echo "Found libaio at: $LIBAIO"
+          PRELOAD_LIBS="${PRELOAD_LIBS:+$PRELOAD_LIBS:}$LIBAIO"
+        else
+          echo "WARNING: libaio.so not found!"
+        fi
+
+        if [ -n "$PRELOAD_LIBS" ]; then
+          echo "LD_PRELOAD=$PRELOAD_LIBS" >> "$GITHUB_ENV"
+        fi
+
+        echo "Configured LD_LIBRARY_PATH and LD_PRELOAD for runtime"
+
+    - name: Install Python package
+      shell: bash
+      working-directory: ./python
+      run: make install
+
+    - name: Verify library dependencies
+      shell: bash
+      run: |
+        set -o pipefail
+
+        echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
+        echo "libmilvus-storage dependency resolution:"
+        ldd -r cpp/build/Release/libmilvus-storage.so 2>&1 | tee /tmp/libmilvus-storage.ldd
+        if grep -q "not found\|undefined symbol" /tmp/libmilvus-storage.ldd; then
+          echo "Runtime dependency resolution failed"
+          exit 1
+        fi
+        ldconfig -p | grep lzma || echo "liblzma not in ldconfig, checking file system..."
+        ls -la /usr/lib/x86_64-linux-gnu/liblzma* || true
+        find cpp/build/Release/libs -name "libglog.so*" -exec ldd {} \; 2>/dev/null | head -20 || true

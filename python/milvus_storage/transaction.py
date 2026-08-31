@@ -185,44 +185,13 @@ class Transaction:
         if self._committed:
             raise ResourceError("Transaction is already committed")
 
-        # Build C structure
-        c_cg = self._ffi.new("LoonColumnGroup*")
-
-        # Columns
-        columns_c = [self._ffi.new("char[]", c.encode("utf-8")) for c in column_group.columns]
-        columns_array = self._ffi.new("char*[]", columns_c)
-        c_cg.columns = self._ffi.cast("const char**", columns_array)
-        c_cg.num_of_columns = len(column_group.columns)
-
-        # Format
-        format_c = self._ffi.new("char[]", column_group.format.encode("utf-8"))
-        c_cg.format = format_c
-
-        # Files
-        if column_group.files:
-            c_files = self._ffi.new("LoonColumnGroupFile[]", len(column_group.files))
-            path_buffers = []
-            for i, f in enumerate(column_group.files):
-                path_c = self._ffi.new("char[]", f.path.encode("utf-8"))
-                path_buffers.append(path_c)
-                c_files[i].path = path_c
-                c_files[i].start_index = f.start_index
-                c_files[i].end_index = f.end_index
-                if f.metadata:
-                    meta_c = self._ffi.new("uint8_t[]", f.metadata)
-                    c_files[i].metadata = meta_c
-                    c_files[i].metadata_size = len(f.metadata)
-                else:
-                    c_files[i].metadata = self._ffi.NULL
-                    c_files[i].metadata_size = 0
-            c_cg.files = c_files
-            c_cg.num_of_files = len(column_group.files)
-        else:
-            c_cg.files = self._ffi.NULL
-            c_cg.num_of_files = 0
-
-        result = self._lib.loon_transaction_add_column_group(self._handle, c_cg)
-        check_result(result)
+        # Reuse the canonical Python-to-C conversion so this path stays in sync
+        # with changes to LoonColumnGroupFile's properties-based ABI.
+        with ColumnGroups.from_list([column_group]) as column_groups:
+            result = self._lib.loon_transaction_add_column_group(
+                self._handle, column_groups._get_c_ptr().column_group_array
+            )
+            check_result(result)
 
     def append_files(self, column_groups: ColumnGroups) -> None:
         """
