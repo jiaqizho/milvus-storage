@@ -375,6 +375,11 @@ class TestRecovery:
             rows=500,
         )
 
+        if fault_key == "FS_OPEN_INPUT_FAIL":
+            # Drop cached file-size/footer properties so the reader exercises
+            # the path-based cold-open operation guarded by this fault point.
+            cg = ColumnGroups.from_list(cg.to_list())
+
         require_fiu.enable(_get_fiu_key(fault_key), one_time=True)
 
         with pytest.raises(Exception):
