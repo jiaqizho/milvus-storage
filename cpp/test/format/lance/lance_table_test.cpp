@@ -50,6 +50,7 @@
 #include "milvus-storage/common/lrucache.h"
 #include "milvus-storage/common/constants.h"
 #include "milvus-storage/filesystem/fs.h"
+#include "milvus-storage/format/format_reader_cache.h"
 #include "milvus-storage/format/lance/lance_table_writer.h"
 #include "milvus-storage/format/lance/lance_table_reader.h"
 #include "milvus-storage/format/lance/lance_common.h"
@@ -296,6 +297,179 @@ TEST_F(LanceBasicTest, DefaultStorageVersionIsV2_1) {
   ASSERT_AND_ASSIGN(auto storage_version, ReadLanceDataFileVersion());
   ASSERT_EQ(storage_version.major, 2);
   ASSERT_EQ(storage_version.minor, 1);
+}
+
+TEST_F(LanceBasicTest, InvalidUriCacheKeyDoesNotCollideWithBaseUri) {
+  api::ColumnGroupFile invalid_file{.path = base_path_, .start_index = 0, .end_index = 1};
+  auto valid_file = invalid_file;
+  valid_file.path = MakeLanceUri(base_path_, 0);
+
+  EXPECT_NE(LanceTableReader::MetaTrait::cache_key(invalid_file), LanceTableReader::MetaTrait::cache_key(valid_file));
+}
+
+TEST_F(LanceBasicTest, DifferentFragmentsShareDatasetMetadata) {
+  if (IsCloudEnv()) {
+    GTEST_SKIP() << "Focused metadata-cache reproduction uses the local Lance fixture.";
+  }
+
+  LanceTableWriter first_writer(base_path_, schema_, properties_);
+  ASSERT_STATUS_OK(first_writer.Write(test_batch_));
+  ASSERT_AND_ASSIGN(auto first_file, first_writer.Close());
+
+  LanceTableWriter second_writer(base_path_, schema_, properties_);
+  ASSERT_STATUS_OK(second_writer.Write(test_batch_));
+  ASSERT_AND_ASSIGN(auto second_file, second_writer.Close());
+  ASSERT_NE(first_file.path, second_file.path);
+
+  const std::vector<api::ColumnGroupFile> files = {std::move(first_file), std::move(second_file)};
+  auto cache = FormatReaderMetadataCache<LanceTableReader>::Make();
+  size_t metadata_load_count = 0;
+  std::vector<LanceTableReader::MetaTrait::MetadataPtr> loaded_metadata;
+  std::vector<std::shared_ptr<LanceTableReader>> readers;
+  loaded_metadata.reserve(files.size());
+  readers.reserve(files.size());
+
+  ASSERT_EQ(LanceTableReader::MetaTrait::cache_key(files[0]), LanceTableReader::MetaTrait::cache_key(files[1]));
+
+  for (size_t i = 0; i < files.size(); ++i) {
+    const auto key = LanceTableReader::MetaTrait::cache_key(files[i]);
+    std::cout << "[ LANCE_METADATA_CACHE_KEY ] key=" << key << std::endl;
+    ASSERT_AND_ASSIGN(
+        auto metadata, cache->get_or_open(key, [&]() -> arrow::Result<LanceTableReader::MetaTrait::MetadataPtr> {
+          ++metadata_load_count;
+          std::cout << "[ LANCE_METADATA_CACHE_MISS ] key=" << key << std::endl;
+          return LanceTableReader::MetaTrait::load_metadata(files[i], properties_, nullptr /* key_retriever */);
+        }));
+    ASSERT_AND_ASSIGN(auto parsed_uri, ParseLanceUri(files[i].path));
+    std::cout << "[ LANCE_DATASET ] fragment_id=" << parsed_uri.second
+              << ", dataset=" << metadata->payload.dataset.get() << std::endl;
+    ASSERT_AND_ASSIGN(auto reader, LanceTableReader::MetaTrait::create_from_metadata(metadata, files[i], schema_,
+                                                                                     std::vector<std::string>{}, ""));
+    ASSERT_AND_ASSIGN(auto row_group_infos, reader->get_row_group_infos());
+    ASSERT_FALSE(row_group_infos.empty());
+    loaded_metadata.emplace_back(metadata);
+    readers.emplace_back(std::move(reader));
+  }
+
+  ASSERT_EQ(loaded_metadata.size(), 2);
+  EXPECT_EQ(metadata_load_count, 1);
+  EXPECT_EQ(loaded_metadata[0].get(), loaded_metadata[1].get());
+  EXPECT_EQ(loaded_metadata[0]->payload.dataset.get(), loaded_metadata[1]->payload.dataset.get());
+  EXPECT_TRUE(loaded_metadata[0]->row_group_infos.empty());
+  EXPECT_NE(readers[0].get(), readers[1].get());
+
+  std::weak_ptr<BlockingDataset> weak_dataset = loaded_metadata[0]->payload.dataset;
+  readers.clear();
+  loaded_metadata.clear();
+  cache.reset();
+  EXPECT_TRUE(weak_dataset.expired());
+}
+
+TEST_F(LanceBasicTest, DifferentBaseUrisDoNotShareDataset) {
+  if (IsCloudEnv()) {
+    GTEST_SKIP() << "Focused dataset-cache test uses the local Lance fixture.";
+  }
+
+  LanceTableWriter first_writer(base_path_ + "/first", schema_, properties_);
+  ASSERT_STATUS_OK(first_writer.Write(test_batch_));
+  ASSERT_AND_ASSIGN(auto first_file, first_writer.Close());
+
+  LanceTableWriter second_writer(base_path_ + "/second", schema_, properties_);
+  ASSERT_STATUS_OK(second_writer.Write(test_batch_));
+  ASSERT_AND_ASSIGN(auto second_file, second_writer.Close());
+
+  ASSERT_AND_ASSIGN(auto first_uri, ParseLanceUri(first_file.path));
+  ASSERT_AND_ASSIGN(auto second_uri, ParseLanceUri(second_file.path));
+  ASSERT_NE(first_uri.first, second_uri.first);
+
+  ASSERT_AND_ASSIGN(auto first_metadata,
+                    LanceTableReader::MetaTrait::load_metadata(first_file, properties_, nullptr /* key_retriever */));
+  ASSERT_AND_ASSIGN(auto second_metadata,
+                    LanceTableReader::MetaTrait::load_metadata(second_file, properties_, nullptr /* key_retriever */));
+  EXPECT_NE(first_metadata->payload.dataset.get(), second_metadata->payload.dataset.get());
+}
+
+TEST_F(LanceBasicTest, SeparateTopLevelReaderCachesDoNotShareDataset) {
+  if (IsCloudEnv()) {
+    GTEST_SKIP() << "Focused dataset-cache test uses the local Lance fixture.";
+  }
+
+  LanceTableWriter first_writer(base_path_, schema_, properties_);
+  ASSERT_STATUS_OK(first_writer.Write(test_batch_));
+  ASSERT_AND_ASSIGN(auto first_file, first_writer.Close());
+  const auto key = LanceTableReader::MetaTrait::cache_key(first_file);
+
+  // ReaderImpl owns one MetadataCache. Independent handles here model two
+  // top-level readers with independent Dataset metadata.
+  MetadataCache first_reader_cache;
+  ASSERT_AND_ASSIGN(auto first_metadata, first_reader_cache.get<LanceTableReader>()->get_or_open(key, [&]() {
+    return LanceTableReader::MetaTrait::load_metadata(first_file, properties_, nullptr /* key_retriever */);
+  }));
+
+  LanceTableWriter second_writer(base_path_, schema_, properties_);
+  ASSERT_STATUS_OK(second_writer.Write(test_batch_));
+  ASSERT_AND_ASSIGN(auto second_file, second_writer.Close());
+  ASSERT_EQ(key, LanceTableReader::MetaTrait::cache_key(second_file));
+
+  ASSERT_AND_ASSIGN(auto first_metadata_again, first_reader_cache.get<LanceTableReader>()->get_or_open(key, [&]() {
+    return LanceTableReader::MetaTrait::load_metadata(second_file, properties_, nullptr /* key_retriever */);
+  }));
+  ASSERT_EQ(first_metadata.get(), first_metadata_again.get());
+  auto stale_fragment_result = LanceTableReader::MetaTrait::create_from_metadata(
+      first_metadata_again, second_file, schema_, std::vector<std::string>{}, "");
+  EXPECT_FALSE(stale_fragment_result.ok());
+
+  MetadataCache second_reader_cache;
+  ASSERT_AND_ASSIGN(auto second_metadata, second_reader_cache.get<LanceTableReader>()->get_or_open(key, [&]() {
+    return LanceTableReader::MetaTrait::load_metadata(second_file, properties_, nullptr /* key_retriever */);
+  }));
+  ASSERT_AND_ASSIGN(auto second_reader, LanceTableReader::MetaTrait::create_from_metadata(
+                                            second_metadata, second_file, schema_, std::vector<std::string>{}, ""));
+
+  EXPECT_NE(first_metadata->payload.dataset.get(), second_metadata->payload.dataset.get());
+}
+
+TEST_F(LanceBasicTest, SameFragmentMetadataIsReusedWithinReaderCache) {
+  if (IsCloudEnv()) {
+    GTEST_SKIP() << "Focused metadata-cache test uses the local Lance fixture.";
+  }
+
+  LanceTableWriter writer(base_path_, schema_, properties_);
+  ASSERT_STATUS_OK(writer.Write(test_batch_));
+  ASSERT_AND_ASSIGN(auto file, writer.Close());
+
+  MetadataCache reader_cache;
+  auto cache = reader_cache.get<LanceTableReader>();
+  const auto key = LanceTableReader::MetaTrait::cache_key(file);
+  size_t metadata_load_count = 0;
+  auto load_metadata = [&]() -> arrow::Result<LanceTableReader::MetaTrait::MetadataPtr> {
+    ++metadata_load_count;
+    return LanceTableReader::MetaTrait::load_metadata(file, properties_, nullptr /* key_retriever */);
+  };
+
+  ASSERT_AND_ASSIGN(auto first_metadata, cache->get_or_open(key, load_metadata));
+  ASSERT_AND_ASSIGN(auto second_metadata, cache->get_or_open(key, load_metadata));
+  EXPECT_EQ(metadata_load_count, 1);
+  EXPECT_EQ(first_metadata.get(), second_metadata.get());
+
+#ifdef BUILD_WITH_FIU
+  // The fragment metadata was loaded before enabling this fault. Reconstructing
+  // readers from the same metadata must hit the inner cache without estimating
+  // fragment memory again.
+  ScopedFiuFault fault(FIUKEY_MEMORY_SIZE_ESTIMATION_FAIL, /*one_time=*/false);
+  ASSERT_EQ(fault.enable_result(), 0);
+#endif
+
+  ASSERT_AND_ASSIGN(auto first_reader, LanceTableReader::MetaTrait::create_from_metadata(
+                                           first_metadata, file, schema_, std::vector<std::string>{}, ""));
+  ASSERT_AND_ASSIGN(auto second_reader, LanceTableReader::MetaTrait::create_from_metadata(
+                                            second_metadata, file, schema_, std::vector<std::string>{}, ""));
+  EXPECT_NE(first_reader.get(), second_reader.get());
+
+  ASSERT_AND_ASSIGN(auto first_memory_sizes, first_reader->get_rg_column_memsz(0));
+  ASSERT_AND_ASSIGN(auto second_memory_sizes, second_reader->get_rg_column_memsz(0));
+  EXPECT_FALSE(first_memory_sizes.empty());
+  EXPECT_EQ(first_memory_sizes, second_memory_sizes);
 }
 
 TEST_F(LanceBasicTest, TestBasic) {
@@ -615,10 +789,11 @@ TEST_F(LanceBasicTest, MemorySizeEstimationFailureDoesNotBlockOpen) {
     ASSERT_AND_ASSIGN(metadata,
                       LanceTableReader::MetaTrait::load_metadata(cgfile, properties_, nullptr /* key_retriever */));
   }
-  assert_memory_size_unavailable(metadata->row_group_infos);
 
   ASSERT_AND_ASSIGN(auto cached_reader, LanceTableReader::MetaTrait::create_from_metadata(
                                             metadata, cgfile, schema_, std::vector<std::string>{}, ""));
+  ASSERT_AND_ASSIGN(auto cached_row_group_infos, cached_reader->get_row_group_infos());
+  assert_memory_size_unavailable(cached_row_group_infos);
   EXPECT_TRUE(cached_reader->get_rg_column_memsz(0).status().IsNotImplemented());
   ASSERT_AND_ASSIGN(auto chunk, cached_reader->get_chunk(0));
   EXPECT_GT(chunk->num_rows(), 0);
@@ -723,14 +898,10 @@ TEST_F(LanceBasicTest, CachedCreateReaderReappliesProjection) {
                                         id_metadata, cgfile, nullptr /* read_schema */, {"id"}, ""));
   ASSERT_AND_ASSIGN(auto id_rgs, id_reader->get_row_group_infos());
   ASSERT_FALSE(id_rgs.empty());
-  ASSERT_EQ(id_rgs.size(), metadata->row_group_infos.size());
-  ASSERT_NE(metadata->payload.column_memory_weights, nullptr);
   for (size_t rg_idx = 0; rg_idx < id_rgs.size(); ++rg_idx) {
-    ASSERT_EQ(id_rgs[rg_idx].memory_size, metadata->row_group_infos[rg_idx].memory_size);
-    ASSERT_AND_ASSIGN(auto expected_memory_sizes, DistributeMemorySizes(metadata->row_group_infos[rg_idx].memory_size,
-                                                                        *metadata->payload.column_memory_weights));
     ASSERT_AND_ASSIGN(auto memory_sizes, id_reader->get_rg_column_memsz(rg_idx));
-    ASSERT_EQ(memory_sizes, expected_memory_sizes);
+    ASSERT_EQ(memory_sizes.size(), static_cast<size_t>(schema_->num_fields()));
+    ASSERT_EQ(std::accumulate(memory_sizes.begin(), memory_sizes.end(), uint64_t{0}), id_rgs[rg_idx].memory_size);
   }
   ASSERT_AND_ASSIGN(auto id_chunk, id_reader->get_chunk(0));
   ASSERT_EQ(id_chunk->num_columns(), 1);

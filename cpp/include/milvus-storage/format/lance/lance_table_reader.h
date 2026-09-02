@@ -41,15 +41,17 @@ class LanceTableReader final : public FormatReader, public std::enable_shared_fr
                    const std::vector<std::string>& needed_columns = {});
 
   struct MetaTrait {
+    // One outer Metadata entry represents a Lance Dataset and is keyed by its
+    // base URI. Fragment-specific immutable metadata is cached inside Payload.
+    struct FragmentMetadata;
+    class FragmentMetadataCache;
+
     struct Payload {
       std::string base_uri;
-      uint64_t fragment_id = 0;
       std::shared_ptr<BlockingDataset> dataset;
-      uint64_t logical_row_count = 0;
-      uint64_t physical_row_count = 0;
-      uint64_t num_deletions = 0;
-      uint64_t logical_chunk_rows = 0;
-      std::shared_ptr<const std::vector<uint64_t>> column_memory_weights;
+      // BlockingFragmentReader is intentionally not cached here because it is
+      // projection-specific and stateful.
+      std::shared_ptr<FragmentMetadataCache> fragment_metadata_cache;
       milvus_storage::api::Properties properties;
     };
 
