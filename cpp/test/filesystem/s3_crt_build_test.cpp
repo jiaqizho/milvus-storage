@@ -720,12 +720,20 @@ TEST(S3CrtBuildSupportTest, InFlightNativeReadCompletesDuringFinalizeS3) {
             boost::beast::http::status::partial_content, request.version()};
         response.set(boost::beast::http::field::content_range, "bytes 2-5/9");
         response.set(boost::beast::http::field::accept_ranges, "bytes");
-        response.set(boost::beast::http::field::etag, "\"s3-crt-finalize-test\"");
+        response.set(boost::beast::http::field::etag, "\"8aa99b1f439ff71293e95357bac6fd94\"");
         response.keep_alive(false);
         response.body() = "cdef";
         response.prepare_payload();
         boost::beast::http::write(*socket, response, error);
-        RecordError(error);
+        if (RecordError(error)) {
+          return;
+        }
+
+        // keep_alive(false) advertises that the server will close the connection,
+        // but Beast does not close the socket after write(). Honor the mock response
+        // contract without depending on server destruction.
+        socket->shutdown(Tcp::socket::shutdown_send, error);
+        socket->close(error);
       }
 
       boost::asio::io_context io_context_;
