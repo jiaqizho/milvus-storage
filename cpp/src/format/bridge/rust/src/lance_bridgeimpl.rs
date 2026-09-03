@@ -312,8 +312,8 @@ impl BlockingDataset {
         Ok(versions)
     }
 
-    pub fn version(&self) -> Result<Version> {
-        Ok(self.inner.version())
+    pub fn version(&self) -> u64 {
+        self.inner.version().version
     }
 
     pub fn checkout_version(&mut self, version: u64) -> Result<Self> {
@@ -657,6 +657,7 @@ pub fn open_dataset(
     uri: &str,
     storage_options_keys: Vec<String>,
     storage_options_values: Vec<String>,
+    version: u64,
 ) -> Result<Box<BlockingDataset>> {
     let mut storage_options = vec_to_hashmap(storage_options_keys, storage_options_values);
     let lance_io_parallelism = extract_lance_io_parallelism(&mut storage_options)?;
@@ -679,6 +680,9 @@ pub fn open_dataset(
     let mut builder = DatasetBuilder::from_uri(uri).with_read_params(read_params);
     if let Some(session) = custom_session {
         builder = builder.with_session(session);
+    }
+    if version != 0 {
+        builder = builder.with_version(version);
     }
     let inner = TOKIO_RT.block_on(builder.load())?;
     let dataset = BlockingDataset::new(inner)?;
@@ -706,6 +710,31 @@ pub fn open_dataset(
             .expect("a newly opened BlockingDataset has no scan scheduler");
     }
     Ok(Box::new(dataset))
+}
+
+pub fn resolve_latest_dataset_version(
+    uri: &str,
+    storage_options_keys: Vec<String>,
+    storage_options_values: Vec<String>,
+) -> Result<u64> {
+    let mut storage_options = vec_to_hashmap(storage_options_keys, storage_options_values);
+    extract_lance_io_parallelism(&mut storage_options)?;
+    let (store_params, custom_session) = build_object_store_params(uri, storage_options)?;
+    let read_params = ReadParams {
+        index_cache_size_bytes: 0,
+        metadata_cache_size_bytes: 0,
+        store_options: Some(store_params),
+        ..Default::default()
+    };
+    let mut builder = DatasetBuilder::from_uri(uri).with_read_params(read_params);
+    if let Some(session) = custom_session {
+        builder = builder.with_session(session);
+    }
+    let (object_store, base_path, commit_handler) =
+        TOKIO_RT.block_on(builder.build_object_store())?;
+    let location = TOKIO_RT
+        .block_on(commit_handler.resolve_latest_location(&base_path, object_store.as_ref()))?;
+    Ok(location.version)
 }
 
 pub unsafe fn write_dataset(
