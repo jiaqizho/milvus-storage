@@ -16,13 +16,25 @@ namespace {
 void BM_StorageTracing(benchmark::State& state) {
   namespace sdk = opentelemetry::sdk::trace;
   const auto mode = state.range(0);
-  SetTracerProvider(nullptr);
+  {
+    const auto configured = SetTracerProvider(nullptr);
+    if (!configured.ok()) {
+      state.SkipWithError(configured.message().c_str());
+      return;
+    }
+  }
   if (mode >= 2) {
     auto exporter = std::make_unique<opentelemetry::exporter::memory::InMemorySpanExporter>(1);
     auto processor = std::make_unique<sdk::SimpleSpanProcessor>(std::move(exporter));
     auto sampler = std::make_unique<sdk::ParentBasedSampler>(std::make_unique<sdk::AlwaysOnSampler>());
-    SetTracerProvider(ProviderPtr(new sdk::TracerProvider(
-        std::move(processor), opentelemetry::sdk::resource::Resource::Create({}), std::move(sampler))));
+    {
+      const auto configured = SetTracerProvider(ProviderPtr(new sdk::TracerProvider(
+          std::move(processor), opentelemetry::sdk::resource::Resource::Create({}), std::move(sampler))));
+      if (!configured.ok()) {
+        state.SkipWithError(configured.message().c_str());
+        return;
+      }
+    }
   }
   TraceParent parent;
   parent.trace_id[0] = 1;
@@ -43,7 +55,13 @@ void BM_StorageTracing(benchmark::State& state) {
       iteration();
     }
   }
-  SetTracerProvider(nullptr);
+  {
+    const auto configured = SetTracerProvider(nullptr);
+    if (!configured.ok()) {
+      state.SkipWithError(configured.message().c_str());
+      return;
+    }
+  }
 }
 BENCHMARK(BM_StorageTracing)->DenseRange(0, 3)->UseRealTime();
 }  // namespace

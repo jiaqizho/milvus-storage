@@ -18,6 +18,7 @@
 #include <opentelemetry/sdk/trace/samplers/parent.h>
 #include <opentelemetry/sdk/trace/samplers/always_on.h>
 #include "milvus-storage/tracing.h"
+#include "milvus-storage/common/fiu_local.h"
 #include "tracing_bridge.h"
 #include "milvus-storage/reader.h"
 #include "milvus-storage/writer.h"
@@ -63,10 +64,10 @@ ProviderPtr Provider(std::shared_ptr<Memory>& data, bool parent_based = false) {
 }
 class StorageTracingTest : public testing::Test {
   protected:
-  void SetUp() override { SetTracerProvider(Provider(data)); }
+  void SetUp() override { ASSERT_STATUS_OK(SetTracerProvider(Provider(data))); }
   void TearDown() override {
-    SetTracerProvider(nullptr);
-    SetTraceOptions({});
+    ASSERT_STATUS_OK(SetTracerProvider(nullptr));
+    ASSERT_STATUS_OK(SetTraceOptions({}));
   }
   std::shared_ptr<Memory> data;
 };
@@ -82,6 +83,129 @@ class ControlledFile final : public arrow::io::BufferReader, public NonBlockingR
   arrow::Future<int64_t> ReadAtAsyncInto(int64_t, int64_t, uint8_t*) override { return pending; }
   arrow::Future<int64_t> GetSizeAsync() override { return arrow::Future<int64_t>::MakeFinished(4); }
 };
+// Verify the tracing boundary itself. libc++ does not declare the implicit
+// const-char* -> string_view conversion noexcept, even though it does not allocate.
+static_assert(std::is_nothrow_constructible_v<TraceScope, opentelemetry::nostd::string_view>);
+static_assert(std::is_nothrow_destructible_v<TraceScope>);
+static_assert(noexcept(TraceScope::Deferred(std::declval<opentelemetry::nostd::string_view>())));
+static_assert(noexcept(AttachContext(ContextPtr{})));
+static_assert(noexcept(AttachParent(std::declval<const TraceParent&>())));
+static_assert(noexcept(Capture()));
+static_assert(noexcept(SetTracerProvider(ProviderPtr{})));
+static_assert(noexcept(SetTraceOptions(std::declval<const TraceOptions&>())));
+static_assert(noexcept(Bind([]() noexcept {})()));
+static_assert(noexcept(HasContext()));
+static_assert(noexcept(StartCurrent()));
+static_assert(noexcept(EnsureStarted(std::declval<const SpanPtr&>(), std::declval<const ContextPtr&>())));
+static_assert(noexcept(EndSpan(std::declval<const SpanPtr&>(), std::declval<const ContextPtr&>())));
+// Passing an existing error status must not copy/allocate before API entry.
+static_assert(noexcept(
+    EndSpan(std::declval<const SpanPtr&>(), std::declval<const ContextPtr&>(), std::declval<const arrow::Status&>())));
+static_assert(
+    noexcept(EndSpan(std::declval<const SpanPtr&>(), std::declval<const ContextPtr&>(), ot::StatusCode::kError)));
+static_assert(noexcept(std::declval<TraceScope&>().Finish(std::declval<const arrow::Status&>())));
+static_assert(noexcept(SetAttribute(std::declval<const SpanPtr&>(),
+                                    std::declval<const ContextPtr&>(),
+                                    std::declval<opentelemetry::nostd::string_view>(),
+                                    std::declval<const opentelemetry::common::AttributeValue&>())));
+static_assert(noexcept(GetSpanContext(std::declval<const ContextPtr&>())));
+
+#ifdef BUILD_WITH_FIU
+TEST_F(StorageTracingTest, FailedScopeDoesNotEscapeOrReplaceBusinessResult) {
+  auto parent = AttachParent(Parent(1));
+  auto before = Capture();
+  const auto business_error = arrow::Status::Invalid("original business error");
+  {
+    ScopedFiuFault fault(FIUKEY_TRACING_SCOPE_FAIL);
+    ASSERT_EQ(fault.enable_result(), 0);
+    auto business_call = [&]() -> arrow::Status {
+      TraceScope scope("failed");
+      EXPECT_FALSE(scope.span());
+      EXPECT_FALSE(Capture());
+      EXPECT_TRUE(Work("not_misattributed").ok());
+      return business_error;
+    };
+    EXPECT_EQ(business_call(), business_error);
+  }
+  EXPECT_EQ(Capture(), before);
+  EXPECT_TRUE(data->GetSpans().empty());
+  EXPECT_TRUE(Work("after_failure").ok());
+  ASSERT_EQ(data->GetSpans().size(), 1);
+}
+
+TEST_F(StorageTracingTest, FailedAttachmentMasksForeignParentAndRestoresOtherRequestData) {
+  struct OtherData : folly::RequestData {
+    bool hasCallback() override { return false; }
+  };
+  auto outer = AttachParent(Parent(1));
+  const auto before = Capture();
+  const folly::RequestToken key("tracing-failure.other-data");
+  auto other = std::make_unique<OtherData>();
+  const auto* expected = other.get();
+  folly::RequestContext::get()->setContextData(key, std::move(other));
+  {
+    ScopedFiuFault fault(FIUKEY_TRACING_CONTEXT_ATTACH_FAIL);
+    ASSERT_EQ(fault.enable_result(), 0);
+    auto failed = AttachParent(Parent(2));
+    EXPECT_FALSE(Capture());
+    EXPECT_FALSE(HasContext());
+    EXPECT_EQ(folly::RequestContext::get()->getContextData(key), expected);
+    EXPECT_TRUE(Work("not_under_foreign_parent").ok());
+  }
+  EXPECT_EQ(Capture(), before);
+  EXPECT_EQ(folly::RequestContext::get()->getContextData(key), expected);
+  EXPECT_TRUE(data->GetSpans().empty());
+  EXPECT_TRUE(Work("restored").ok());
+  auto spans = data->GetSpans();
+  ASSERT_EQ(spans.size(), 1);
+  EXPECT_EQ(spans[0]->GetTraceId(), ExpectedTrace(1));
+}
+
+TEST_F(StorageTracingTest, EmptyAttachmentStillMasksWhenAnotherFailedScopeFinishes) {
+  auto outer = AttachParent(Parent(1));
+  const auto before = Capture();
+  ScopedFiuFault fault(FIUKEY_TRACING_SCOPE_FAIL);
+  ASSERT_EQ(fault.enable_result(), 0);
+  TraceScope failed("failed");
+  EXPECT_FALSE(Capture());
+  {
+    auto empty = AttachContext(nullptr);
+    failed.Finish();
+    EXPECT_FALSE(Capture());
+    EXPECT_FALSE(HasContext());
+    EXPECT_TRUE(Work("masked_after_recovery").ok());
+  }
+  EXPECT_EQ(Capture(), before);
+  EXPECT_TRUE(data->GetSpans().empty());
+  EXPECT_TRUE(Work("restored_after_failure").ok());
+  EXPECT_EQ(data->GetSpans().size(), 1);
+}
+
+TEST_F(StorageTracingTest, ConfigurationFailureReturnsStatusAndPreservesPreviousSettings) {
+  {
+    ScopedFiuFault fault(FIUKEY_TRACING_CONFIGURATION_FAIL);
+    ASSERT_EQ(fault.enable_result(), 0);
+    EXPECT_FALSE(SetTracerProvider(nullptr).ok());
+  }
+  auto parent = AttachParent(Parent(1));
+  EXPECT_TRUE(Work("old_provider").ok());
+  EXPECT_EQ(data->GetSpans().size(), 1);
+  ASSERT_STATUS_OK(SetTraceOptions({true, 1}));
+  {
+    ScopedFiuFault fault(FIUKEY_TRACING_CONFIGURATION_FAIL);
+    ASSERT_EQ(fault.enable_result(), 0);
+    EXPECT_FALSE(SetTraceOptions({true, 256}).ok());
+  }
+  {
+    TraceScope scope("root");
+    EXPECT_TRUE(Work("still_suppressed").ok());
+  }
+  auto spans = data->GetSpans();
+  ASSERT_EQ(spans.size(), 1);
+  EXPECT_EQ(spans[0]->GetName(), "root");
+}
+#endif
+
 TEST_F(StorageTracingTest, NativeAttributesReachSamplerAndPreserveTypes) {
   class AttributeSampler final : public sdk::Sampler {
  public:
@@ -105,9 +229,10 @@ TEST_F(StorageTracingTest, NativeAttributesReachSamplerAndPreserveTypes) {
   auto exporter = std::make_unique<opentelemetry::exporter::memory::InMemorySpanExporter>(128);
   data = exporter->GetData();
   auto processor = std::make_unique<sdk::SimpleSpanProcessor>(std::move(exporter));
-  SetTracerProvider(ProviderPtr(new sdk::TracerProvider(
-      std::move(processor), opentelemetry::sdk::resource::Resource::Create({}), std::make_unique<AttributeSampler>())));
-  SetTraceOptions({false, 256});
+  ASSERT_STATUS_OK(SetTracerProvider(
+      ProviderPtr(new sdk::TracerProvider(std::move(processor), opentelemetry::sdk::resource::Resource::Create({}),
+                                          std::make_unique<AttributeSampler>()))));
+  ASSERT_STATUS_OK(SetTraceOptions({false, 256}));
   auto parent = AttachParent(Parent(1));
   const int column_index = 3;
   const std::string column_name = "column-name";
@@ -230,14 +355,14 @@ TEST_F(StorageTracingTest, ParentScopeNestedMaskAndRestore) {
   EXPECT_EQ(spans[0]->GetSpanContext().trace_state()->ToHeader(), "vendor=value");
 }
 TEST_F(StorageTracingTest, NullProviderDoesNotUseGlobalProvider) {
-  SetTracerProvider(nullptr);
+  ASSERT_STATUS_OK(SetTracerProvider(nullptr));
   auto scope = AttachParent(Parent(1));
   EXPECT_TRUE(Work().ok());
   EXPECT_TRUE(data->GetSpans().empty());
 }
 TEST_F(StorageTracingTest, ArrowSpanCanParentStorageOperations) {
   auto provider = Provider(data);
-  SetTracerProvider(provider);
+  ASSERT_STATUS_OK(SetTracerProvider(provider));
   arrow::util::tracing::Span parent_span;
   auto& span = arrow::internal::tracing::RewrapSpan(parent_span.details.get(),
                                                     provider->GetTracer("arrow-caller")->StartSpan("caller"));
@@ -268,7 +393,7 @@ TEST_F(StorageTracingTest, DisabledParquetReadDoesNotUseArrowGlobalProvider) {
   } restore;
   std::shared_ptr<Memory> global_spans;
   ot::Provider::SetTracerProvider(Provider(global_spans));
-  SetTracerProvider(nullptr);
+  ASSERT_STATUS_OK(SetTracerProvider(nullptr));
 
   Properties properties;
   ASSERT_STATUS_OK(InitTestProperties(properties));
@@ -302,7 +427,7 @@ TEST_F(StorageTracingTest, NestedMetadataNamesDoNotSuppressDistinctOperations) {
   EXPECT_EQ(spans[1]->GetParentSpanId(), ExpectedSpan(1));
 }
 TEST_F(StorageTracingTest, NullProviderKeepsReadyFutureReady) {
-  SetTracerProvider(nullptr);
+  ASSERT_STATUS_OK(SetTracerProvider(nullptr));
   auto scope = AttachParent(Parent(1));
   auto file = WrapFile(std::make_shared<ControlledFile>(), "test");
   auto* async = dynamic_cast<NonBlockingRandomAccessFile*>(file.get());
@@ -314,7 +439,7 @@ TEST_F(StorageTracingTest, NullProviderKeepsReadyFutureReady) {
 }
 
 TEST_F(StorageTracingTest, UnsampledParentIsNotPromotedToRoot) {
-  SetTracerProvider(Provider(data, true));
+  ASSERT_STATUS_OK(SetTracerProvider(Provider(data, true)));
   auto parent = Parent(1);
   parent.trace_flags = 0;
   auto scope = AttachParent(parent);
@@ -408,7 +533,7 @@ TEST_F(StorageTracingTest, LazyFutureCapturesParentAndProviderBeforeConsumption)
   }();
   EXPECT_TRUE(data->GetSpans().empty());
   std::shared_ptr<Memory> replacement;
-  SetTracerProvider(Provider(replacement));
+  ASSERT_STATUS_OK(SetTracerProvider(Provider(replacement)));
   folly::CPUThreadPoolExecutor executor(1);
   {
     auto scope = AttachParent(Parent(2));
@@ -516,7 +641,7 @@ TEST_F(StorageTracingTest, SameThreadFibersRestoreIndependentNestedContexts) {
   EXPECT_TRUE(data->GetSpans().empty());
 }
 TEST_F(StorageTracingTest, BudgetSuppressesChildrenWithoutEndingParent) {
-  SetTraceOptions({true, 2});
+  ASSERT_STATUS_OK(SetTraceOptions({true, 2}));
   auto parent = AttachParent(Parent(1));
   TraceScope span_scope("storage.read");
   auto context = span_scope.context();
@@ -589,7 +714,7 @@ TEST_F(StorageTracingTest, DisabledIOFuturesDoNotRetainTracingContexts) {
       return std::vector<arrow::Future<std::shared_ptr<arrow::Buffer>>>(ranges.size(), pending);
     }
   };
-  SetTracerProvider(nullptr);
+  ASSERT_STATUS_OK(SetTracerProvider(nullptr));
   auto raw = std::make_shared<PendingFile>();
   auto file = WrapFile(raw, "test");
   std::weak_ptr<const Context> captured;
@@ -607,7 +732,7 @@ TEST_F(StorageTracingTest, DisabledIOFuturesDoNotRetainTracingContexts) {
   // Only tracing callbacks could retain this context: the source future has no
   // context of its own. Disabled reads return it without completion observers.
   EXPECT_TRUE(captured.expired());
-  SetTracerProvider(Provider(data));
+  ASSERT_STATUS_OK(SetTracerProvider(Provider(data)));
   auto foreign = AttachParent(Parent(2));
   raw->pending.MarkFinished(arrow::Buffer::FromString("ab"));
   for (const auto& future : futures) {
@@ -620,7 +745,7 @@ TEST_F(StorageTracingTest, SuppressedIOSpansStillAggregateReads) {
   auto file = WrapFile(std::make_shared<arrow::io::BufferReader>(arrow::Buffer::FromString("abcd")), "test");
   auto parent = AttachParent(Parent(1));
   for (const auto options : {TraceOptions{false, 256}, TraceOptions{true, 1}}) {
-    SetTraceOptions(options);
+    ASSERT_STATUS_OK(SetTraceOptions(options));
     {
       TraceScope span_scope("storage.read");
       auto context = span_scope.context();
@@ -678,7 +803,7 @@ TEST_F(StorageTracingTest, IOOverloadsErrorAndDisabledSwitch) {
   auto spans = data->GetSpans();
   ASSERT_EQ(spans.size(), 5);
   EXPECT_EQ(spans.back()->GetStatus(), ot::StatusCode::kError);
-  SetTraceOptions({false, 256});
+  ASSERT_STATUS_OK(SetTraceOptions({false, 256}));
   {
     TraceScope span_scope("storage.read");
     auto context = span_scope.context();
@@ -966,7 +1091,7 @@ TEST_F(StorageTracingTest, UnconsumedReaderFuturesDoNotCreateWorkSpans) {
   ASSERT_STATUS_OK(DeleteTestDir(fs, path));
 }
 TEST_F(StorageTracingTest, DisabledProviderSnapshotRemainsDisabledAfterInjection) {
-  SetTracerProvider(nullptr);
+  ASSERT_STATUS_OK(SetTracerProvider(nullptr));
   auto future = [&] {
     auto parent = AttachParent(Parent(1));
     auto span_scope = TraceScope::Deferred("storage.read");
@@ -982,7 +1107,7 @@ TEST_F(StorageTracingTest, DisabledProviderSnapshotRemainsDisabledAfterInjection
     span_scope.ReleaseSpan();
     return future;
   }();
-  SetTracerProvider(Provider(data));
+  ASSERT_STATUS_OK(SetTracerProvider(Provider(data)));
   EXPECT_TRUE(std::move(future).get().ok());
   EXPECT_TRUE(data->GetSpans().empty());
 }
@@ -1064,7 +1189,7 @@ class ThrowingFile final : public arrow::io::RandomAccessFile, public NonBlockin
 
 TEST_F(StorageTracingTest, FileInstrumentationPreservesThrownExceptions) {
   for (bool enabled : {false, true}) {
-    SetTracerProvider(enabled ? Provider(data) : nullptr);
+    ASSERT_STATUS_OK(SetTracerProvider(enabled ? Provider(data) : nullptr));
     auto file = WrapFile(std::make_shared<ThrowingFile>(), "test");
     auto scope = AttachParent(Parent(1));
     uint8_t out[4];

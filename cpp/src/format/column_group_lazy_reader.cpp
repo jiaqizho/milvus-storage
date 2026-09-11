@@ -349,8 +349,12 @@ folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> ColumnGroupLazyR
   if (scope.span()) {
     future = std::move(future).defer([span = scope.span(), context = scope.context()](
                                          folly::Try<arrow::Result<std::shared_ptr<arrow::Table>>>&& result) {
-      tracing::EndSpan(span, context,
-                       result.hasException() ? arrow::Status::UnknownError("exception") : result.value().status());
+      if (result.hasException()) {
+        tracing::SetAttribute(span, context, "error.type", "UnknownError");
+        tracing::EndSpan(span, context, opentelemetry::trace::StatusCode::kError);
+      } else {
+        tracing::EndSpan(span, context, result.value().status());
+      }
       return std::move(result);
     });
     scope.ReleaseSpan();

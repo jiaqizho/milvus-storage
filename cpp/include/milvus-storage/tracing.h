@@ -12,6 +12,7 @@
 
 #include <optional>
 #include <utility>
+#include <type_traits>
 #include <folly/io/async/Request.h>
 #include <arrow/status.h>
 #include <arrow/util/tracing.h>
@@ -30,8 +31,9 @@ struct TraceParent {
 using ProviderPtr = opentelemetry::nostd::shared_ptr<opentelemetry::trace::TracerProvider>;
 
 // Storage never installs a global provider, creates an exporter, or shuts down
-// an injected provider. The host must use a matching OTel C++ ABI.
-void SetTracerProvider(ProviderPtr provider);
+// an injected provider. The host must use a matching OTel C++ ABI. Configuration
+// errors are returned without replacing the previous configuration.
+arrow::Status SetTracerProvider(ProviderPtr provider) noexcept;
 
 struct TraceOptions {
   bool io_spans = true;
@@ -39,37 +41,41 @@ struct TraceOptions {
   uint32_t max_spans_per_operation = 256;
 };
 // Changes apply to subsequent operations; active operations retain their snapshot.
-void SetTraceOptions(const TraceOptions& options);
+arrow::Status SetTraceOptions(const TraceOptions& options) noexcept;
 
 // Storage instrumentation and execution-context propagation.
 struct Context;
 using ContextPtr = std::shared_ptr<const Context>;
-ContextPtr Capture();
+ContextPtr Capture() noexcept;
 // Check the active flow without copying an owning context snapshot.
-bool HasContext();
-void StartCurrent();
+bool HasContext() noexcept;
+void StartCurrent() noexcept;
 
 // Spans are Arrow's actual thin wrapper. The separate context owns request
 // propagation, the provider snapshot, and per-operation accounting.
 using SpanPtr = std::shared_ptr<arrow::util::tracing::Span>;
 
-void EnsureStarted(const SpanPtr& span, const ContextPtr& context);
+void EnsureStarted(const SpanPtr& span, const ContextPtr& context) noexcept;
 // A scope-only end leaves status unset. Explicit I/O/completion sites may pass
 // their actual status. Ending an unstarted deferred scope without a result is inert.
-void EndSpan(const SpanPtr& span, const ContextPtr& context, const std::optional<arrow::Status>& status = std::nullopt);
-bool IsEnabled(const ContextPtr& context);
+void EndSpan(const SpanPtr& span, const ContextPtr& context) noexcept;
+void EndSpan(const SpanPtr& span, const ContextPtr& context, const arrow::Status& status) noexcept;
+void EndSpan(const SpanPtr& span, const ContextPtr& context, opentelemetry::trace::StatusCode status) noexcept;
+bool IsEnabled(const ContextPtr& context) noexcept;
 // Setting an attribute materializes a deferred span if it has not started yet.
 void SetAttribute(const SpanPtr& span,
                   const ContextPtr& context,
                   opentelemetry::nostd::string_view key,
-                  const opentelemetry::common::AttributeValue& value);
+                  const opentelemetry::common::AttributeValue& value) noexcept;
 // Resolve the span identity (or inherited parent). This starts a deferred span
 // when necessary to obtain its actual span ID; Capture() itself does not start it.
-opentelemetry::trace::SpanContext GetSpanContext(const ContextPtr& context);
+opentelemetry::trace::SpanContext GetSpanContext(const ContextPtr& context) noexcept;
 
 // Own a span for the current C++ scope. The destructor ends only that span,
 // then restores the previous Folly context. It never invokes business code,
-// catches exceptions, or interprets return values.
+// catches business exceptions, or interprets return values. Tracing failures are
+// contained. If context attachment fails, capture is conservatively suppressed
+// across execution flows until every failed scope has exited.
 class TraceScope {
   public:
   using Attributes =
@@ -78,31 +84,32 @@ class TraceScope {
   explicit TraceScope(opentelemetry::nostd::string_view name,
                       Attributes attributes = {},
                       Links links = {},
-                      opentelemetry::trace::SpanKind kind = opentelemetry::trace::SpanKind::kInternal)
+                      opentelemetry::trace::SpanKind kind = opentelemetry::trace::SpanKind::kInternal) noexcept
       : TraceScope(name, attributes, links, kind, Mode::Scoped) {}
   // Start when captured work executes, rather than when its SemiFuture is built.
   // Names, attributes and links are copied; destroying unexecuted work emits nothing.
   static TraceScope Deferred(opentelemetry::nostd::string_view name,
                              Attributes attributes = {},
                              Links links = {},
-                             opentelemetry::trace::SpanKind kind = opentelemetry::trace::SpanKind::kInternal);
-  ~TraceScope() {
-    if (span_)
-      EndSpan(span_, context_);
+                             opentelemetry::trace::SpanKind kind = opentelemetry::trace::SpanKind::kInternal) noexcept;
+  ~TraceScope() noexcept {
+    if (span_ || scope_ || failed_)
+      Finish();
   }
   TraceScope(const TraceScope&) = delete;
   TraceScope& operator=(const TraceScope&) = delete;
   TraceScope(TraceScope&&) = delete;
   TraceScope& operator=(TraceScope&&) = delete;
 
-  const SpanPtr& span() const { return span_; }
-  const ContextPtr& context() const { return context_; }
+  const SpanPtr& span() const noexcept { return span_; }
+  const ContextPtr& context() const noexcept { return context_; }
   // Call after an async completion callback has captured span()/context().
   // Only relinquishes span completion; context restoration still happens here.
-  void ReleaseSpan() { span_.reset(); }
+  void ReleaseSpan() noexcept { span_.reset(); }
   // End this scope early and restore the previous context. Inner guards must
   // have exited first, exactly as for normal stack destruction.
-  void Finish(const std::optional<arrow::Status>& status = std::nullopt);
+  void Finish() noexcept;
+  void Finish(const arrow::Status& status) noexcept;
 
   private:
   enum class Mode { Scoped, Deferred, IO };
@@ -110,7 +117,7 @@ class TraceScope {
              Attributes attributes,
              Links links,
              opentelemetry::trace::SpanKind kind,
-             Mode mode)
+             Mode mode) noexcept
       : context_(Capture()) {
     // Keep the default disabled path local to the caller: it needs no span,
     // configuration snapshot, attributes copy, or request-context guard.
@@ -121,25 +128,33 @@ class TraceScope {
                   Attributes attributes,
                   Links links,
                   opentelemetry::trace::SpanKind kind,
-                  Mode mode);
-  explicit TraceScope(ContextPtr context);
+                  Mode mode) noexcept;
+  void Finish(const arrow::Status* status) noexcept;
+  void Fail() noexcept;
+  enum class Failed {};
+  explicit TraceScope(Failed) noexcept { Fail(); }
+  explicit TraceScope(ContextPtr context) noexcept;
   ContextPtr context_;
   SpanPtr span_;
   std::optional<folly::ShallowCopyRequestContextScopeGuard> scope_;
-  friend TraceScope AttachContext(ContextPtr context);
-  friend TraceScope TraceIO(opentelemetry::nostd::string_view name, Attributes attributes);
+  bool failed_ = false;
+  friend TraceScope AttachContext(ContextPtr context) noexcept;
+  friend TraceScope AttachParent(const TraceParent& parent) noexcept;
+  friend TraceScope TraceIO(opentelemetry::nostd::string_view name, Attributes attributes) noexcept;
 };
 
 // Attach-only scopes never create or end the parent's span or modify OTel TLS.
 // Captured empty contexts and invalid parents mask enclosing scopes. Destroy
 // guards in stack order on the same execution flow (including Folly fibers).
-[[nodiscard]] TraceScope AttachContext(ContextPtr context);
-[[nodiscard]] TraceScope AttachParent(const TraceParent& parent);
+[[nodiscard]] TraceScope AttachContext(ContextPtr context) noexcept;
+[[nodiscard]] TraceScope AttachParent(const TraceParent& parent) noexcept;
 
 // Restores only Storage-owned data, preserving other RequestContext keys.
+// Moving and invoking the supplied callable retain its own exception contract.
 template <typename F>
-auto Bind(F&& fn) {
-  return [context = Capture(), fn = std::forward<F>(fn)](auto&&... args) mutable -> decltype(auto) {
+auto Bind(F&& fn) noexcept(std::is_nothrow_constructible_v<std::decay_t<F>, F&&>) {
+  return [context = Capture(), fn = std::forward<F>(fn)](auto&&... args) mutable noexcept(
+             std::is_nothrow_invocable_v<std::decay_t<F>&, decltype(args)...>) -> decltype(auto) {
     auto scope = AttachContext(context);
     StartCurrent();
     return fn(std::forward<decltype(args)>(args)...);

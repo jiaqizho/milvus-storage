@@ -1056,12 +1056,16 @@ folly::SemiFuture<arrow::Status> ParquetFormatReader::open_async() {
             });
   });
   if (scope.span()) {
-    future = std::move(future).defer([span = scope.span(),
-                                      context = scope.context()](folly::Try<arrow::Status>&& result) {
-      tracing::EndSpan(span, context,
-                       result.hasException() ? arrow::Status::UnknownError("exception") : result.value());
-      return std::move(result);
-    });
+    future =
+        std::move(future).defer([span = scope.span(), context = scope.context()](folly::Try<arrow::Status>&& result) {
+          if (result.hasException()) {
+            tracing::SetAttribute(span, context, "error.type", "UnknownError");
+            tracing::EndSpan(span, context, opentelemetry::trace::StatusCode::kError);
+          } else {
+            tracing::EndSpan(span, context, result.value());
+          }
+          return std::move(result);
+        });
     scope.ReleaseSpan();
   }
   return future;
@@ -1614,8 +1618,12 @@ folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>> Parq
     future =
         std::move(future).defer([span = scope.span(), context = scope.context()](
                                     folly::Try<arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>>&& result) {
-          tracing::EndSpan(span, context,
-                           result.hasException() ? arrow::Status::UnknownError("exception") : result.value().status());
+          if (result.hasException()) {
+            tracing::SetAttribute(span, context, "error.type", "UnknownError");
+            tracing::EndSpan(span, context, opentelemetry::trace::StatusCode::kError);
+          } else {
+            tracing::EndSpan(span, context, result.value().status());
+          }
           return std::move(result);
         });
     scope.ReleaseSpan();
@@ -1695,8 +1703,12 @@ folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> ParquetFormatRea
   if (scope.span()) {
     future = std::move(future).defer([span = scope.span(), context = scope.context()](
                                          folly::Try<arrow::Result<std::shared_ptr<arrow::Table>>>&& result) {
-      tracing::EndSpan(span, context,
-                       result.hasException() ? arrow::Status::UnknownError("exception") : result.value().status());
+      if (result.hasException()) {
+        tracing::SetAttribute(span, context, "error.type", "UnknownError");
+        tracing::EndSpan(span, context, opentelemetry::trace::StatusCode::kError);
+      } else {
+        tracing::EndSpan(span, context, result.value().status());
+      }
       return std::move(result);
     });
     scope.ReleaseSpan();
