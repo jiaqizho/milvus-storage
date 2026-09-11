@@ -41,7 +41,6 @@
 #include <arrow/util/async_generator.h>
 #include <arrow/util/key_value_metadata.h>
 #include <arrow/util/ubsan.h>
-#include <folly/ScopeGuard.h>
 #include <folly/futures/Promise.h>
 #include <parquet/file_reader.h>
 #include <parquet/arrow/schema.h>
@@ -114,7 +113,7 @@ static folly::SemiFuture<T> bridge_arrow_future(
   auto semi_future = promise.getSemiFuture();
   arrow_future.AddCallback([storage_context = tracing::Capture(), promise = std::move(promise),
                             executor_keep_alive = std::move(executor_keep_alive)](const T& result) mutable {
-    tracing::ContextScope storage_scope(storage_context);
+    auto storage_scope = tracing::AttachContext(storage_context);
     tracing::StartCurrent();
     (void)executor_keep_alive;
     promise.setValue(result);
@@ -131,12 +130,12 @@ static ArrowFuture transfer_arrow_future(ArrowFuture arrow_future,
   auto transferred = ArrowFuture::Make();
   try {
     arrow_future.AddCallback([storage_context = tracing::Capture(), transferred, executor](const T& result) mutable {
-      tracing::ContextScope storage_scope(storage_context);
+      auto storage_scope = tracing::AttachContext(storage_context);
       tracing::StartCurrent();
       arrow::Status spawn_status;
       try {
         spawn_status = executor->Spawn([storage_context = tracing::Capture(), transferred, result]() mutable {
-          tracing::ContextScope storage_scope(storage_context);
+          auto storage_scope = tracing::AttachContext(storage_context);
           tracing::StartCurrent();
           transferred.MarkFinished(std::move(result));
         });
@@ -475,7 +474,7 @@ ParquetFormatReader::MetaTrait::load_metadata_async(const api::ColumnGroupFile& 
   return folly::makeSemiFuture().deferValue(
       [storage_context = tracing::Capture(), file, properties,
        key_retriever](folly::Unit) -> folly::SemiFuture<arrow::Result<ParquetFormatReader::MetaTrait::MetadataPtr>> {
-        tracing::ContextScope storage_scope(storage_context);
+        auto storage_scope = tracing::AttachContext(storage_context);
         tracing::StartCurrent();
         FOLLY_ARROW_ASSIGN_OR_RAISE(auto fs, FilesystemCache::getInstance().get(properties, file.path));
         FOLLY_ARROW_ASSIGN_OR_RAISE(auto uri, StorageUri::Parse(file.path));
@@ -486,7 +485,7 @@ ParquetFormatReader::MetaTrait::load_metadata_async(const api::ColumnGroupFile& 
         // has been built from the opened footer.
         return reader->open_async().deferValue([storage_context = tracing::Capture(), reader = std::move(reader),
                                                 file](arrow::Status status) -> arrow::Result<MetadataPtr> {
-          tracing::ContextScope storage_scope(storage_context);
+          auto storage_scope = tracing::AttachContext(storage_context);
           tracing::StartCurrent();
           ARROW_RETURN_NOT_OK(status);
           return create_metadata_from_reader(reader, file);
@@ -547,25 +546,17 @@ ParquetFormatReader::MetaTrait::create_from_metadata_async(MetadataPtr metadata,
   return folly::makeSemiFuture().deferValue(
       [storage_context = tracing::Capture(), metadata = std::move(metadata), file, read_schema, needed_columns,
        predicate](folly::Unit) -> arrow::Result<std::shared_ptr<ParquetFormatReader>> {
-        tracing::ContextScope storage_scope(storage_context);
+        auto storage_scope = tracing::AttachContext(storage_context);
         tracing::StartCurrent();
         return create_from_metadata(std::move(metadata), file, read_schema, needed_columns, predicate);
       });
 }
 
 arrow::Status ParquetFormatReader::open() {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.metadata.load", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "open", "parquet",
-                                           !MetadataCache::HasTracedLoad())
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  auto scope = MetadataCache::HasTracedLoad()
+                   ? tracing::AttachContext(tracing::Capture())
+                   : tracing::TraceScope("storage.metadata.load",
+                                         {{"storage.operation", "open"}, {"storage.format", "parquet"}});
 
   assert(file_reader_ == nullptr);
 
@@ -636,7 +627,7 @@ static arrow::Future<std::shared_ptr<arrow::Buffer>> read_file_async_and_transfe
     return transfer_arrow_future(async_file->ReadAtAsyncInto(position, nbytes, buffer->mutable_data()), executor)
         .Then([storage_context = tracing::Capture(), buffer = std::move(buffer),
                nbytes](const int64_t bytes_read) mutable -> arrow::Result<std::shared_ptr<arrow::Buffer>> {
-          tracing::ContextScope storage_scope(storage_context);
+          auto storage_scope = tracing::AttachContext(storage_context);
           tracing::StartCurrent();
           if (bytes_read < 0 || bytes_read > nbytes) {
             return arrow::Status::IOError("Invalid async read result: requested ", nbytes, " bytes but received ",
@@ -783,7 +774,7 @@ static arrow::Future<std::shared_ptr<::parquet::FileMetaData>> read_footer_async
   return footer_future.Then([storage_context = tracing::Capture(), file, file_size, footer_size,
                              reader_properties = std::move(reader_properties),
                              executor](const std::shared_ptr<arrow::Buffer>& footer_buffer) mutable -> MetadataFuture {
-    tracing::ContextScope storage_scope(storage_context);
+    auto storage_scope = tracing::AttachContext(storage_context);
     tracing::StartCurrent();
     auto maybe_metadata_length = try_parse_footer_length(footer_buffer, footer_size, file_size);
     if (!maybe_metadata_length) {
@@ -810,7 +801,7 @@ static arrow::Future<std::shared_ptr<::parquet::FileMetaData>> read_footer_async
     auto metadata_future = read_file_async_and_transfer(file, metadata_offset, metadata_length, executor);
     return metadata_future.Then([storage_context = tracing::Capture(), reader_properties = std::move(reader_properties),
                                  metadata_length](const std::shared_ptr<arrow::Buffer>& metadata_buffer) {
-      tracing::ContextScope storage_scope(storage_context);
+      auto storage_scope = tracing::AttachContext(storage_context);
       tracing::StartCurrent();
       return try_parse_plain_footer_metadata(metadata_buffer, metadata_length, reader_properties);
     });
@@ -854,7 +845,7 @@ static arrow::Future<std::shared_ptr<::parquet::arrow::FileReader>> create_file_
        reader_properties = std::move(reader_properties), arrow_reader_properties = std::move(arrow_reader_properties),
        executor =
            std::move(executor)](const std::shared_ptr<::parquet::FileMetaData>& metadata) mutable -> FileReaderFuture {
-        tracing::ContextScope storage_scope(storage_context);
+        auto storage_scope = tracing::AttachContext(storage_context);
         tracing::StartCurrent();
         try {
           std::shared_ptr<ParquetOpenFile> open_file;
@@ -879,7 +870,7 @@ static arrow::Future<std::shared_ptr<::parquet::arrow::FileReader>> create_file_
                 [storage_context = tracing::Capture(), parquet_future, file_reader_future,
                  open_file = std::move(open_file), arrow_reader_properties = std::move(arrow_reader_properties),
                  executor](const arrow::Result<std::unique_ptr<::parquet::ParquetFileReader>>&) mutable {
-                  tracing::ContextScope storage_scope(storage_context);
+                  auto storage_scope = tracing::AttachContext(storage_context);
                   tracing::StartCurrent();
                   arrow::Status spawn_status;
                   try {
@@ -887,7 +878,7 @@ static arrow::Future<std::shared_ptr<::parquet::arrow::FileReader>> create_file_
                         executor->Spawn([storage_context = tracing::Capture(), parquet_future, file_reader_future,
                                          open_file = std::move(open_file),
                                          arrow_reader_properties = std::move(arrow_reader_properties)]() mutable {
-                          tracing::ContextScope storage_scope(storage_context);
+                          auto storage_scope = tracing::AttachContext(storage_context);
                           tracing::StartCurrent();
                           try {
                             const auto& parquet_result = parquet_future.result();
@@ -973,14 +964,10 @@ static arrow::Future<std::shared_ptr<::parquet::arrow::FileReader>> create_file_
 //                                                       |
 //                                          finish_open [Folly, owns self]
 folly::SemiFuture<arrow::Status> ParquetFormatReader::open_async() {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.metadata.load", true, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "open_async", "parquet",
-                                           !MetadataCache::HasTracedLoad())
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
+  auto scope = MetadataCache::HasTracedLoad()
+                   ? tracing::AttachContext(tracing::Capture())
+                   : tracing::TraceScope::Deferred(
+                         "storage.metadata.load", {{"storage.operation", "open_async"}, {"storage.format", "parquet"}});
 
   // Keep filesystem setup lazy: constructing the SemiFuture only retains the
   // reader. OpenInputFile and all I/O start when the future is consumed. The
@@ -990,7 +977,7 @@ folly::SemiFuture<arrow::Status> ParquetFormatReader::open_async() {
   auto future = folly::makeSemiFuture().deferExValue([storage_context = tracing::Capture(), self = std::move(self)](
                                                          folly::Executor::KeepAlive<> executor,
                                                          folly::Unit) mutable -> folly::SemiFuture<arrow::Status> {
-    tracing::ContextScope storage_scope(storage_context);
+    auto storage_scope = tracing::AttachContext(storage_context);
     tracing::StartCurrent();
     assert(self->file_reader_ == nullptr);
 
@@ -1040,7 +1027,7 @@ folly::SemiFuture<arrow::Status> ParquetFormatReader::open_async() {
                                                   footer_size, reader_properties = std::move(reader_properties),
                                                   arrow_reader_properties = std::move(arrow_reader_properties),
                                                   arrow_executor](const int64_t file_size) mutable {
-        tracing::ContextScope storage_scope(storage_context);
+        auto storage_scope = tracing::AttachContext(storage_context);
         tracing::StartCurrent();
         // file_size is operation-local. ParquetOpenFile supplies it to
         // Parquet without updating ParquetFormatReader::file_size_.
@@ -1057,7 +1044,7 @@ folly::SemiFuture<arrow::Status> ParquetFormatReader::open_async() {
         .deferValue(
             [storage_context = tracing::Capture(),
              self](arrow::Result<std::shared_ptr<::parquet::arrow::FileReader>>&& file_reader_result) -> arrow::Status {
-              tracing::ContextScope storage_scope(storage_context);
+              auto storage_scope = tracing::AttachContext(storage_context);
               tracing::StartCurrent();
               if (!file_reader_result.ok()) {
                 const auto& status = file_reader_result.status();
@@ -1068,12 +1055,14 @@ folly::SemiFuture<arrow::Status> ParquetFormatReader::open_async() {
               return self->finish_open(std::move(file_reader));
             });
   });
-  if (span) {
-    return std::move(future).defer([span, context](folly::Try<arrow::Status>&& result) {
+  if (scope.span()) {
+    future = std::move(future).defer([span = scope.span(),
+                                      context = scope.context()](folly::Try<arrow::Status>&& result) {
       tracing::EndSpan(span, context,
                        result.hasException() ? arrow::Status::UnknownError("exception") : result.value());
       return std::move(result);
     });
+    scope.ReleaseSpan();
   }
   return future;
 }
@@ -1232,17 +1221,7 @@ arrow::Status ParquetFormatReader::set_needed_columns(const std::vector<std::str
 }
 
 arrow::Result<std::shared_ptr<arrow::RecordBatch>> ParquetFormatReader::get_chunk(const int& row_group_index) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.format.read", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "get_chunk", "parquet")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.format.read", {{"storage.operation", "get_chunk"}, {"storage.format", "parquet"}});
 
   std::shared_ptr<arrow::Table> table;
   assert(file_reader_);
@@ -1278,17 +1257,8 @@ arrow::Result<std::shared_ptr<arrow::Table>> ParquetFormatReader::get_chunks_int
 
 arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> ParquetFormatReader::get_chunks(
     const std::vector<int>& rg_indices_in_file) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.format.read", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "get_chunks", "parquet")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.format.read",
+                            {{"storage.operation", "get_chunks"}, {"storage.format", "parquet"}});
 
   std::shared_ptr<arrow::Table> table;
   std::vector<std::shared_ptr<arrow::RecordBatch>> result;
@@ -1340,17 +1310,7 @@ arrow::Result<std::vector<int>> ParquetFormatReader::get_chunk_indices(const std
 }
 
 arrow::Result<std::shared_ptr<arrow::Table>> ParquetFormatReader::take(const std::vector<int64_t>& row_indices) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.format.read", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "take", "parquet")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.format.read", {{"storage.operation", "take"}, {"storage.format", "parquet"}});
 
   ARROW_ASSIGN_OR_RAISE(auto chunk_indices, get_chunk_indices(row_indices));
   assert(chunk_indices.size() == row_indices.size());
@@ -1405,17 +1365,8 @@ class RangeRecordBatchReader : public arrow::RecordBatchReader {
   ~RangeRecordBatchReader() override = default;
 
   arrow::Status ReadNext(std::shared_ptr<::arrow::RecordBatch>* out) override {
-    auto context = tracing::Capture();
-    auto span = context ? tracing::StartSpan(context, "storage.format.read", false, false,
-                                             opentelemetry::trace::SpanContext::GetInvalid(), "ReadNext", "parquet")
-                        : nullptr;
-    std::optional<tracing::ContextScope> scope;
-    if (context)
-      scope.emplace(context);
-    SCOPE_EXIT {
-      if (span)
-        tracing::EndSpan(span, context);
-    };
+    tracing::TraceScope scope("storage.format.read",
+                              {{"storage.operation", "ReadNext"}, {"storage.format", "parquet"}});
 
     // Lazy load: read all row groups on first ReadNext call
     if (!loaded_) {
@@ -1469,18 +1420,8 @@ class RangeRecordBatchReader : public arrow::RecordBatchReader {
 
 arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> ParquetFormatReader::read_with_range(
     const uint64_t& start_offset, const uint64_t& end_offset) {
-  auto context = tracing::Capture();
-  auto span = context
-                  ? tracing::StartSpan(context, "storage.format.read", false, false,
-                                       opentelemetry::trace::SpanContext::GetInvalid(), "read_with_range", "parquet")
-                  : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.format.read",
+                            {{"storage.operation", "read_with_range"}, {"storage.format", "parquet"}});
 
   if (row_group_infos_.empty()) {
     return arrow::Status::Invalid(fmt::format("Empty row group infos. [path={}]", path_));
@@ -1559,14 +1500,8 @@ ParquetFormatReader::ParquetFormatReader(const ParquetFormatReader& other,
 
 folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>> ParquetFormatReader::read_with_range_async(
     uint64_t start_offset, uint64_t end_offset) {
-  auto context = tracing::Capture();
-  auto span =
-      context ? tracing::StartSpan(context, "storage.format.read", true, false,
-                                   opentelemetry::trace::SpanContext::GetInvalid(), "read_with_range_async", "parquet")
-              : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
+  auto scope = tracing::TraceScope::Deferred(
+      "storage.format.read", {{"storage.operation", "read_with_range_async"}, {"storage.format", "parquet"}});
 
   using ResultType = arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>;
 
@@ -1628,7 +1563,7 @@ folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>> Parq
        projected_leaf_column_indices = projected_leaf_column_indices_, first_rg_slice_offset, total_rows,
        projected_schema = std::move(projected_schema)](folly::Executor::KeepAlive<> executor,
                                                        folly::Unit) mutable -> folly::SemiFuture<ResultType> {
-        tracing::ContextScope storage_scope(storage_context);
+        auto storage_scope = tracing::AttachContext(storage_context);
         tracing::StartCurrent();
         // The callback now receives a concrete KeepAlive token for the consumer's
         // executor. The Arrow adapter only retains that token and forwards work;
@@ -1647,7 +1582,7 @@ folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>> Parq
                                                       total_rows, projected_schema = std::move(projected_schema)](
                                                          std::vector<std::shared_ptr<arrow::RecordBatch>> batches)
                                                          -> arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> {
-          tracing::ContextScope storage_scope(storage_context);
+          auto storage_scope = tracing::AttachContext(storage_context);
           tracing::StartCurrent();
           // Keep the projected schema even when Arrow produces no batches.
           if (batches.empty()) {
@@ -1675,26 +1610,23 @@ folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>> Parq
         }),
                                    std::move(arrow_executor));
       });
-  if (span) {
-    return std::move(future).defer(
-        [span, context](folly::Try<arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>>&& result) {
+  if (scope.span()) {
+    future =
+        std::move(future).defer([span = scope.span(), context = scope.context()](
+                                    folly::Try<arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>>&& result) {
           tracing::EndSpan(span, context,
                            result.hasException() ? arrow::Status::UnknownError("exception") : result.value().status());
           return std::move(result);
         });
+    scope.ReleaseSpan();
   }
   return future;
 }
 
 folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> ParquetFormatReader::take_async(
     const std::vector<int64_t>& row_indices) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.format.read", true, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "take_async", "parquet")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
+  auto scope = tracing::TraceScope::Deferred("storage.format.read",
+                                             {{"storage.operation", "take_async"}, {"storage.format", "parquet"}});
 
   // Keep one row-group id per requested row for final remapping.
   FOLLY_ARROW_ASSIGN_OR_RAISE(auto chunk_indices, get_chunk_indices(row_indices));
@@ -1714,7 +1646,7 @@ folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> ParquetFormatRea
        projected_leaf_column_indices = projected_leaf_column_indices_, row_group_infos = row_group_infos_](
           folly::Executor::KeepAlive<> executor,
           folly::Unit) mutable -> folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> {
-        tracing::ContextScope storage_scope(storage_context);
+        auto storage_scope = tracing::AttachContext(storage_context);
         tracing::StartCurrent();
         // KeepAlive is now the concrete consumer executor token. This adapter
         // forwards Arrow work to it without creating a separate thread pool.
@@ -1732,7 +1664,7 @@ folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> ParquetFormatRea
                  chunk_indices = std::move(chunk_indices), unique_chunk_indices = std::move(unique_chunk_indices),
                  row_group_infos = std::move(row_group_infos)](std::vector<std::shared_ptr<arrow::RecordBatch>> batches)
                     -> arrow::Result<std::shared_ptr<arrow::Table>> {
-                  tracing::ContextScope storage_scope(storage_context);
+                  auto storage_scope = tracing::AttachContext(storage_context);
                   tracing::StartCurrent();
                   // Generator output is ordered by unique_chunk_indices. Record
                   // each row group's base offset in the concatenated table.
@@ -1760,12 +1692,14 @@ folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> ParquetFormatRea
                 }),
             std::move(arrow_executor));
       });
-  if (span) {
-    return std::move(future).defer([span, context](folly::Try<arrow::Result<std::shared_ptr<arrow::Table>>>&& result) {
+  if (scope.span()) {
+    future = std::move(future).defer([span = scope.span(), context = scope.context()](
+                                         folly::Try<arrow::Result<std::shared_ptr<arrow::Table>>>&& result) {
       tracing::EndSpan(span, context,
                        result.hasException() ? arrow::Status::UnknownError("exception") : result.value().status());
       return std::move(result);
     });
+    scope.ReleaseSpan();
   }
   return future;
 }

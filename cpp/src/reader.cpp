@@ -38,7 +38,6 @@
 #include <parquet/properties.h>
 #include <fmt/format.h>
 #include <glog/logging.h>
-#include <folly/ScopeGuard.h>
 #include <folly/executors/IOThreadPoolExecutor.h>
 #include <folly/futures/Future.h>
 
@@ -251,17 +250,7 @@ class PackedRecordBatchReader final : public arrow::RecordBatchReader {
    * @param batch The record batch pointer specified to read.
    */
   arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch>* out_batch) override {
-    auto context = tracing::Capture();
-    auto span = context ? tracing::StartSpan(context, "storage.read", false, false,
-                                             opentelemetry::trace::SpanContext::GetInvalid(), "ReadNext")
-                        : nullptr;
-    std::optional<tracing::ContextScope> scope;
-    if (context)
-      scope.emplace(context);
-    SCOPE_EXIT {
-      if (span)
-        tracing::EndSpan(span, context);
-    };
+    tracing::TraceScope scope("storage.read", {{"storage.operation", "ReadNext"}});
 
     // Load data, retrying if predicate filtering drained all rows in a batch
     // but more chunks remain.
@@ -637,7 +626,7 @@ folly::SemiFuture<arrow::Status> ChunkReaderImpl::open_async() {
                                          "", metadata_cache_)
       .deferValue([storage_context = tracing::Capture(),
                    this](arrow::Result<std::unique_ptr<ColumnGroupReader>>&& reader_result) -> arrow::Status {
-        tracing::ContextScope storage_scope(storage_context);
+        auto storage_scope = tracing::AttachContext(storage_context);
         tracing::StartCurrent();
         ARROW_ASSIGN_OR_RAISE(chunk_reader_, std::move(reader_result));
         return arrow::Status::OK();
@@ -651,33 +640,13 @@ arrow::Result<std::vector<int64_t>> ChunkReaderImpl::get_chunk_indices(const std
 }
 
 arrow::Result<std::shared_ptr<arrow::RecordBatch>> ChunkReaderImpl::get_chunk(int64_t chunk_index) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.read", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "get_chunk")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.read", {{"storage.operation", "get_chunk"}});
   return chunk_reader_->get_chunk(chunk_index);
 }
 
 arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> ChunkReaderImpl::get_chunks(
     const std::vector<int64_t>& chunk_indices, size_t parallelism) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.read", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "get_chunks")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.read", {{"storage.operation", "get_chunks"}});
   return get_chunks_sync(chunk_indices, parallelism);
 }
 
@@ -738,13 +707,7 @@ arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> ChunkReaderImpl:
 
 folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>> ChunkReaderImpl::get_chunks_async(
     const std::vector<int64_t>& chunk_indices, size_t parallelism) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.read", true, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "get_chunks_async")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
+  auto scope = tracing::TraceScope::Deferred("storage.read", {{"storage.operation", "get_chunks_async"}});
 
   // Plan on sorted unique chunks; fan-in below restores caller order and duplicates.
   std::vector<int64_t> unique_chunk_indices(chunk_indices.begin(), chunk_indices.end());
@@ -797,7 +760,7 @@ folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>
           .deferValue(
               [storage_context = tracing::Capture(), chunk_indices, task_chunk_lists = std::move(task_chunk_lists)](
                   auto&& all_results) -> arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> {
-                tracing::ContextScope storage_scope(storage_context);
+                auto storage_scope = tracing::AttachContext(storage_context);
                 tracing::StartCurrent();
                 std::unordered_map<int64_t, std::shared_ptr<arrow::RecordBatch>> all_rbs;
                 for (size_t i = 0; i < all_results.size(); ++i) {
@@ -828,13 +791,15 @@ folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>
                 }
                 return result;
               });
-  if (span) {
-    return std::move(future).defer(
-        [span, context](folly::Try<arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>>&& result) {
+  if (scope.span()) {
+    future = std::move(future).defer(
+        [span = scope.span(), context = scope.context()](
+            folly::Try<arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>>&& result) {
           tracing::EndSpan(span, context,
                            result.hasException() ? arrow::Status::UnknownError("exception") : result.value().status());
           return std::move(result);
         });
+    scope.ReleaseSpan();
   }
   return future;
 }
@@ -924,17 +889,7 @@ class ReaderImpl : public Reader {
    */
   [[nodiscard]] arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> get_record_batch_reader(
       const std::string& predicate) const override {
-    auto context = tracing::Capture();
-    auto span = context ? tracing::StartSpan(context, "storage.open", false, false,
-                                             opentelemetry::trace::SpanContext::GetInvalid(), "get_record_batch_reader")
-                        : nullptr;
-    std::optional<tracing::ContextScope> scope;
-    if (context)
-      scope.emplace(context);
-    SCOPE_EXIT {
-      if (span)
-        tracing::EndSpan(span, context);
-    };
+    tracing::TraceScope scope("storage.open", {{"storage.operation", "get_record_batch_reader"}});
 
     // empty column groups
     if (cgs_->size() == 0) {
@@ -979,17 +934,7 @@ class ReaderImpl : public Reader {
   [[nodiscard]] arrow::Result<std::unique_ptr<ChunkReader>> get_chunk_reader(
       int64_t column_group_index,
       const std::shared_ptr<std::vector<std::string>>& needed_columns = nullptr) const override {
-    auto context = tracing::Capture();
-    auto span = context ? tracing::StartSpan(context, "storage.open", false, false,
-                                             opentelemetry::trace::SpanContext::GetInvalid(), "get_chunk_reader")
-                        : nullptr;
-    std::optional<tracing::ContextScope> scope;
-    if (context)
-      scope.emplace(context);
-    SCOPE_EXIT {
-      if (span)
-        tracing::EndSpan(span, context);
-    };
+    tracing::TraceScope scope("storage.open", {{"storage.operation", "get_chunk_reader"}});
 
     if (column_group_index < 0 || static_cast<size_t>(column_group_index) >= cgs_->size()) {
       return arrow::Status::Invalid(
@@ -1015,13 +960,7 @@ class ReaderImpl : public Reader {
   [[nodiscard]] folly::SemiFuture<arrow::Result<std::unique_ptr<ChunkReader>>> get_chunk_reader_async(
       int64_t column_group_index,
       const std::shared_ptr<std::vector<std::string>>& needed_columns = nullptr) const override {
-    auto context = tracing::Capture();
-    auto span = context ? tracing::StartSpan(context, "storage.open", true, false,
-                                             opentelemetry::trace::SpanContext::GetInvalid(), "get_chunk_reader_async")
-                        : nullptr;
-    std::optional<tracing::ContextScope> scope;
-    if (context)
-      scope.emplace(context);
+    auto scope = tracing::TraceScope::Deferred("storage.open", {{"storage.operation", "get_chunk_reader_async"}});
 
     if (column_group_index < 0 || static_cast<size_t>(column_group_index) >= cgs_->size()) {
       return folly::makeSemiFuture(arrow::Result<std::unique_ptr<ChunkReader>>(arrow::Status::Invalid(
@@ -1047,17 +986,19 @@ class ReaderImpl : public Reader {
     auto future = chunk_reader_ptr->open_async().deferValue(
         [storage_context = tracing::Capture(), chunk_reader = std::move(chunk_reader)](
             arrow::Status status) mutable -> arrow::Result<std::unique_ptr<ChunkReader>> {
-          tracing::ContextScope storage_scope(storage_context);
+          auto storage_scope = tracing::AttachContext(storage_context);
           tracing::StartCurrent();
           ARROW_RETURN_NOT_OK(status);
           return std::move(chunk_reader);
         });
-    if (span) {
-      return std::move(future).defer([span, context](folly::Try<arrow::Result<std::unique_ptr<ChunkReader>>>&& result) {
+    if (scope.span()) {
+      future = std::move(future).defer([span = scope.span(), context = scope.context()](
+                                           folly::Try<arrow::Result<std::unique_ptr<ChunkReader>>>&& result) {
         tracing::EndSpan(span, context,
                          result.hasException() ? arrow::Status::UnknownError("exception") : result.value().status());
         return std::move(result);
       });
+      scope.ReleaseSpan();
     }
     return future;
   }
@@ -1069,17 +1010,7 @@ class ReaderImpl : public Reader {
       const std::vector<int64_t>& row_indices,
       size_t parallelism = 1,
       const std::shared_ptr<std::vector<std::string>>& needed_columns = nullptr) override {
-    auto context = tracing::Capture();
-    auto span = context ? tracing::StartSpan(context, "storage.read", false, false,
-                                             opentelemetry::trace::SpanContext::GetInvalid(), "take")
-                        : nullptr;
-    std::optional<tracing::ContextScope> scope;
-    if (context)
-      scope.emplace(context);
-    SCOPE_EXIT {
-      if (span)
-        tracing::EndSpan(span, context);
-    };
+    tracing::TraceScope scope("storage.read", {{"storage.operation", "take"}});
 
     // empty input row indices
     if (row_indices.empty()) {
@@ -1112,13 +1043,7 @@ class ReaderImpl : public Reader {
       const std::vector<int64_t>& row_indices,
       size_t parallelism = 1,
       const std::shared_ptr<std::vector<std::string>>& needed_columns = nullptr) override {
-    auto context = tracing::Capture();
-    auto span = context ? tracing::StartSpan(context, "storage.read", true, false,
-                                             opentelemetry::trace::SpanContext::GetInvalid(), "take_async")
-                        : nullptr;
-    std::optional<tracing::ContextScope> scope;
-    if (context)
-      scope.emplace(context);
+    auto scope = tracing::TraceScope::Deferred("storage.read", {{"storage.operation", "take_async"}});
 
     if (row_indices.empty()) {
       if (!schema_) {
@@ -1148,18 +1073,19 @@ class ReaderImpl : public Reader {
                       .deferValue([storage_context = tracing::Capture(), row_indices,
                                    resolved_columns = std::move(resolved_columns), schema = schema_,
                                    lazy_readers](auto&& tables_result) -> arrow::Result<std::shared_ptr<arrow::Table>> {
-                        tracing::ContextScope storage_scope(storage_context);
+                        auto storage_scope = tracing::AttachContext(storage_context);
                         tracing::StartCurrent();
                         ARROW_ASSIGN_OR_RAISE(auto tables, std::move(tables_result));
                         return build_take_table(tables, row_indices, resolved_columns, schema);
                       });
-    if (span) {
-      return std::move(future).defer([span,
-                                      context](folly::Try<arrow::Result<std::shared_ptr<arrow::Table>>>&& result) {
+    if (scope.span()) {
+      future = std::move(future).defer([span = scope.span(), context = scope.context()](
+                                           folly::Try<arrow::Result<std::shared_ptr<arrow::Table>>>&& result) {
         tracing::EndSpan(span, context,
                          result.hasException() ? arrow::Status::UnknownError("exception") : result.value().status());
         return std::move(result);
       });
+      scope.ReleaseSpan();
     }
     return future;
   }
@@ -1391,17 +1317,7 @@ arrow::Result<std::shared_ptr<arrow::Table>> ReaderImpl::build_take_table(
     const std::vector<int64_t>& row_indices,
     const std::vector<std::string>& resolved_columns,
     const std::shared_ptr<arrow::Schema>& schema) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.assemble", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "build_take_table")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.assemble", {{"storage.operation", "build_take_table"}});
 
   // Every input table represents one column group and has already been reordered
   // to the requested row order. Flatten their columns after verifying row counts.
@@ -1501,7 +1417,7 @@ folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::Table>>>> Rea
       .deferValue([storage_context = tracing::Capture(), row_indices, lazy_readers,
                    task_cg_indices = std::move(task_cg_indices), task_positions = std::move(task_positions)](
                       auto&& all_results) -> arrow::Result<std::vector<std::shared_ptr<arrow::Table>>> {
-        tracing::ContextScope storage_scope(storage_context);
+        auto storage_scope = tracing::AttachContext(storage_context);
         tracing::StartCurrent();
         std::vector<std::vector<std::shared_ptr<arrow::Table>>> per_cg_tables(lazy_readers->size());
         std::vector<std::vector<size_t>> per_cg_positions(lazy_readers->size());

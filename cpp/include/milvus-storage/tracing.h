@@ -4,8 +4,10 @@
 
 #include <array>
 #include <cstdint>
+#include <initializer_list>
 #include <memory>
 #include <string>
+#include <opentelemetry/common/attribute_value.h>
 #include <opentelemetry/trace/tracer_provider.h>
 
 #include <optional>
@@ -39,26 +41,6 @@ struct TraceOptions {
 // Changes apply to subsequent operations; active operations retain their snapshot.
 void SetTraceOptions(const TraceOptions& options);
 
-class TraceScope {
-  public:
-  ~TraceScope();
-  TraceScope(const TraceScope&) = delete;
-  TraceScope& operator=(const TraceScope&) = delete;
-  TraceScope(TraceScope&&) = delete;
-  TraceScope& operator=(TraceScope&&) = delete;
-
-  private:
-  struct Impl;
-  explicit TraceScope(const TraceParent& parent);
-  std::unique_ptr<Impl> impl_;
-  friend TraceScope AttachParent(const TraceParent& parent);
-};
-
-// Only changes the Storage RequestContext. Does not create/end a parent span
-// or modify OTel TLS. Invalid parents mask enclosing scopes. Destroy on the
-// same execution flow in stack order; Folly fibers may suspend with this guard.
-[[nodiscard]] TraceScope AttachParent(const TraceParent& parent);
-
 // Storage instrumentation and execution-context propagation.
 struct Context;
 using ContextPtr = std::shared_ptr<const Context>;
@@ -67,43 +49,98 @@ ContextPtr Capture();
 bool HasContext();
 void StartCurrent();
 
-class ContextScope {
-  public:
-  explicit ContextScope(ContextPtr context);
-
-  private:
-  std::optional<folly::ShallowCopyRequestContextScopeGuard> scope_;
-};
-
 // Spans are Arrow's actual thin wrapper. The separate context owns request
 // propagation, the provider snapshot, and per-operation accounting.
 using SpanPtr = std::shared_ptr<arrow::util::tracing::Span>;
 
-// Start from Capture(). The context is updated even when tracing is disabled so
-// asynchronous work retains that decision. A null span never owns its parent.
-SpanPtr StartSpan(ContextPtr& context,
-                  const char* name,
-                  bool lazy = false,
-                  bool io = false,
-                  opentelemetry::trace::SpanContext link = opentelemetry::trace::SpanContext::GetInvalid(),
-                  const char* operation = nullptr,
-                  const char* format = nullptr,
-                  bool create_span = true);
 void EnsureStarted(const SpanPtr& span, const ContextPtr& context);
 // A scope-only end leaves status unset. Explicit I/O/completion sites may pass
-// their actual status. Ending an unstarted lazy scope without a result is inert.
+// their actual status. Ending an unstarted deferred scope without a result is inert.
 void EndSpan(const SpanPtr& span, const ContextPtr& context, const std::optional<arrow::Status>& status = std::nullopt);
 bool IsEnabled(const ContextPtr& context);
-void AccountRead(const ContextPtr& context, int64_t requested, int64_t returned);
-void SetAttribute(const SpanPtr& span, const ContextPtr& context, const char* key, int64_t value);
-void SetAttribute(const SpanPtr& span, const ContextPtr& context, const char* key, const char* value);
+// Setting an attribute materializes a deferred span if it has not started yet.
+void SetAttribute(const SpanPtr& span,
+                  const ContextPtr& context,
+                  opentelemetry::nostd::string_view key,
+                  const opentelemetry::common::AttributeValue& value);
+// Resolve the span identity (or inherited parent). This starts a deferred span
+// when necessary to obtain its actual span ID; Capture() itself does not start it.
 opentelemetry::trace::SpanContext GetSpanContext(const ContextPtr& context);
+
+// Own a span for the current C++ scope. The destructor ends only that span,
+// then restores the previous Folly context. It never invokes business code,
+// catches exceptions, or interprets return values.
+class TraceScope {
+  public:
+  using Attributes =
+      std::initializer_list<std::pair<opentelemetry::nostd::string_view, opentelemetry::common::AttributeValue>>;
+  using Links = std::initializer_list<std::pair<opentelemetry::trace::SpanContext, Attributes>>;
+  explicit TraceScope(opentelemetry::nostd::string_view name,
+                      Attributes attributes = {},
+                      Links links = {},
+                      opentelemetry::trace::SpanKind kind = opentelemetry::trace::SpanKind::kInternal)
+      : TraceScope(name, attributes, links, kind, Mode::Scoped) {}
+  // Start when captured work executes, rather than when its SemiFuture is built.
+  // Names, attributes and links are copied; destroying unexecuted work emits nothing.
+  static TraceScope Deferred(opentelemetry::nostd::string_view name,
+                             Attributes attributes = {},
+                             Links links = {},
+                             opentelemetry::trace::SpanKind kind = opentelemetry::trace::SpanKind::kInternal);
+  ~TraceScope() {
+    if (span_)
+      EndSpan(span_, context_);
+  }
+  TraceScope(const TraceScope&) = delete;
+  TraceScope& operator=(const TraceScope&) = delete;
+  TraceScope(TraceScope&&) = delete;
+  TraceScope& operator=(TraceScope&&) = delete;
+
+  const SpanPtr& span() const { return span_; }
+  const ContextPtr& context() const { return context_; }
+  // Call after an async completion callback has captured span()/context().
+  // Only relinquishes span completion; context restoration still happens here.
+  void ReleaseSpan() { span_.reset(); }
+  // End this scope early and restore the previous context. Inner guards must
+  // have exited first, exactly as for normal stack destruction.
+  void Finish(const std::optional<arrow::Status>& status = std::nullopt);
+
+  private:
+  enum class Mode { Scoped, Deferred, IO };
+  TraceScope(opentelemetry::nostd::string_view name,
+             Attributes attributes,
+             Links links,
+             opentelemetry::trace::SpanKind kind,
+             Mode mode)
+      : context_(Capture()) {
+    // Keep the default disabled path local to the caller: it needs no span,
+    // configuration snapshot, attributes copy, or request-context guard.
+    if (context_)
+      Initialize(name, attributes, links, kind, mode);
+  }
+  void Initialize(opentelemetry::nostd::string_view name,
+                  Attributes attributes,
+                  Links links,
+                  opentelemetry::trace::SpanKind kind,
+                  Mode mode);
+  explicit TraceScope(ContextPtr context);
+  ContextPtr context_;
+  SpanPtr span_;
+  std::optional<folly::ShallowCopyRequestContextScopeGuard> scope_;
+  friend TraceScope AttachContext(ContextPtr context);
+  friend TraceScope TraceIO(opentelemetry::nostd::string_view name, Attributes attributes);
+};
+
+// Attach-only scopes never create or end the parent's span or modify OTel TLS.
+// Captured empty contexts and invalid parents mask enclosing scopes. Destroy
+// guards in stack order on the same execution flow (including Folly fibers).
+[[nodiscard]] TraceScope AttachContext(ContextPtr context);
+[[nodiscard]] TraceScope AttachParent(const TraceParent& parent);
 
 // Restores only Storage-owned data, preserving other RequestContext keys.
 template <typename F>
 auto Bind(F&& fn) {
   return [context = Capture(), fn = std::forward<F>(fn)](auto&&... args) mutable -> decltype(auto) {
-    ContextScope scope(context);
+    auto scope = AttachContext(context);
     StartCurrent();
     return fn(std::forward<decltype(args)>(args)...);
   };

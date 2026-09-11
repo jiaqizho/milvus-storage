@@ -31,8 +31,6 @@
 #include <arrow/type.h>
 #include <arrow/type_fwd.h>
 #include <fmt/format.h>
-#include <folly/ScopeGuard.h>
-
 #include "milvus-storage/common/arrow_util.h"
 #include "milvus-storage/common/constants.h"
 #include "milvus-storage/common/fiu_local.h"
@@ -193,7 +191,7 @@ ColumnGroupLazyReaderImpl<ReaderT>::open_reader_for_file_async(size_t file_index
         .deferValue([storage_context = tracing::Capture(),
                      format = column_group_->format](arrow::Result<std::shared_ptr<FormatReader>>&& reader_result)
                         -> arrow::Result<std::shared_ptr<ReaderT>> {
-          tracing::ContextScope storage_scope(storage_context);
+          auto storage_scope = tracing::AttachContext(storage_context);
           tracing::StartCurrent();
           ARROW_ASSIGN_OR_RAISE(auto reader, std::move(reader_result));
           auto typed_reader = std::dynamic_pointer_cast<ReaderT>(reader);
@@ -219,7 +217,7 @@ ColumnGroupLazyReaderImpl<ReaderT>::open_reader_for_file_async(size_t file_index
                      needed_columns =
                          needed_columns_](arrow::Result<typename ReaderT::MetaTrait::MetadataPtr>&& metadata_result)
                         -> folly::SemiFuture<arrow::Result<std::shared_ptr<ReaderT>>> {
-          tracing::ContextScope storage_scope(storage_context);
+          auto storage_scope = tracing::AttachContext(storage_context);
           tracing::StartCurrent();
           FOLLY_ARROW_ASSIGN_OR_RAISE(auto metadata, std::move(metadata_result));
           return ReaderT::MetaTrait::create_from_metadata_async(std::move(metadata), file, read_schema, needed_columns,
@@ -235,17 +233,7 @@ ColumnGroupLazyReaderImpl<ReaderT>::open_reader_for_file_async(size_t file_index
 template <typename ReaderT>
 arrow::Result<std::shared_ptr<arrow::Table>> ColumnGroupLazyReaderImpl<ReaderT>::take_rows_from_files(
     const std::vector<int64_t>& row_indices) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.read_task", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "take_rows_from_files")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.read_task", {{"storage.operation", "take_rows_from_files"}});
 
   const auto& cg_files = column_group_->files;
   std::vector<std::vector<int64_t>> indices_in_files(cg_files.size());
@@ -274,17 +262,7 @@ arrow::Result<std::shared_ptr<arrow::Table>> ColumnGroupLazyReaderImpl<ReaderT>:
 template <typename ReaderT>
 arrow::Result<std::shared_ptr<arrow::Table>> ColumnGroupLazyReaderImpl<ReaderT>::take(
     const std::vector<int64_t>& row_indices, size_t parallelism) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.read", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "take")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.read", {{"storage.operation", "take"}});
 
   FIU_RETURN_ON(FIUKEY_TAKE_ROWS_FAIL,
                 arrow::Status::IOError(fmt::format("Injected fault: {}", FIUKEY_TAKE_ROWS_FAIL)));
@@ -303,7 +281,7 @@ arrow::Result<std::shared_ptr<arrow::Table>> ColumnGroupLazyReaderImpl<ReaderT>:
   for (const auto& task_row_indices : splitted_row_indices) {
     std::packaged_task<arrow::Result<std::shared_ptr<arrow::Table>>()> task(
         [storage_context = tracing::Capture(), this, task_row_indices]() {
-          tracing::ContextScope storage_scope(storage_context);
+          auto storage_scope = tracing::AttachContext(storage_context);
           tracing::StartCurrent();
           return take_rows_from_files(task_row_indices);
         });
@@ -329,13 +307,7 @@ arrow::Result<std::shared_ptr<arrow::Table>> ColumnGroupLazyReaderImpl<ReaderT>:
 template <typename ReaderT>
 folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> ColumnGroupLazyReaderImpl<ReaderT>::take_async(
     const TakeTask& task) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.read_task", true, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "take_async")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
+  auto scope = tracing::TraceScope::Deferred("storage.read_task", {{"storage.operation", "take_async"}});
 
   FIU_RETURN_ON(FIUKEY_TAKE_ROWS_FAIL,
                 folly::makeSemiFuture(arrow::Result<std::shared_ptr<arrow::Table>>(
@@ -361,25 +333,27 @@ folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> ColumnGroupLazyR
                     .deferValue([storage_context = tracing::Capture(), rows_in_file = std::move(rows_in_file)](
                                     arrow::Result<std::shared_ptr<ReaderT>>&& reader_result)
                                     -> folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> {
-                      tracing::ContextScope storage_scope(storage_context);
+                      auto storage_scope = tracing::AttachContext(storage_context);
                       tracing::StartCurrent();
                       FOLLY_ARROW_ASSIGN_OR_RAISE(auto reader, std::move(reader_result));
                       return reader->take_async(rows_in_file)
                           .deferValue([storage_context = tracing::Capture(), reader = std::move(reader)](
                                           auto&& table_result) -> arrow::Result<std::shared_ptr<arrow::Table>> {
-                            tracing::ContextScope storage_scope(storage_context);
+                            auto storage_scope = tracing::AttachContext(storage_context);
                             tracing::StartCurrent();
                             // Lifetime-only capture: backend state must outlive the async take.
                             (void)reader;
                             return std::move(table_result);
                           });
                     });
-  if (span) {
-    return std::move(future).defer([span, context](folly::Try<arrow::Result<std::shared_ptr<arrow::Table>>>&& result) {
+  if (scope.span()) {
+    future = std::move(future).defer([span = scope.span(), context = scope.context()](
+                                         folly::Try<arrow::Result<std::shared_ptr<arrow::Table>>>&& result) {
       tracing::EndSpan(span, context,
                        result.hasException() ? arrow::Status::UnknownError("exception") : result.value().status());
       return std::move(result);
     });
+    scope.ReleaseSpan();
   }
   return future;
 }

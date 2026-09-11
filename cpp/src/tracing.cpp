@@ -2,9 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "milvus-storage/tracing.h"
 #include "milvus-storage/common/extend_status.h"
+#include "tracing/filesystem.h"
 #include <arrow/util/tracing_internal.h>
+#include <algorithm>
 #include <atomic>
 #include <mutex>
+#include <type_traits>
+#include <vector>
+#include <opentelemetry/sdk/common/attribute_utils.h>
 #include <opentelemetry/trace/trace_state.h>
 
 #ifndef ARROW_WITH_OPENTELEMETRY
@@ -32,6 +37,73 @@ struct Budget {
   std::atomic<int64_t> dropped{0};
   std::atomic<int64_t> reads{0}, requested_bytes{0}, returned_bytes{0};
 };
+// OTel's SDK owns attribute values; this view borrows them only for the duration
+// of each SDK callback. In particular, strings and arrays must survive deferred
+// execution and be present when the sampler receives StartSpan's attributes.
+class OwnedAttributes final : public opentelemetry::common::KeyValueIterable {
+  public:
+  explicit OwnedAttributes(TraceScope::Attributes attributes) : attributes_(attributes) {}
+
+  bool ForEachKeyValue(
+      opentelemetry::nostd::function_ref<bool(opentelemetry::nostd::string_view, opentelemetry::common::AttributeValue)>
+          callback) const noexcept override {
+    for (const auto& [key, attribute] : attributes_) {
+      const bool keep_going = opentelemetry::nostd::visit(
+          [&](const auto& value) {
+            using Value = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<Value, std::vector<bool>>) {
+              // vector<bool> has no contiguous bool storage to expose as a span.
+              auto values = std::make_unique<bool[]>(value.size());
+              std::copy(value.begin(), value.end(), values.get());
+              return callback(key, opentelemetry::nostd::span<const bool>(values.get(), value.size()));
+            } else if constexpr (std::is_same_v<Value, std::vector<std::string>>) {
+              std::vector<opentelemetry::nostd::string_view> values(value.begin(), value.end());
+              return callback(key, opentelemetry::nostd::span<const opentelemetry::nostd::string_view>(values));
+            } else if constexpr (std::is_arithmetic_v<Value>) {
+              return callback(key, value);
+            } else if constexpr (std::is_same_v<Value, std::string>) {
+              return callback(key, opentelemetry::nostd::string_view(value));
+            } else {
+              return callback(key, opentelemetry::nostd::span<const typename Value::value_type>(value));
+            }
+          },
+          attribute);
+      if (!keep_going)
+        return false;
+    }
+    return true;
+  }
+
+  size_t size() const noexcept override { return attributes_.size(); }
+
+  private:
+  const opentelemetry::sdk::common::AttributeMap attributes_;
+};
+struct DeferredSpan final : ot::SpanContextKeyValueIterable {
+  DeferredSpan(opentelemetry::nostd::string_view span_name,
+               TraceScope::Attributes span_attributes,
+               TraceScope::Links span_links)
+      : name(span_name), attributes(span_attributes) {
+    links.reserve(span_links.size());
+    for (const auto& [context, values] : span_links) links.emplace_back(context, values);
+  }
+
+  bool ForEachKeyValue(
+      opentelemetry::nostd::function_ref<bool(ot::SpanContext, const opentelemetry::common::KeyValueIterable&)>
+          callback) const noexcept override {
+    for (const auto& [context, values] : links) {
+      if (!callback(context, values))
+        return false;
+    }
+    return true;
+  }
+
+  size_t size() const noexcept override { return links.size(); }
+
+  const std::string name;
+  const OwnedAttributes attributes;
+  std::vector<std::pair<ot::SpanContext, OwnedAttributes>> links;
+};
 struct SpanState {
   mutable std::mutex mutex;
   // Arrow owns the span representation; the SDK span starts only when work
@@ -40,16 +112,17 @@ struct SpanState {
   ContextPtr parent;
   std::shared_ptr<const Configuration> config;
   std::shared_ptr<Budget> budget;
-  const char* name;
-  const char* operation = nullptr;
-  const char* format = nullptr;
-  ot::SpanContext link = ot::SpanContext::GetInvalid();
+  // Immediate spans borrow creation arguments; only deferred spans need copies.
+  std::unique_ptr<DeferredSpan> deferred;
+  ot::SpanKind kind = ot::SpanKind::kInternal;
   bool finished = false;
   bool root = false;
   // Publishes the immutable span pointer (or a disabled decision) once Start
   // completes. Keep this beside the other flags to reuse their padding.
   std::atomic<bool> started{false};
-  void Start();
+  void Start(opentelemetry::nostd::string_view name = {},
+             TraceScope::Attributes attributes = {},
+             TraceScope::Links links = {});
   ~SpanState() {
     if (span && span->valid() && !finished) {
       auto& arrow_span = *span;
@@ -75,7 +148,9 @@ ot::SpanContext Parent(const ContextPtr& context) {
   op->Start();
   return op->span && op->span->valid() ? at::UnwrapSpan(op->span->details.get())->GetContext() : Parent(op->parent);
 }
-void SpanState::Start() {
+void SpanState::Start(opentelemetry::nostd::string_view name,
+                      TraceScope::Attributes attributes,
+                      TraceScope::Links links) {
   if (started.load(std::memory_order_acquire))
     return;
   std::lock_guard<std::mutex> lock(mutex);
@@ -90,15 +165,11 @@ void SpanState::Start() {
   }
   ot::StartSpanOptions options;
   options.parent = parent_context;
-  auto& ot_span = link.IsValid()
-                      ? at::RewrapSpan(span->details.get(), config->tracer->StartSpan(name, {}, {{link, {}}}, options))
-                      : at::RewrapSpan(span->details.get(), config->tracer->StartSpan(name, options));
-  if (ot_span && ot_span->IsRecording()) {
-    if (operation)
-      ot_span->SetAttribute("storage.operation", operation);
-    if (format)
-      ot_span->SetAttribute("storage.format", format);
-  }
+  options.kind = kind;
+  at::RewrapSpan(span->details.get(),
+                 deferred ? config->tracer->StartSpan(deferred->name, deferred->attributes, *deferred, options)
+                          : config->tracer->StartSpan(name, attributes, links, options));
+  deferred.reset();
   started.store(true, std::memory_order_release);
 }
 struct Data final : folly::RequestData {
@@ -124,29 +195,34 @@ void StartCurrent() {
   if (context && context->operation)
     context->operation->Start();
 }
-ContextScope::ContextScope(ContextPtr context) {
-  // Common disabled path does not allocate a RequestContext. A captured empty
-  // context must still mask unrelated context on a foreign completion thread.
-  if (context || HasContext())
-    scope_.emplace(storage_key, std::make_unique<Data>(std::move(context)));
+TraceScope::TraceScope(ContextPtr context) : context_(std::move(context)) {
+  // A captured empty context must mask unrelated context on a foreign thread.
+  if (context_ || HasContext())
+    scope_.emplace(storage_key, std::make_unique<Data>(context_));
 }
-
-struct TraceScope::Impl {
-  explicit Impl(const TraceParent& parent)
-      : scope(std::make_shared<Context>(Context{ot::SpanContext(ot::TraceId(parent.trace_id),
-                                                                ot::SpanId(parent.span_id),
-                                                                ot::TraceFlags(parent.trace_flags),
-                                                                parent.is_remote,
-                                                                ot::TraceState::FromHeader(parent.tracestate)),
-                                                nullptr})) {}
-  ContextScope scope;
-};
-TraceScope::TraceScope(const TraceParent& parent) {
+TraceScope TraceScope::Deferred(opentelemetry::nostd::string_view name,
+                                Attributes attributes,
+                                Links links,
+                                ot::SpanKind kind) {
+  return TraceScope(name, attributes, links, kind, Mode::Deferred);
+}
+TraceScope TraceIO(opentelemetry::nostd::string_view name, TraceScope::Attributes attributes) {
+  return TraceScope(name, attributes, {}, ot::SpanKind::kInternal, TraceScope::Mode::IO);
+}
+void TraceScope::Finish(const std::optional<arrow::Status>& status) {
+  if (span_)
+    EndSpan(span_, context_, status);
+  span_.reset();
+  scope_.reset();
+}
+TraceScope AttachContext(ContextPtr context) { return TraceScope(std::move(context)); }
+TraceScope AttachParent(const TraceParent& parent) {
   contexts_seen.store(true, std::memory_order_relaxed);
-  impl_ = std::make_unique<Impl>(parent);
+  return AttachContext(std::make_shared<Context>(Context{
+      ot::SpanContext(ot::TraceId(parent.trace_id), ot::SpanId(parent.span_id), ot::TraceFlags(parent.trace_flags),
+                      parent.is_remote, ot::TraceState::FromHeader(parent.tracestate)),
+      nullptr}));
 }
-TraceScope::~TraceScope() = default;
-TraceScope AttachParent(const TraceParent& parent) { return TraceScope(parent); }
 void SetTracerProvider(ProviderPtr provider) {
   auto tracer = provider ? provider->GetTracer("milvus-storage", MILVUS_STORAGE_VERSION) : nullptr;
   std::lock_guard<std::mutex> lock(configuration_mutex);
@@ -161,61 +237,51 @@ void SetTraceOptions(const TraceOptions& options) {
   next->options = options;
   configuration = std::move(next);
 }
-SpanPtr StartSpan(ContextPtr& context,
-                  const char* name,
-                  bool lazy,
-                  bool io,
-                  ot::SpanContext link,
-                  const char* operation,
-                  const char* format,
-                  bool create_span) {
-  if (!context || context->disabled || !create_span)
-    return nullptr;
-  const bool root = !context->operation;
-  std::shared_ptr<const Configuration> config;
-  std::shared_ptr<Budget> budget;
-  if (!root) {
-    config = context->operation->config;
-    // Children retain their parent's fixed configuration even if the host
-    // injects a provider later. No child state is needed for suppressed spans.
-    if (!config->tracer || (io && !config->options.io_spans))
-      return nullptr;
-    budget = context->operation->budget;
-    if (budget->used.fetch_add(1, std::memory_order_relaxed) >=
-        std::max<uint32_t>(1, config->options.max_spans_per_operation)) {
-      budget->dropped.fetch_add(1, std::memory_order_relaxed);
-      return nullptr;
-    }
-  } else {
-    if (!context->parent.IsValid())
-      return nullptr;
-    {
+void TraceScope::Initialize(
+    opentelemetry::nostd::string_view name, Attributes attributes, Links links, ot::SpanKind kind, Mode mode) {
+  const bool root = !context_->operation;
+  if (!context_->disabled && (!root || context_->parent.IsValid())) {
+    std::shared_ptr<const Configuration> config;
+    std::shared_ptr<Budget> budget;
+    if (root) {
       std::lock_guard<std::mutex> lock(configuration_mutex);
       config = configuration;
+    } else {
+      config = context_->operation->config;
+      budget = context_->operation->budget;
     }
-    if (!config->tracer || (io && !config->options.io_spans)) {
-      context = std::make_shared<Context>(Context{context->parent, nullptr, true});
-      return nullptr;
+    bool create = config->tracer && (mode != Mode::IO || config->options.io_spans);
+    if (!root && create &&
+        budget->used.fetch_add(1, std::memory_order_relaxed) >=
+            std::max<uint32_t>(1, config->options.max_spans_per_operation)) {
+      budget->dropped.fetch_add(1, std::memory_order_relaxed);
+      create = false;
     }
-    budget = std::make_shared<Budget>();
+    if (root && !create) {
+      // Retain the disabled decision even if the host replaces its provider.
+      context_ = std::make_shared<Context>(Context{context_->parent, nullptr, true});
+    } else if (create) {
+      if (root) {
+        budget = std::make_shared<Budget>();
+        budget->used.store(1, std::memory_order_relaxed);
+      }
+      auto state = std::make_shared<SpanState>();
+      state->parent = context_;
+      state->kind = kind;
+      state->config = std::move(config);
+      state->budget = std::move(budget);
+      state->root = root;
+      state->span.emplace();
+      span_ = SpanPtr(state, &*state->span);
+      if (mode == Mode::Deferred)
+        state->deferred = std::make_unique<DeferredSpan>(name, attributes, links);
+      else
+        state->Start(name, attributes, links);
+      context_ = std::make_shared<Context>(Context{ot::SpanContext::GetInvalid(), std::move(state)});
+    }
   }
-  auto state = std::make_shared<SpanState>();
-  state->parent = context;
-  state->name = name;
-  state->operation = operation;
-  state->format = format;
-  state->link = std::move(link);
-  state->config = std::move(config);
-  state->budget = std::move(budget);
-  state->root = root;
-  if (state->root)
-    state->budget->used.store(1, std::memory_order_relaxed);
-  state->span.emplace();
-  SpanPtr span(state, &*state->span);
-  context = std::make_shared<Context>(Context{ot::SpanContext::GetInvalid(), std::move(state)});
-  if (!lazy)
-    EnsureStarted(span, context);
-  return span;
+  // Suppression keeps the inherited context active without owning its span.
+  scope_.emplace(storage_key, std::make_unique<Data>(context_));
 }
 bool IsEnabled(const ContextPtr& context) { return context && context->operation; }
 void AccountRead(const ContextPtr& context, int64_t requested, int64_t returned) {
@@ -270,12 +336,10 @@ void EndSpan(const SpanPtr& owned_span, const ContextPtr& context, const std::op
   }
   END_SPAN(arrow_span);
 }
-void SetAttribute(const SpanPtr& span, const ContextPtr& context, const char* key, int64_t value) {
-  EnsureStarted(span, context);
-  if (span && span->valid())
-    at::UnwrapSpan(span->details.get())->SetAttribute(key, value);
-}
-void SetAttribute(const SpanPtr& span, const ContextPtr& context, const char* key, const char* value) {
+void SetAttribute(const SpanPtr& span,
+                  const ContextPtr& context,
+                  opentelemetry::nostd::string_view key,
+                  const opentelemetry::common::AttributeValue& value) {
   EnsureStarted(span, context);
   if (span && span->valid())
     at::UnwrapSpan(span->details.get())->SetAttribute(key, value);

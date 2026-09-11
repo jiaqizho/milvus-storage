@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "tracing/filesystem.h"
 #include <arrow/buffer.h>
-#include <folly/ScopeGuard.h>
 #include <arrow/util/future.h>
 #include <limits>
 #include <mutex>
@@ -31,89 +30,70 @@ class TracedFile : public arrow::io::RandomAccessFile {
   arrow::Result<std::shared_ptr<const arrow::KeyValueMetadata>> ReadMetadata() override {
     if (!HasContext())
       return file_->ReadMetadata();
-    auto context = Capture();
-    auto span = StartSpan(context, "storage.fs.metadata", false, true);
-    ContextScope scope(context);
-    SCOPE_EXIT { EndSpan(span, context); };
+    auto scope = TraceIO("storage.fs.metadata");
     auto result = file_->ReadMetadata();
-    EndSpan(span, context, result.status());
+    scope.Finish(result.status());
     return result;
   }
   arrow::Future<std::shared_ptr<const arrow::KeyValueMetadata>> ReadMetadataAsync(
       const arrow::io::IOContext& context) override {
     if (!HasContext())
       return file_->ReadMetadataAsync(context);
-    auto trace_context = Capture();
-    auto span = StartSpan(trace_context, "storage.fs.metadata", false, true);
-    ContextScope scope(trace_context);
-    auto cleanup = folly::makeGuard([&] { EndSpan(span, trace_context); });
+    auto scope = TraceIO("storage.fs.metadata");
     auto result = file_->ReadMetadataAsync(context);
-    if (span) {
-      result.AddCallback(
-          [span, trace_context](const arrow::Result<std::shared_ptr<const arrow::KeyValueMetadata>>& completed) {
-            EndSpan(span, trace_context, completed.status());
-          });
+    if (scope.span()) {
+      result.AddCallback([span = scope.span(), context = scope.context()](
+                             const arrow::Result<std::shared_ptr<const arrow::KeyValueMetadata>>& completed) {
+        EndSpan(span, context, completed.status());
+      });
     }
-    cleanup.dismiss();
+    scope.ReleaseSpan();
     return result;
   }
   arrow::Result<int64_t> GetSize() override {
     if (!HasContext())
       return file_->GetSize();
-    auto context = Capture();
-    auto span = StartSpan(context, "storage.fs.head", false, true);
-    ContextScope scope(context);
-    SCOPE_EXIT { EndSpan(span, context); };
+    auto scope = TraceIO("storage.fs.head");
     auto result = file_->GetSize();
-    EndSpan(span, context, result.status());
+    scope.Finish(result.status());
     return result;
   }
   arrow::Result<int64_t> Read(int64_t nbytes, void* out) override {
     if (!HasContext())
       return file_->Read(nbytes, out);
-    auto context = Capture();
-    auto span = StartSpan(context, "storage.fs.read", false, true);
-    ContextScope scope(context);
-    SCOPE_EXIT { EndSpan(span, context); };
-    Attributes(span, context, -1, nbytes);
+    auto scope = TraceIO("storage.fs.read",
+                         {{"storage.backend", backend_}, {"storage.offset", -1}, {"storage.requested_bytes", nbytes}});
     auto result = file_->Read(nbytes, out);
-    RecordRead(span, context, nbytes, result.ok() ? Bytes(*result) : 0, result.status());
+    RecordRead(scope.span(), scope.context(), nbytes, result.ok() ? Bytes(*result) : 0, result.status());
     return result;
   }
   arrow::Result<std::shared_ptr<arrow::Buffer>> Read(int64_t nbytes) override {
     if (!HasContext())
       return file_->Read(nbytes);
-    auto context = Capture();
-    auto span = StartSpan(context, "storage.fs.read", false, true);
-    ContextScope scope(context);
-    SCOPE_EXIT { EndSpan(span, context); };
-    Attributes(span, context, -1, nbytes);
+    auto scope = TraceIO("storage.fs.read",
+                         {{"storage.backend", backend_}, {"storage.offset", -1}, {"storage.requested_bytes", nbytes}});
     auto result = file_->Read(nbytes);
-    RecordRead(span, context, nbytes, result.ok() ? Bytes(*result) : 0, result.status());
+    RecordRead(scope.span(), scope.context(), nbytes, result.ok() ? Bytes(*result) : 0, result.status());
     return result;
   }
   arrow::Result<int64_t> ReadAt(int64_t position, int64_t nbytes, void* out) override {
     if (!HasContext())
       return file_->ReadAt(position, nbytes, out);
-    auto context = Capture();
-    auto span = StartSpan(context, "storage.fs.read", false, true);
-    ContextScope scope(context);
-    SCOPE_EXIT { EndSpan(span, context); };
-    Attributes(span, context, position, nbytes);
+    auto scope =
+        TraceIO("storage.fs.read",
+                {{"storage.backend", backend_}, {"storage.offset", position}, {"storage.requested_bytes", nbytes}});
     auto result = file_->ReadAt(position, nbytes, out);
-    RecordRead(span, context, nbytes, result.ok() ? Bytes(*result) : 0, result.status());
+    RecordRead(scope.span(), scope.context(), nbytes, result.ok() ? Bytes(*result) : 0, result.status());
     return result;
   }
   arrow::Result<std::shared_ptr<arrow::Buffer>> ReadAt(int64_t position, int64_t nbytes) override {
     if (!HasContext())
       return file_->ReadAt(position, nbytes);
-    auto context = Capture();
-    auto span = StartSpan(context, "storage.fs.read", false, true);
-    ContextScope scope(context);
-    SCOPE_EXIT { EndSpan(span, context); };
-    Attributes(span, context, position, nbytes);
+    auto scope =
+        TraceIO("storage.fs.read",
+                {{"storage.backend", backend_}, {"storage.offset", position}, {"storage.requested_bytes", nbytes}});
     auto result = file_->ReadAt(position, nbytes);
-    RecordRead(span, context, nbytes, result.ok() ? Bytes(*result) : 0, result.status());
+    RecordRead(scope.span(), scope.context(), nbytes, result.ok() ? Bytes(*result) : 0, result.status());
     return result;
   }
   arrow::Future<std::shared_ptr<arrow::Buffer>> ReadAsync(const arrow::io::IOContext& context,
@@ -121,35 +101,31 @@ class TracedFile : public arrow::io::RandomAccessFile {
                                                           int64_t nbytes) override {
     if (!HasContext())
       return file_->ReadAsync(context, position, nbytes);
-    auto trace_context = Capture();
-    auto span = StartSpan(trace_context, "storage.fs.read", false, true);
-    ContextScope scope(trace_context);
-    auto cleanup = folly::makeGuard([&] { EndSpan(span, trace_context); });
-    Attributes(span, trace_context, position, nbytes);
+    auto scope =
+        TraceIO("storage.fs.read",
+                {{"storage.backend", backend_}, {"storage.offset", position}, {"storage.requested_bytes", nbytes}});
     auto result = file_->ReadAsync(context, position, nbytes);
-    if (IsEnabled(trace_context)) {
-      result.AddCallback([span, trace_context, nbytes](const arrow::Result<std::shared_ptr<arrow::Buffer>>& completed) {
+    if (IsEnabled(scope.context())) {
+      result.AddCallback([span = scope.span(), context = scope.context(),
+                          nbytes](const arrow::Result<std::shared_ptr<arrow::Buffer>>& completed) {
         if (completed.ok())
-          SetAttribute(span, trace_context, "storage.short_read", static_cast<int64_t>(Bytes(*completed) < nbytes));
-        RecordRead(span, trace_context, nbytes, completed.ok() ? Bytes(*completed) : 0, completed.status());
+          SetAttribute(span, context, "storage.short_read", static_cast<int64_t>(Bytes(*completed) < nbytes));
+        RecordRead(span, context, nbytes, completed.ok() ? Bytes(*completed) : 0, completed.status());
       });
     }
-    cleanup.dismiss();
+    scope.ReleaseSpan();
     return result;
   }
   std::vector<arrow::Future<std::shared_ptr<arrow::Buffer>>> ReadManyAsync(
       const arrow::io::IOContext& context, const std::vector<arrow::io::ReadRange>& ranges) override {
     if (!HasContext())
       return file_->ReadManyAsync(context, ranges);
-    tracing::ContextPtr trace_context = tracing::Capture();
-    tracing::SpanPtr trace = tracing::StartSpan(trace_context, "storage.fs.read", false, true);
-    ContextScope scope(trace_context);
-    auto cleanup = folly::makeGuard([&] { EndSpan(trace, trace_context); });
-
+    auto scope = TraceIO("storage.fs.read",
+                         {{"storage.backend", backend_}, {"storage.range_count", static_cast<int64_t>(ranges.size())}});
+    const auto& trace = scope.span();
+    const auto& trace_context = scope.context();
     if (!tracing::IsEnabled(trace_context))
       return file_->ReadManyAsync(context, ranges);
-    tracing::SetAttribute(trace, trace_context, "storage.backend", backend_.c_str());
-    tracing::SetAttribute(trace, trace_context, "storage.range_count", static_cast<int64_t>(ranges.size()));
     int64_t requested = 0;
     for (const auto& range : ranges) {
       auto length = std::max<int64_t>(0, range.length);
@@ -185,7 +161,7 @@ class TracedFile : public arrow::io::RandomAccessFile {
         }
       });
     }
-    cleanup.dismiss();
+    scope.ReleaseSpan();
     return futures;
   }
 
@@ -201,11 +177,7 @@ class TracedFile : public arrow::io::RandomAccessFile {
     }
     EndSpan(span, context, status);
   }
-  void Attributes(const SpanPtr& trace, const ContextPtr& trace_context, int64_t position, int64_t nbytes) {
-    tracing::SetAttribute(trace, trace_context, "storage.backend", backend_.c_str());
-    tracing::SetAttribute(trace, trace_context, "storage.offset", position);
-    tracing::SetAttribute(trace, trace_context, "storage.requested_bytes", nbytes);
-  }
+
   std::shared_ptr<arrow::io::RandomAccessFile> file_;
   std::string backend_;
 };
@@ -220,35 +192,32 @@ class TracedAsyncFile final : public TracedFile, public NonBlockingRandomAccessF
   arrow::Future<int64_t> ReadAtAsyncInto(int64_t position, int64_t nbytes, uint8_t* out) override {
     if (!HasContext())
       return async_->ReadAtAsyncInto(position, nbytes, out);
-    auto context = Capture();
-    auto span = StartSpan(context, "storage.fs.read", false, true);
-    ContextScope scope(context);
-    auto cleanup = folly::makeGuard([&] { EndSpan(span, context); });
-    Attributes(span, context, position, nbytes);
+    auto scope =
+        TraceIO("storage.fs.read",
+                {{"storage.backend", backend_}, {"storage.offset", position}, {"storage.requested_bytes", nbytes}});
     auto result = async_->ReadAtAsyncInto(position, nbytes, out);
-    if (IsEnabled(context)) {
-      result.AddCallback([span, context, nbytes](const arrow::Result<int64_t>& completed) {
-        if (completed.ok())
-          SetAttribute(span, context, "storage.short_read", static_cast<int64_t>(Bytes(*completed) < nbytes));
-        RecordRead(span, context, nbytes, completed.ok() ? Bytes(*completed) : 0, completed.status());
-      });
+    if (IsEnabled(scope.context())) {
+      result.AddCallback(
+          [span = scope.span(), context = scope.context(), nbytes](const arrow::Result<int64_t>& completed) {
+            if (completed.ok())
+              SetAttribute(span, context, "storage.short_read", static_cast<int64_t>(Bytes(*completed) < nbytes));
+            RecordRead(span, context, nbytes, completed.ok() ? Bytes(*completed) : 0, completed.status());
+          });
     }
-    cleanup.dismiss();
+    scope.ReleaseSpan();
     return result;
   }
   arrow::Future<int64_t> GetSizeAsync() override {
     if (!HasContext())
       return async_->GetSizeAsync();
-    auto context = Capture();
-    auto span = StartSpan(context, "storage.fs.head", false, true);
-    ContextScope scope(context);
-    auto cleanup = folly::makeGuard([&] { EndSpan(span, context); });
+    auto scope = TraceIO("storage.fs.head");
     auto result = async_->GetSizeAsync();
-    if (span) {
-      result.AddCallback(
-          [span, context](const arrow::Result<int64_t>& completed) { EndSpan(span, context, completed.status()); });
+    if (scope.span()) {
+      result.AddCallback([span = scope.span(), context = scope.context()](const arrow::Result<int64_t>& completed) {
+        EndSpan(span, context, completed.status());
+      });
     }
-    cleanup.dismiss();
+    scope.ReleaseSpan();
     return result;
   }
 

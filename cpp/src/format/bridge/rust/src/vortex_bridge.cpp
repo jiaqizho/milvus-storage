@@ -9,8 +9,6 @@
 #include <string_view>
 
 #include <arrow/record_batch.h>
-#include <folly/ScopeGuard.h>
-
 #include "bridge_util.h"
 
 namespace milvus_storage::vortex {
@@ -23,15 +21,7 @@ class VortexErrorTranslatingReader final : public arrow::RecordBatchReader {
   std::shared_ptr<arrow::Schema> schema() const override { return inner_->schema(); }
 
   arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch>* batch) override {
-    auto context = tracing::Capture();
-    auto span = context ? tracing::StartSpan(context, "storage.format.read") : nullptr;
-    std::optional<tracing::ContextScope> scope;
-    if (context)
-      scope.emplace(context);
-    SCOPE_EXIT {
-      if (span)
-        tracing::EndSpan(span, context);
-    };
+    tracing::TraceScope scope("storage.format.read");
     return MakeBridgeErrorStatus("Failed to read vortex record batch", inner_->ReadNext(batch));
   }
 

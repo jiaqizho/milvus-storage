@@ -30,7 +30,6 @@
 #include <arrow/compute/api.h>
 #include <arrow/table.h>
 #include <fmt/format.h>
-#include <folly/ScopeGuard.h>
 #include <folly/json/json.h>
 #include <parquet/arrow/reader.h>
 
@@ -296,18 +295,10 @@ IcebergFormatReader::IcebergFormatReader(std::shared_ptr<parquet::ParquetFormatR
       logical_row_group_infos_(std::move(logical_row_group_infos)) {}
 
 arrow::Status IcebergFormatReader::open() {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.metadata.load", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "open", "iceberg",
-                                           !MetadataCache::HasTracedLoad())
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  auto scope = MetadataCache::HasTracedLoad()
+                   ? tracing::AttachContext(tracing::Capture())
+                   : tracing::TraceScope("storage.metadata.load",
+                                         {{"storage.operation", "open"}, {"storage.format", "iceberg"}});
 
   ARROW_RETURN_NOT_OK(inner_reader_->open());
   ARROW_ASSIGN_OR_RAISE(projected_schema_, build_projected_schema(inner_reader_->get_schema(), needed_columns_));
@@ -459,17 +450,7 @@ arrow::Result<std::vector<uint64_t>> IcebergFormatReader::get_rg_column_memsz(in
 }
 
 arrow::Result<std::shared_ptr<arrow::RecordBatch>> IcebergFormatReader::get_chunk(const int& row_group_index) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.format.read", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "get_chunk", "iceberg")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.format.read", {{"storage.operation", "get_chunk"}, {"storage.format", "iceberg"}});
 
   // Check if this logical row group has zero rows (e.g. all rows deleted)
   if (row_group_index >= 0 && static_cast<size_t>(row_group_index) < logical_row_group_infos_.size()) {
@@ -496,17 +477,8 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> IcebergFormatReader::get_chun
 
 arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> IcebergFormatReader::get_chunks(
     const std::vector<int>& rg_indices_in_file) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.format.read", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "get_chunks", "iceberg")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.format.read",
+                            {{"storage.operation", "get_chunks"}, {"storage.format", "iceberg"}});
 
   ARROW_ASSIGN_OR_RAISE(auto batches, inner_reader_->get_chunks(rg_indices_in_file));
 
@@ -528,17 +500,7 @@ arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> IcebergFormatRea
 }
 
 arrow::Result<std::shared_ptr<arrow::Table>> IcebergFormatReader::take(const std::vector<int64_t>& row_indices) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.format.read", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "take", "iceberg")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.format.read", {{"storage.operation", "take"}, {"storage.format", "iceberg"}});
 
   if (row_indices.empty()) {
     return arrow::Table::MakeEmpty(output_schema());
@@ -561,18 +523,8 @@ arrow::Result<std::shared_ptr<arrow::Table>> IcebergFormatReader::take(const std
 
 arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> IcebergFormatReader::read_with_range(
     const uint64_t& start_offset, const uint64_t& end_offset) {
-  auto context = tracing::Capture();
-  auto span = context
-                  ? tracing::StartSpan(context, "storage.format.read", false, false,
-                                       opentelemetry::trace::SpanContext::GetInvalid(), "read_with_range", "iceberg")
-                  : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.format.read",
+                            {{"storage.operation", "read_with_range"}, {"storage.format", "iceberg"}});
 
   // Empty range — return immediately (e.g. all rows deleted)
   if (start_offset >= end_offset) {

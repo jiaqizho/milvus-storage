@@ -5,8 +5,8 @@
 namespace milvus_storage::rust_bridge::ffi {
 namespace {
 struct ScopedAttachment final : TraceAttachment {
-  explicit ScopedAttachment(tracing::ContextPtr context) : scope(std::move(context)) {}
-  tracing::ContextScope scope;
+  explicit ScopedAttachment(tracing::ContextPtr context) : scope(tracing::AttachContext(std::move(context))) {}
+  tracing::TraceScope scope;
 };
 }  // namespace
 TraceAttachment::~TraceAttachment() = default;

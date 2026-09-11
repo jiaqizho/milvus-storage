@@ -13,7 +13,6 @@
 // limitations under the License.
 
 #include "milvus-storage/tracing.h"
-#include <folly/ScopeGuard.h>
 #include "milvus-storage/format/format_reader_cache.h"
 
 #include "milvus-storage/format/vortex/vortex_format_reader.h"
@@ -437,7 +436,7 @@ static void vortex_open_async_callback(void* ctx_raw, uintptr_t handle, const ch
                                                                    &vortex_free_error_string);
 
   try {
-    tracing::ContextScope scope(ctx->trace_context);
+    auto scope = tracing::AttachContext(ctx->trace_context);
     if (error) {
       ctx->Complete(MakeBridgeErrorStatus("Failed to open vortex file", error.get()));
       return;
@@ -518,7 +517,7 @@ VortexFormatReader::MetaTrait::load_metadata_async(const api::ColumnGroupFile& f
   return folly::makeSemiFuture().deferValue(
       [storage_context = tracing::Capture(), file,
        properties](folly::Unit) -> folly::SemiFuture<arrow::Result<VortexFormatReader::MetaTrait::MetadataPtr>> {
-        tracing::ContextScope storage_scope(storage_context);
+        auto storage_scope = tracing::AttachContext(storage_context);
         tracing::StartCurrent();
         FOLLY_ARROW_ASSIGN_OR_RAISE(auto fs, FilesystemCache::getInstance().get(properties, file.path));
         FOLLY_ARROW_ASSIGN_OR_RAISE(auto uri, StorageUri::Parse(file.path));
@@ -528,7 +527,7 @@ VortexFormatReader::MetaTrait::load_metadata_async(const api::ColumnGroupFile& f
         // Snapshot immutable schema/split metadata only after async open succeeds.
         return reader->open_async().deferValue([storage_context = tracing::Capture(), reader = std::move(reader),
                                                 file](arrow::Status status) -> arrow::Result<MetadataPtr> {
-          tracing::ContextScope storage_scope(storage_context);
+          auto storage_scope = tracing::AttachContext(storage_context);
           tracing::StartCurrent();
           ARROW_RETURN_NOT_OK(status);
           return create_metadata_from_reader(reader, file);
@@ -567,7 +566,7 @@ VortexFormatReader::MetaTrait::create_from_metadata_async(MetadataPtr metadata,
   return folly::makeSemiFuture().deferValue(
       [storage_context = tracing::Capture(), metadata = std::move(metadata), file, read_schema, needed_columns,
        predicate](folly::Unit) -> arrow::Result<std::shared_ptr<VortexFormatReader>> {
-        tracing::ContextScope storage_scope(storage_context);
+        auto storage_scope = tracing::AttachContext(storage_context);
         tracing::StartCurrent();
         return create_from_metadata(std::move(metadata), file, read_schema, needed_columns, predicate);
       });
@@ -627,19 +626,10 @@ VortexFormatReader::VortexFormatReader(MetaTrait::MetadataPtr metadata,
 }
 
 arrow::Status VortexFormatReader::open() {
-  auto span_context = tracing::Capture();
-  auto span = span_context ? tracing::StartSpan(span_context, "storage.metadata.load", false, false,
-                                                opentelemetry::trace::SpanContext::GetInvalid(), "open", "vortex",
-                                                !MetadataCache::HasTracedLoad())
-                           : nullptr;
-  std::optional<tracing::ContextScope> span_scope;
-  if (span_context)
-    span_scope.emplace(span_context);
-
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, span_context);
-  };
+  auto span_scope =
+      MetadataCache::HasTracedLoad()
+          ? tracing::AttachContext(tracing::Capture())
+          : tracing::TraceScope("storage.metadata.load", {{"storage.operation", "open"}, {"storage.format", "vortex"}});
 
   assert(!vxfile_);
 
@@ -669,19 +659,10 @@ arrow::Status VortexFormatReader::open() {
 }
 
 folly::SemiFuture<arrow::Status> VortexFormatReader::open_async() {
-  auto trace_context = tracing::Capture();
-  auto trace = trace_context ? tracing::StartSpan(trace_context, "storage.metadata.load", false, false,
-                                                  opentelemetry::trace::SpanContext::GetInvalid(), "open_async",
-                                                  "vortex", !MetadataCache::HasTracedLoad())
-                             : nullptr;
-  std::optional<tracing::ContextScope> span_scope;
-  if (trace_context)
-    span_scope.emplace(trace_context);
-
-  auto span_cleanup = folly::makeGuard([&] {
-    if (trace)
-      tracing::EndSpan(trace, trace_context);
-  });
+  auto span_scope = MetadataCache::HasTracedLoad()
+                        ? tracing::AttachContext(tracing::Capture())
+                        : tracing::TraceScope("storage.metadata.load",
+                                              {{"storage.operation", "open_async"}, {"storage.format", "vortex"}});
 
   assert(!vxfile_);
 
@@ -711,12 +692,12 @@ folly::SemiFuture<arrow::Status> VortexFormatReader::open_async() {
     read_schema_ = nullptr;
   }
 
-  auto ctx = std::make_unique<VortexOpenAsyncContext>(trace, trace_context);
+  auto ctx = std::make_unique<VortexOpenAsyncContext>(span_scope.span(), span_scope.context());
   auto semi_future = ctx->promise.getSemiFuture();
   // The callback imports the owned Rust handle and publishes reader state only
   // after schema and logical chunk metadata have both been derived successfully.
   ctx->initialize = [storage_context = tracing::Capture(), self = std::move(self)](uintptr_t handle) -> arrow::Status {
-    tracing::ContextScope storage_scope(storage_context);
+    auto storage_scope = tracing::AttachContext(storage_context);
     tracing::StartCurrent();
     ARROW_ASSIGN_OR_RAISE(auto vxfile_unique, VortexFile::FromRawHandle(handle));
     auto vxfile = std::shared_ptr<VortexFile>(std::move(vxfile_unique));
@@ -741,7 +722,7 @@ folly::SemiFuture<arrow::Status> VortexFormatReader::open_async() {
   // Validation failures may call back synchronously, so transfer ownership
   // before crossing the FFI boundary.
   auto* raw_ctx = ctx.release();
-  span_cleanup.dismiss();
+  span_scope.ReleaseSpan();
 
   vortex_open_file_async(reinterpret_cast<uint8_t*>(fs_holder_.get()), path_.data(), path_.size(), file_size_,
                          footer_size_, vortex_open_async_callback, static_cast<void*>(raw_ctx));
@@ -798,18 +779,8 @@ arrow::Result<std::vector<uint64_t>> VortexFormatReader::get_rg_column_memsz(int
 }
 
 arrow::Result<std::shared_ptr<arrow::RecordBatch>> VortexFormatReader::get_chunk(const int& row_group_index) {
-  auto span_context = tracing::Capture();
-  auto span = span_context ? tracing::StartSpan(span_context, "storage.format.read", false, false,
-                                                opentelemetry::trace::SpanContext::GetInvalid(), "get_chunk", "vortex")
-                           : nullptr;
-  std::optional<tracing::ContextScope> span_scope;
-  if (span_context)
-    span_scope.emplace(span_context);
-
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, span_context);
-  };
+  tracing::TraceScope span_scope("storage.format.read",
+                                 {{"storage.operation", "get_chunk"}, {"storage.format", "vortex"}});
 
   assert(vxfile_);
   if (row_group_index < 0 || static_cast<size_t>(row_group_index) >= row_group_infos_.size()) {
@@ -834,18 +805,8 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> VortexFormatReader::get_chunk
 
 arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> VortexFormatReader::get_chunks(
     const std::vector<int>& rg_indices_in_file) {
-  auto span_context = tracing::Capture();
-  auto span = span_context ? tracing::StartSpan(span_context, "storage.format.read", false, false,
-                                                opentelemetry::trace::SpanContext::GetInvalid(), "get_chunks", "vortex")
-                           : nullptr;
-  std::optional<tracing::ContextScope> span_scope;
-  if (span_context)
-    span_scope.emplace(span_context);
-
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, span_context);
-  };
+  tracing::TraceScope span_scope("storage.format.read",
+                                 {{"storage.operation", "get_chunks"}, {"storage.format", "vortex"}});
 
   assert(vxfile_);
   std::vector<std::shared_ptr<arrow::RecordBatch>> rbs;
@@ -1012,18 +973,7 @@ arrow::Result<std::shared_ptr<arrow::ChunkedArray>> VortexFormatReader::blocking
 }
 
 arrow::Result<std::shared_ptr<arrow::Table>> VortexFormatReader::take(const std::vector<int64_t>& row_indices) {
-  auto span_context = tracing::Capture();
-  auto span = span_context ? tracing::StartSpan(span_context, "storage.format.read", false, false,
-                                                opentelemetry::trace::SpanContext::GetInvalid(), "take", "vortex")
-                           : nullptr;
-  std::optional<tracing::ContextScope> span_scope;
-  if (span_context)
-    span_scope.emplace(span_context);
-
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, span_context);
-  };
+  tracing::TraceScope span_scope("storage.format.read", {{"storage.operation", "take"}, {"storage.format", "vortex"}});
 
   assert(vxfile_);
   ARROW_ASSIGN_OR_RAISE(auto scan_builder, vxfile_->CreateScanBuilder(kSmallCoalescingWindow));
@@ -1067,19 +1017,8 @@ arrow::Result<std::shared_ptr<arrow::Table>> VortexFormatReader::take(const std:
 
 arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> VortexFormatReader::read_with_range(
     const uint64_t& start_offset, const uint64_t& end_offset) {
-  auto span_context = tracing::Capture();
-  auto span = span_context
-                  ? tracing::StartSpan(span_context, "storage.format.read", false, false,
-                                       opentelemetry::trace::SpanContext::GetInvalid(), "read_with_range", "vortex")
-                  : nullptr;
-  std::optional<tracing::ContextScope> span_scope;
-  if (span_context)
-    span_scope.emplace(span_context);
-
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, span_context);
-  };
+  tracing::TraceScope span_scope("storage.format.read",
+                                 {{"storage.operation", "read_with_range"}, {"storage.format", "vortex"}});
 
   assert(vxfile_);
   return streaming_read(start_offset, end_offset, kLargeCoalescingWindow);
@@ -1124,7 +1063,7 @@ static void vortex_take_async_callback(void* ctx_raw,
                                                                    &vortex_free_error_string);
 
   try {
-    tracing::ContextScope scope(ctx->trace_context);
+    auto scope = tracing::AttachContext(ctx->trace_context);
     if (error) {
       ctx->Complete(MakeBridgeErrorStatus("Failed to take from vortex file", error.get()));
       return;
@@ -1177,7 +1116,7 @@ static void vortex_read_range_async_callback(void* ctx_raw,
                                                                    &vortex_free_error_string);
 
   try {
-    tracing::ContextScope scope(ctx->trace_context);
+    auto scope = tracing::AttachContext(ctx->trace_context);
     if (error) {
       ctx->Complete(MakeBridgeErrorStatus("Failed to read vortex file", error.get()));
       return;
@@ -1202,19 +1141,8 @@ static void vortex_read_range_async_callback(void* ctx_raw,
 
 folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> VortexFormatReader::take_async(
     const std::vector<int64_t>& row_indices) {
-  auto trace_context = tracing::Capture();
-  auto trace = trace_context
-                   ? tracing::StartSpan(trace_context, "storage.format.read", false, false,
-                                        opentelemetry::trace::SpanContext::GetInvalid(), "take_async", "vortex")
-                   : nullptr;
-  std::optional<tracing::ContextScope> span_scope;
-  if (trace_context)
-    span_scope.emplace(trace_context);
-
-  auto span_cleanup = folly::makeGuard([&] {
-    if (trace)
-      tracing::EndSpan(trace, trace_context);
-  });
+  tracing::TraceScope span_scope("storage.format.read",
+                                 {{"storage.operation", "take_async"}, {"storage.format", "vortex"}});
 
   assert(vxfile_);
 
@@ -1240,13 +1168,14 @@ folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> VortexFormatRead
                               validate_and_cast_row_indices(row_indices, vxfile_->RowCount(), path_));
   scan_builder.WithIncludeByIndex(include_indices.data(), include_indices.size());
 
-  auto ctx = std::make_unique<VortexAsyncContext<std::shared_ptr<arrow::Table>>>(trace, trace_context);
+  auto ctx =
+      std::make_unique<VortexAsyncContext<std::shared_ptr<arrow::Table>>>(span_scope.span(), span_scope.context());
   auto semi_future = ctx->promise.getSemiFuture();
   // Rust consumes the scan handle and may invoke the callback synchronously on
   // setup failure, so hand off the callback context before the FFI call.
   uintptr_t handle = std::move(scan_builder).IntoRawHandle();
   auto* raw_ctx = ctx.release();
-  span_cleanup.dismiss();
+  span_scope.ReleaseSpan();
 
   // This call schedules collection on Tokio. The Folly promise is only the C++
   // completion bridge; a caller-supplied Folly executor does not run the scan.
@@ -1256,19 +1185,8 @@ folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> VortexFormatRead
 
 folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>> VortexFormatReader::read_with_range_async(
     uint64_t start_offset, uint64_t end_offset) {
-  auto trace_context = tracing::Capture();
-  auto trace = trace_context ? tracing::StartSpan(trace_context, "storage.format.read", false, false,
-                                                  opentelemetry::trace::SpanContext::GetInvalid(),
-                                                  "read_with_range_async", "vortex")
-                             : nullptr;
-  std::optional<tracing::ContextScope> span_scope;
-  if (trace_context)
-    span_scope.emplace(trace_context);
-
-  auto span_cleanup = folly::makeGuard([&] {
-    if (trace)
-      tracing::EndSpan(trace, trace_context);
-  });
+  tracing::TraceScope span_scope("storage.format.read",
+                                 {{"storage.operation", "read_with_range_async"}, {"storage.format", "vortex"}});
 
   assert(vxfile_);
 
@@ -1294,13 +1212,14 @@ folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>> Vort
   // Vortex interprets this as the file-local interval [start_offset, end_offset).
   scan_builder.WithRowRange(start_offset, end_offset);
 
-  auto ctx = std::make_unique<VortexAsyncContext<std::shared_ptr<arrow::RecordBatchReader>>>(trace, trace_context);
+  auto ctx = std::make_unique<VortexAsyncContext<std::shared_ptr<arrow::RecordBatchReader>>>(span_scope.span(),
+                                                                                             span_scope.context());
   auto semi_future = ctx->promise.getSemiFuture();
   // Rust consumes the scan handle and may invoke the callback synchronously on
   // setup failure, so hand off the callback context before the FFI call.
   uintptr_t handle = std::move(scan_builder).IntoRawHandle();
   auto* raw_ctx = ctx.release();
-  span_cleanup.dismiss();
+  span_scope.ReleaseSpan();
 
   // Rust collects the selected batches on Tokio, writes the Arrow C stream into
   // raw_ctx, and invokes the callback that fulfills this Folly future.

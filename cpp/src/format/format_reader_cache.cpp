@@ -71,8 +71,7 @@ arrow::Status FormatReaderMetadataCache<ReaderT>::add(
 template <typename ReaderT>
 arrow::Result<typename FormatReaderMetadataCache<ReaderT>::MetadataPtr> FormatReaderMetadataCache<ReaderT>::get_or_open(
     const std::string& key, const typename FormatReaderMetadataCache<ReaderT>::MetadataLoader& load_fn) {
-  tracing::ContextPtr lookup_context = tracing::Capture();
-  tracing::SpanPtr lookup = tracing::StartSpan(lookup_context, "storage.metadata.lookup");
+  tracing::TraceScope lookup("storage.metadata.lookup");
   std::shared_ptr<InFlightLoad> in_flight_load;
   bool owns_in_flight_load = false;
   {
@@ -81,8 +80,8 @@ arrow::Result<typename FormatReaderMetadataCache<ReaderT>::MetadataPtr> FormatRe
     // Return cached immutable metadata without entering the singleflight path.
     auto cached = entries_.find(key);
     if (cached != entries_.end()) {
-      tracing::SetAttribute(lookup, lookup_context, "storage.cache", "hit");
-      tracing::EndSpan(lookup, lookup_context, arrow::Status::OK());
+      tracing::SetAttribute(lookup.span(), lookup.context(), "storage.cache", "hit");
+      lookup.Finish(arrow::Status::OK());
       return cached->second.metadata;
     }
 
@@ -93,20 +92,23 @@ arrow::Result<typename FormatReaderMetadataCache<ReaderT>::MetadataPtr> FormatRe
     auto [it, inserted] = in_flight_loads_.try_emplace(key, std::make_shared<InFlightLoad>(InFlightLoad::kSync));
     in_flight_load = it->second;
     owns_in_flight_load = inserted;
-    tracing::SetAttribute(lookup, lookup_context, "storage.cache", inserted ? "miss" : "in_flight");
-    tracing::EndSpan(lookup, lookup_context, arrow::Status::OK());
+    tracing::SetAttribute(lookup.span(), lookup.context(), "storage.cache", inserted ? "miss" : "in_flight");
+    lookup.Finish(arrow::Status::OK());
     if (inserted && tracing::HasContext()) {
-      in_flight_load->trace_context = tracing::Capture();
-      in_flight_load->trace = tracing::StartSpan(in_flight_load->trace_context, "storage.metadata.load", true);
+      auto load = tracing::TraceScope::Deferred("storage.metadata.load");
+      in_flight_load->trace_context = load.context();
+      in_flight_load->trace = load.span();
+      load.ReleaseSpan();
     }
     if (!inserted && in_flight_load->leader_type == InFlightLoad::kSync) {
       // condition_variable::wait releases mutex_ while sleeping, so other keys
       // and the leader can still update the cache. The current thread remains blocked.
-      tracing::ContextPtr wait_context = tracing::Capture();
-      tracing::SpanPtr wait = tracing::StartSpan(wait_context, "storage.metadata.wait", false, false,
-                                                 tracing::GetSpanContext(in_flight_load->trace_context));
+      const auto leader = tracing::GetSpanContext(in_flight_load->trace_context);
+      tracing::TraceScope wait(
+          "storage.metadata.wait", {},
+          leader.IsValid() ? tracing::TraceScope::Links{{leader, {}}} : tracing::TraceScope::Links{});
       in_flight_load->cv.wait(lock, [&in_flight_load]() { return in_flight_load->done; });
-      tracing::EndSpan(wait, wait_context, in_flight_load->status);
+      wait.Finish(in_flight_load->status);
       if (!in_flight_load->status.ok()) {
         return in_flight_load->status;
       }
@@ -123,12 +125,14 @@ arrow::Result<typename FormatReaderMetadataCache<ReaderT>::MetadataPtr> FormatRe
   auto load_trace = in_flight_load->trace;
   auto load_trace_context = in_flight_load->trace_context;
   if (!owns_in_flight_load) {
-    load_trace_context = tracing::Capture();
-    load_trace = tracing::StartSpan(load_trace_context, "storage.metadata.load", true);
+    auto load = tracing::TraceScope::Deferred("storage.metadata.load");
+    load_trace_context = load.context();
+    load_trace = load.span();
+    load.ReleaseSpan();
   }
   if (load_trace)
     tracing::EnsureStarted(load_trace, load_trace_context);
-  tracing::ContextScope load_scope(load_trace_context);
+  auto load_scope = tracing::AttachContext(load_trace_context);
   std::optional<folly::ShallowCopyRequestContextScopeGuard> metadata_scope;
   if (tracing::IsEnabled(load_trace_context))
     metadata_scope.emplace(metadata_load_key, std::make_unique<MetadataLoadData>(load_trace_context));
@@ -186,10 +190,9 @@ FormatReaderMetadataCache<ReaderT>::get_or_open_async(
 
   return folly::makeSemiFuture().deferValue([storage_context = tracing::Capture(), self = std::move(self), key,
                                              load_fn](folly::Unit) -> folly::SemiFuture<MetadataResult> {
-    tracing::ContextScope storage_scope(storage_context);
+    auto storage_scope = tracing::AttachContext(storage_context);
     tracing::StartCurrent();
-    tracing::ContextPtr lookup_context = tracing::Capture();
-    tracing::SpanPtr lookup = tracing::StartSpan(lookup_context, "storage.metadata.lookup");
+    tracing::TraceScope lookup("storage.metadata.lookup");
     std::shared_ptr<InFlightLoad> in_flight_load;
     {
       std::lock_guard<std::mutex> lock(self->mutex_);
@@ -198,8 +201,8 @@ FormatReaderMetadataCache<ReaderT>::get_or_open_async(
       // populated it after get_or_open_async() returned its deferred future.
       auto cached = self->entries_.find(key);
       if (cached != self->entries_.end()) {
-        tracing::SetAttribute(lookup, lookup_context, "storage.cache", "hit");
-        tracing::EndSpan(lookup, lookup_context, arrow::Status::OK());
+        tracing::SetAttribute(lookup.span(), lookup.context(), "storage.cache", "hit");
+        lookup.Finish(arrow::Status::OK());
         return folly::makeSemiFuture(MetadataResult(cached->second.metadata));
       }
 
@@ -207,28 +210,34 @@ FormatReaderMetadataCache<ReaderT>::get_or_open_async(
       // blocking a thread. Only the caller that inserts the marker runs load_fn.
       auto [it, inserted] = self->in_flight_loads_.try_emplace(key, std::make_shared<InFlightLoad>());
       in_flight_load = it->second;
-      tracing::SetAttribute(lookup, lookup_context, "storage.cache", inserted ? "miss" : "in_flight");
-      tracing::EndSpan(lookup, lookup_context, arrow::Status::OK());
+      tracing::SetAttribute(lookup.span(), lookup.context(), "storage.cache", inserted ? "miss" : "in_flight");
+      lookup.Finish(arrow::Status::OK());
       if (!inserted) {
         if (!tracing::HasContext())
           return in_flight_load->async_result.getSemiFuture();
-        tracing::ContextPtr wait_context = tracing::Capture();
-        tracing::SpanPtr wait = tracing::StartSpan(wait_context, "storage.metadata.wait", false, false,
-                                                   tracing::GetSpanContext(in_flight_load->trace_context));
-        return in_flight_load->async_result.getSemiFuture().deferValue([wait, wait_context](MetadataResult result) {
-          tracing::EndSpan(wait, wait_context, result.status());
-          return result;
-        });
+        const auto leader = tracing::GetSpanContext(in_flight_load->trace_context);
+        tracing::TraceScope wait(
+            "storage.metadata.wait", {},
+            leader.IsValid() ? tracing::TraceScope::Links{{leader, {}}} : tracing::TraceScope::Links{});
+        auto future = in_flight_load->async_result.getSemiFuture().deferValue(
+            [span = wait.span(), context = wait.context()](MetadataResult result) {
+              tracing::EndSpan(span, context, result.status());
+              return result;
+            });
+        wait.ReleaseSpan();
+        return future;
       }
       if (tracing::HasContext()) {
-        in_flight_load->trace_context = tracing::Capture();
-        in_flight_load->trace = tracing::StartSpan(in_flight_load->trace_context, "storage.metadata.load", true);
+        auto load = tracing::TraceScope::Deferred("storage.metadata.load");
+        in_flight_load->trace_context = load.context();
+        in_flight_load->trace = load.span();
+        load.ReleaseSpan();
       }
     }
 
     if (in_flight_load->trace)
       tracing::EnsureStarted(in_flight_load->trace, in_flight_load->trace_context);
-    tracing::ContextScope load_scope(in_flight_load->trace_context);
+    auto load_scope = tracing::AttachContext(in_flight_load->trace_context);
     std::optional<folly::ShallowCopyRequestContextScopeGuard> metadata_scope;
     if (tracing::IsEnabled(in_flight_load->trace_context))
       metadata_scope.emplace(metadata_load_key, std::make_unique<MetadataLoadData>(in_flight_load->trace_context));
@@ -237,7 +246,7 @@ FormatReaderMetadataCache<ReaderT>::get_or_open_async(
     try {
       return load_fn().defer([storage_context = tracing::Capture(), self, key,
                               in_flight_load](folly::Try<MetadataResult>&& load_try) -> MetadataResult {
-        tracing::ContextScope storage_scope(storage_context);
+        auto storage_scope = tracing::AttachContext(storage_context);
         tracing::StartCurrent();
         if (load_try.hasException()) {
           auto message = load_try.exception().what();

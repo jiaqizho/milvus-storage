@@ -35,7 +35,6 @@
 #include <arrow/type.h>
 #include <arrow/type_fwd.h>
 #include <fmt/format.h>
-#include <folly/ScopeGuard.h>
 #include <folly/executors/IOThreadPoolExecutor.h>
 
 #include "milvus-storage/common/arrow_util.h"
@@ -276,7 +275,7 @@ folly::SemiFuture<arrow::Result<std::shared_ptr<ReaderT>>> ColumnGroupReaderImpl
         .deferValue([storage_context = tracing::Capture(), predicate = predicate_,
                      format = column_group_->format](arrow::Result<std::shared_ptr<FormatReader>>&& reader_result)
                         -> arrow::Result<std::shared_ptr<ReaderT>> {
-          tracing::ContextScope storage_scope(storage_context);
+          auto storage_scope = tracing::AttachContext(storage_context);
           tracing::StartCurrent();
           ARROW_ASSIGN_OR_RAISE(auto reader, std::move(reader_result));
           if (!predicate.empty()) {
@@ -305,7 +304,7 @@ folly::SemiFuture<arrow::Result<std::shared_ptr<ReaderT>>> ColumnGroupReaderImpl
                      needed_columns = needed_columns_,
                      predicate = predicate_](arrow::Result<typename ReaderT::MetaTrait::MetadataPtr>&& metadata_result)
                         -> folly::SemiFuture<arrow::Result<std::shared_ptr<ReaderT>>> {
-          tracing::ContextScope storage_scope(storage_context);
+          auto storage_scope = tracing::AttachContext(storage_context);
           tracing::StartCurrent();
           FOLLY_ARROW_ASSIGN_OR_RAISE(auto metadata, std::move(metadata_result));
           return ReaderT::MetaTrait::create_from_metadata_async(std::move(metadata), file, read_schema, needed_columns,
@@ -371,7 +370,7 @@ folly::SemiFuture<arrow::Status> ColumnGroupReaderImpl<ReaderT>::open_async() {
     auto future = open_reader_for_file_async(file_idx).deferValue(
         [storage_context = tracing::Capture(), file_idx,
          cg_file](arrow::Result<std::shared_ptr<ReaderT>>&& reader_result) -> arrow::Result<OpenedFile> {
-          tracing::ContextScope storage_scope(storage_context);
+          auto storage_scope = tracing::AttachContext(storage_context);
           tracing::StartCurrent();
           ARROW_ASSIGN_OR_RAISE(auto reader, std::move(reader_result));
           ARROW_ASSIGN_OR_RAISE(auto row_group_infos, reader->get_row_group_infos());
@@ -386,7 +385,7 @@ folly::SemiFuture<arrow::Status> ColumnGroupReaderImpl<ReaderT>::open_async() {
   return folly::collectAll(std::move(futures))
       .deferValue([storage_context = tracing::Capture(), this,
                    file_count = cg_files.size()](auto&& open_results) -> arrow::Status {
-        tracing::ContextScope storage_scope(storage_context);
+        auto storage_scope = tracing::AttachContext(storage_context);
         tracing::StartCurrent();
         chunk_infos_.clear();
         row_group_infos_.clear();
@@ -454,17 +453,7 @@ arrow::Result<std::vector<int64_t>> ColumnGroupReaderImpl<ReaderT>::get_chunk_in
 
 template <typename ReaderT>
 arrow::Result<std::shared_ptr<arrow::RecordBatch>> ColumnGroupReaderImpl<ReaderT>::get_chunk(int64_t chunk_index) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.read", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "get_chunk")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.read", {{"storage.operation", "get_chunk"}});
 
   assert(opened_);
   FIU_RETURN_ON(FIUKEY_COLUMN_GROUP_READ_FAIL,
@@ -545,17 +534,7 @@ static std::vector<std::vector<int64_t>> split_chunks(const std::vector<int64_t>
 
 template <typename ReaderT>
 ChunkRBMapResult ColumnGroupReaderImpl<ReaderT>::read_chunks_from_files(const std::vector<int64_t>& task_indices) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.read_task", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "read_chunks_from_files")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.read_task", {{"storage.operation", "read_chunks_from_files"}});
 
   std::unordered_map<int64_t, std::shared_ptr<arrow::RecordBatch>> chunk_rb_map;
   std::vector<std::vector<int64_t>> chunk_idxs_in_files(column_group_->files.size());
@@ -636,17 +615,7 @@ ChunkRBMapResult ColumnGroupReaderImpl<ReaderT>::read_chunks_from_files(const st
 template <typename ReaderT>
 arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> ColumnGroupReaderImpl<ReaderT>::get_chunks(
     const std::vector<int64_t>& chunk_indices, size_t parallelism) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.read", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "get_chunks")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.read", {{"storage.operation", "get_chunks"}});
 
   assert(opened_);
 
@@ -672,7 +641,7 @@ arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> ColumnGroupReade
 
     for (const auto& task_indices : splitted_chunks) {
       std::packaged_task<ChunkRBMapResult()> task([storage_context = tracing::Capture(), this, task_indices]() {
-        tracing::ContextScope storage_scope(storage_context);
+        auto storage_scope = tracing::AttachContext(storage_context);
         tracing::StartCurrent();
         return read_chunks_from_files(task_indices);
       });
@@ -777,13 +746,7 @@ const ChunkInfo& ColumnGroupReaderImpl<ReaderT>::get_chunk_info(int64_t chunk_in
 template <typename ReaderT>
 folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>>
 ColumnGroupReaderImpl<ReaderT>::get_chunks_async(const ChunkTask& task) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.read_task", true, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "get_chunks_async")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
+  auto scope = tracing::TraceScope::Deferred("storage.read_task", {{"storage.operation", "get_chunks_async"}});
 
   FIU_RETURN_ON(FIUKEY_COLUMN_GROUP_READ_FAIL,
                 folly::makeSemiFuture(arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>(
@@ -816,14 +779,14 @@ ColumnGroupReaderImpl<ReaderT>::get_chunks_async(const ChunkTask& task) {
               [storage_context = tracing::Capture(), range_start = task.range_start, range_end = task.range_end,
                chunk_infos = std::move(chunk_infos)](arrow::Result<std::shared_ptr<ReaderT>>&& reader_result) mutable
               -> folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>> {
-                tracing::ContextScope storage_scope(storage_context);
+                auto storage_scope = tracing::AttachContext(storage_context);
                 tracing::StartCurrent();
                 FOLLY_ARROW_ASSIGN_OR_RAISE(auto reader, std::move(reader_result));
                 return reader->read_with_range_async(range_start, range_end)
                     .deferValue([storage_context = tracing::Capture(), reader = std::move(reader),
                                  chunk_infos = std::move(chunk_infos)](auto&& rb_reader_result)
                                     -> arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> {
-                      tracing::ContextScope storage_scope(storage_context);
+                      auto storage_scope = tracing::AttachContext(storage_context);
                       tracing::StartCurrent();
                       // Lifetime-only capture: drain the Arrow reader before releasing
                       // the independent FormatReader that produced it.
@@ -854,13 +817,15 @@ ColumnGroupReaderImpl<ReaderT>::get_chunks_async(const ChunkTask& task) {
                       return result;
                     });
               });
-  if (span) {
-    return std::move(future).defer(
-        [span, context](folly::Try<arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>>&& result) {
+  if (scope.span()) {
+    future = std::move(future).defer(
+        [span = scope.span(), context = scope.context()](
+            folly::Try<arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>>&& result) {
           tracing::EndSpan(span, context,
                            result.hasException() ? arrow::Status::UnknownError("exception") : result.value().status());
           return std::move(result);
         });
+    scope.ReleaseSpan();
   }
   return future;
 }
@@ -985,7 +950,7 @@ folly::SemiFuture<arrow::Result<std::unique_ptr<ColumnGroupReader>>> ColumnGroup
           return reader_ptr->open_async().deferValue(
               [storage_context = tracing::Capture(), reader = std::move(reader)](
                   arrow::Status status) mutable -> arrow::Result<std::unique_ptr<ColumnGroupReader>> {
-                tracing::ContextScope storage_scope(storage_context);
+                auto storage_scope = tracing::AttachContext(storage_context);
                 tracing::StartCurrent();
                 ARROW_RETURN_NOT_OK(status);
                 return std::move(reader);

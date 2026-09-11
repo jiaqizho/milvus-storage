@@ -37,8 +37,6 @@
 #include <arrow/status.h>
 #include <arrow/result.h>
 #include <fmt/format.h>
-#include <folly/ScopeGuard.h>
-
 #include "milvus-storage/common/fiu_local.h"
 #include "milvus-storage/common/log.h"
 #include "milvus-storage/common/lrucache.h"
@@ -613,18 +611,10 @@ arrow::Result<std::shared_ptr<LanceTableReader>> LanceTableReader::MetaTrait::cr
 }
 
 arrow::Status LanceTableReader::open() {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.metadata.load", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "open", "lance",
-                                           !MetadataCache::HasTracedLoad())
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  auto scope =
+      MetadataCache::HasTracedLoad()
+          ? tracing::AttachContext(tracing::Capture())
+          : tracing::TraceScope("storage.metadata.load", {{"storage.operation", "open"}, {"storage.format", "lance"}});
 
   assert(!fragment_reader_);
 
@@ -725,17 +715,7 @@ arrow::Result<std::vector<uint64_t>> LanceTableReader::get_rg_column_memsz(int64
 }
 
 arrow::Result<std::shared_ptr<arrow::RecordBatch>> LanceTableReader::get_chunk(const int& row_group_index) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.format.read", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "get_chunk", "lance")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.format.read", {{"storage.operation", "get_chunk"}, {"storage.format", "lance"}});
 
   assert(fragment_reader_);
   auto start_idx = row_group_infos_[row_group_index].start_offset;
@@ -760,17 +740,7 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> LanceTableReader::get_chunk(c
 
 arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> LanceTableReader::get_chunks(
     const std::vector<int>& rg_indices_in_file) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.format.read", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "get_chunks", "lance")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.format.read", {{"storage.operation", "get_chunks"}, {"storage.format", "lance"}});
 
   assert(fragment_reader_);
   std::vector<std::shared_ptr<arrow::RecordBatch>> rbs;
@@ -825,17 +795,7 @@ arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> LanceTableReader
 }
 
 arrow::Result<std::shared_ptr<arrow::Table>> LanceTableReader::take(const std::vector<int64_t>& row_indices) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.format.read", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "take", "lance")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.format.read", {{"storage.operation", "take"}, {"storage.format", "lance"}});
 
   assert(fragment_reader_);
   ARROW_ASSIGN_OR_RAISE(auto array_stream, fragment_reader_->TakeAsStream(row_indices, row_indices.size()));
@@ -862,17 +822,8 @@ arrow::Result<std::shared_ptr<arrow::Table>> LanceTableReader::take(const std::v
 
 arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> LanceTableReader::read_with_range(const uint64_t& start_offset,
                                                                                            const uint64_t& end_offset) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.format.read", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "read_with_range", "lance")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.format.read",
+                            {{"storage.operation", "read_with_range"}, {"storage.format", "lance"}});
 
   assert(fragment_reader_);
   // Lance's read_range accepts logical indices directly.

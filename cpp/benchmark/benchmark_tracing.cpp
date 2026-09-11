@@ -1,7 +1,6 @@
 // Copyright 2026 Zilliz
 // SPDX-License-Identifier: Apache-2.0
 #include <benchmark/benchmark.h>
-#include <folly/ScopeGuard.h>
 #include <opentelemetry/exporters/memory/in_memory_span_exporter.h>
 #include <opentelemetry/sdk/trace/simple_processor.h>
 #include <opentelemetry/sdk/trace/tracer_provider.h>
@@ -30,20 +29,9 @@ void BM_StorageTracing(benchmark::State& state) {
   parent.span_id[0] = 1;
   parent.trace_flags = mode == 3 ? 1 : 0;
   const auto iteration = [] {
-    auto context = Capture();
-    auto span = context ? StartSpan(context, "storage.read") : nullptr;
-    std::optional<ContextScope> scope;
-    if (context)
-      scope.emplace(context);
-    SCOPE_EXIT {
-      if (span)
-        EndSpan(span, context);
-    };
+    TraceScope scope("storage.read");
     for (int i = 0; i < 4; ++i) {
-      auto child_context = Capture();
-      auto child = child_context ? StartSpan(child_context, "storage.read_task") : nullptr;
-      if (child)
-        EndSpan(child, child_context);
+      TraceScope child("storage.read_task");
       benchmark::DoNotOptimize(arrow::Status::OK());
     }
   };

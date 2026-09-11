@@ -28,7 +28,6 @@
 #include <arrow/compute/api.h>
 #include <arrow/table.h>
 #include <fmt/format.h>
-#include <folly/ScopeGuard.h>
 #include <nlohmann/json.hpp>
 
 #include "milvus-storage/common/arrow_util.h"
@@ -612,18 +611,10 @@ PaimonFormatReader::PaimonFormatReader(MetaTrait::MetadataPtr metadata,
 bool PaimonFormatReader::is_data_split() const { return metadata_->payload.read_path == kDataSplitReadPath; }
 
 arrow::Status PaimonFormatReader::open() {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.metadata.load", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "open", "paimon",
-                                           !MetadataCache::HasTracedLoad())
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  auto scope =
+      MetadataCache::HasTracedLoad()
+          ? tracing::AttachContext(tracing::Capture())
+          : tracing::TraceScope("storage.metadata.load", {{"storage.operation", "open"}, {"storage.format", "paimon"}});
 
   if (is_data_split()) {
     if (!split_reader_) {
@@ -664,17 +655,7 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> PaimonFormatReader::filter_di
 }
 
 arrow::Result<std::shared_ptr<arrow::RecordBatch>> PaimonFormatReader::get_chunk(const int& row_group_index) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.format.read", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "get_chunk", "paimon")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.format.read", {{"storage.operation", "get_chunk"}, {"storage.format", "paimon"}});
 
   if (row_group_index < 0 || static_cast<size_t>(row_group_index) >= metadata_->row_group_infos.size()) {
     return arrow::Status::Invalid("Paimon row group index out of range: ", row_group_index);
@@ -706,17 +687,7 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> PaimonFormatReader::get_chunk
 
 arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> PaimonFormatReader::get_chunks(
     const std::vector<int>& indices) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.format.read", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "get_chunks", "paimon")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.format.read", {{"storage.operation", "get_chunks"}, {"storage.format", "paimon"}});
 
   std::vector<std::shared_ptr<arrow::RecordBatch>> output;
   output.reserve(indices.size());
@@ -785,17 +756,7 @@ arrow::Result<std::vector<int64_t>> PaimonFormatReader::logical_to_physical(
 }
 
 arrow::Result<std::shared_ptr<arrow::Table>> PaimonFormatReader::take(const std::vector<int64_t>& indices) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.format.read", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "take", "paimon")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.format.read", {{"storage.operation", "take"}, {"storage.format", "paimon"}});
 
   if (indices.empty()) {
     return arrow::Table::MakeEmpty(output_schema_);
@@ -811,17 +772,8 @@ arrow::Result<std::shared_ptr<arrow::Table>> PaimonFormatReader::take(const std:
 
 arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> PaimonFormatReader::read_with_range(const uint64_t& start,
                                                                                              const uint64_t& end) {
-  auto context = tracing::Capture();
-  auto span = context ? tracing::StartSpan(context, "storage.format.read", false, false,
-                                           opentelemetry::trace::SpanContext::GetInvalid(), "read_with_range", "paimon")
-                      : nullptr;
-  std::optional<tracing::ContextScope> scope;
-  if (context)
-    scope.emplace(context);
-  SCOPE_EXIT {
-    if (span)
-      tracing::EndSpan(span, context);
-  };
+  tracing::TraceScope scope("storage.format.read",
+                            {{"storage.operation", "read_with_range"}, {"storage.format", "paimon"}});
 
   if (end < start || end > metadata_->payload.record_count) {
     return arrow::Status::Invalid("Invalid Paimon logical range");
