@@ -168,8 +168,8 @@ target_link_libraries(milvus-storage PUBLIC ${LINK_LIBS})
 target_include_directories(milvus-storage PUBLIC ${INCLUDE_PATHS})
 target_compile_options(milvus-storage PRIVATE -fPIC)
 target_compile_definitions(milvus-storage PRIVATE MILVUS_STORAGE_VERSION="${PROJECT_VERSION}")
-# Conan pins opentelemetry-cpp:with_stl=True. Its common component omits
-# this API ABI definition; propagate it explicitly to Storage's C++ hosts.
+# The pinned SDK uses the same C++17 STL ABI as milvus-common, independently
+# of the C++ language level used to compile Storage and Arrow.
 target_compile_definitions(milvus-storage PUBLIC OPENTELEMETRY_STL_VERSION=2017)
 
 # On macOS, folly's static archive dead-strips IOThreadPoolExecutor.cpp,

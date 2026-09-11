@@ -4,6 +4,8 @@
 	check-error-ratchet update-error-ratchet \
 	aws gcp azure aliyun tencent huawei
 
+.DEFAULT_GOAL := build
+
 TEST_THREADS ?= 4
 ifneq ($(TIDY_THREADS),)
 	TIDY_THREAD_PARAMETER := -j ${TIDY_THREADS}
@@ -33,7 +35,13 @@ endif
 CONAN_SETTINGS = ${libcxx_setting} -s:h build_type=${build_type} -s:b build_type=${build_type}
 CONAN_BASE = conan install .. --build=arrow --build=missing ${CONAN_SETTINGS}
 
-build:
+# Keep the Arrow tracing interface patch reproducible from this workspace.
+.PHONY: tracing-recipes
+tracing-recipes:
+	conan export conan/opentelemetry --name=opentelemetry-cpp --version=1.23.0 --user=milvus --channel=storage-tracing
+	conan export conan/arrow --name=arrow --version=17.0.0 --user=milvus --channel=dev-2.6-tracing
+
+build: tracing-recipes
 	# Example building debug mode: BUILD_TYPE=Debug WITH_UT=False make
 	# Example building with fault injection: WITH_FIU=True make
 	@echo "with_ut: ${with_ut}"
@@ -60,7 +68,7 @@ package: build
 	mkdir -p build && cd build && \
 	conan export .. --user=milvus --channel=dev
 
-python-lib:
+python-lib: tracing-recipes
 	@echo "Building library for Python bindings with hidden symbols..."
 	@echo "with_fiu: ${with_fiu}"
 	mkdir -p build && cd build && \
@@ -71,7 +79,7 @@ python-lib:
 	-o "&:with_ut=False" -o "&:with_benchmark=False" -o "&:with_asan=False" -o "&:with_jni=False" -o "&:with_jemalloc=False" \
 	-o "&:with_python_binding=True" -o "&:with_fiu=${with_fiu}"
 
-java-lib:
+java-lib: tracing-recipes
 	@echo "Building library for Java/Scala dependencies..."
 	mkdir -p build && cd build && \
 	${CONAN_BASE} \

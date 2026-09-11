@@ -1,12 +1,13 @@
 // Copyright 2026 Zilliz
 // SPDX-License-Identifier: Apache-2.0
 #include <benchmark/benchmark.h>
+#include <folly/ScopeGuard.h>
 #include <opentelemetry/exporters/memory/in_memory_span_exporter.h>
 #include <opentelemetry/sdk/trace/simple_processor.h>
 #include <opentelemetry/sdk/trace/tracer_provider.h>
 #include <opentelemetry/sdk/trace/samplers/parent.h>
 #include <opentelemetry/sdk/trace/samplers/always_on.h>
-#include "tracing/runtime.h"
+#include "milvus-storage/tracing.h"
 
 namespace milvus_storage::tracing {
 namespace {
@@ -28,23 +29,30 @@ void BM_StorageTracing(benchmark::State& state) {
   parent.trace_id[0] = 1;
   parent.span_id[0] = 1;
   parent.trace_flags = mode == 3 ? 1 : 0;
-  const auto work = [] {
-    return Run("storage.read", [] {
-      for (int i = 0; i < 4; ++i) {
-        auto result = Run("storage.read_task", [] { return arrow::Status::OK(); });
-        benchmark::DoNotOptimize(result);
-      }
-      return arrow::Status::OK();
-    });
+  const auto iteration = [] {
+    auto context = Capture();
+    auto span = context ? StartSpan(context, "storage.read") : nullptr;
+    std::optional<ContextScope> scope;
+    if (context)
+      scope.emplace(context);
+    SCOPE_EXIT {
+      if (span)
+        EndSpan(span, context);
+    };
+    for (int i = 0; i < 4; ++i) {
+      auto child_context = Capture();
+      auto child = child_context ? StartSpan(child_context, "storage.read_task") : nullptr;
+      if (child)
+        EndSpan(child, child_context);
+      benchmark::DoNotOptimize(arrow::Status::OK());
+    }
   };
   for (auto _ : state) {
     if (mode == 0) {
-      auto result = work();
-      benchmark::DoNotOptimize(result);
+      iteration();
     } else {
-      auto scope = AttachParent(parent);
-      auto result = work();
-      benchmark::DoNotOptimize(result);
+      auto parent_scope = AttachParent(parent);
+      iteration();
     }
   }
   SetTracerProvider(nullptr);

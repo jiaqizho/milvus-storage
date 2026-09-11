@@ -14,7 +14,7 @@
 
 #include "milvus-storage/format/parquet/folly_arrow_executor.h"
 
-#include "tracing/runtime.h"
+#include "milvus-storage/tracing.h"
 
 #include <exception>
 #include <utility>

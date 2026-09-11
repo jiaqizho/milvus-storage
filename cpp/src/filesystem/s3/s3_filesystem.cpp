@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tracing/runtime.h"
+#include "milvus-storage/tracing.h"
 
 #include "milvus-storage/filesystem/s3/s3_filesystem.h"
 #include "milvus-storage/filesystem/fs.h"
@@ -824,15 +824,19 @@ class ObjectCrtInputFile final : public arrow::io::RandomAccessFile, public NonB
     ctx->request.SetBucket(ToAwsString(path_.bucket));
     ctx->request.SetKey(ToAwsString(path_.key));
 
-    ctx->trace.Attribute("storage.backend", "s3-crt");
-    ctx->trace.Attribute("storage.operation", "head");
-    (void)tracing::Observe(ctx->future, ctx->trace);
+    tracing::SetAttribute(ctx->trace, ctx->trace_context, "storage.backend", "s3-crt");
+    tracing::SetAttribute(ctx->trace, ctx->trace_context, "storage.operation", "head");
+    if (ctx->trace) {
+      ctx->future.AddCallback([span = ctx->trace, context = ctx->trace_context](const arrow::Result<int64_t>& result) {
+        tracing::EndSpan(span, context, result.status());
+      });
+    }
     try {
       ctx->client_lease->HeadObjectAsync(
           ctx->request, [ctx](const Aws::S3Crt::S3CrtClient*, const S3CrtModel::HeadObjectRequest&,
                               const S3CrtModel::HeadObjectOutcome& outcome,
                               const std::shared_ptr<const Aws::Client::AsyncCallerContext>&) mutable {
-            tracing::ContextScope trace_scope(ctx->trace.context());
+            tracing::ContextScope trace_scope(ctx->trace_context);
             if (!outcome.IsSuccess()) {
               if (outcome.GetError().GetResponseCode() == Aws::Http::HttpResponseCode::NOT_FOUND) {
                 ctx->future.MarkFinished(arrow::Result<int64_t>(PathNotFound(ctx->path)));
@@ -906,15 +910,19 @@ class ObjectCrtInputFile final : public arrow::io::RandomAccessFile, public NonB
     ctx->request.SetResponseStreamFactory(AwsWriteableStreamFactory(out, nbytes));
 
     ctx->metrics->IncrementReadCount();
-    ctx->trace.Attribute("storage.backend", "s3-crt");
-    ctx->trace.Attribute("storage.operation", "get");
-    (void)tracing::Observe(ctx->future, ctx->trace);
+    tracing::SetAttribute(ctx->trace, ctx->trace_context, "storage.backend", "s3-crt");
+    tracing::SetAttribute(ctx->trace, ctx->trace_context, "storage.operation", "get");
+    if (ctx->trace) {
+      ctx->future.AddCallback([span = ctx->trace, context = ctx->trace_context](const arrow::Result<int64_t>& result) {
+        tracing::EndSpan(span, context, result.status());
+      });
+    }
     try {
       ctx->client_lease->GetObjectAsync(
           ctx->request, [ctx](const Aws::S3Crt::S3CrtClient*, const S3CrtModel::GetObjectRequest&,
                               S3CrtModel::GetObjectOutcome outcome,
                               const std::shared_ptr<const Aws::Client::AsyncCallerContext>&) mutable {
-            tracing::ContextScope trace_scope(ctx->trace.context());
+            tracing::ContextScope trace_scope(ctx->trace_context);
             if (!outcome.IsSuccess()) {
               ctx->metrics->IncrementFailedCount();
               ctx->future.MarkFinished(arrow::Result<int64_t>(ErrorToStatus("GetObject", outcome.GetError())));
@@ -1110,7 +1118,8 @@ class ObjectCrtInputFile final : public arrow::io::RandomAccessFile, public NonB
   }
 
   struct AsyncReadContext {
-    tracing::OperationTrace trace{"storage.backend.request", false, true};
+    tracing::ContextPtr trace_context = tracing::Capture();
+    tracing::SpanPtr trace = tracing::StartSpan(trace_context, "storage.backend.request", false, true);
     // AWS CRT retains this context through the callback. Never add owning
     // references to S3CrtClient, S3CrtClientHolder, or ObjectCrtInputFile here.
     // The lease owns only operation state and a non-owning client pointer.
@@ -1124,7 +1133,8 @@ class ObjectCrtInputFile final : public arrow::io::RandomAccessFile, public NonB
   };
 
   struct AsyncHeadContext {
-    tracing::OperationTrace trace{"storage.backend.request", false, true};
+    tracing::ContextPtr trace_context = tracing::Capture();
+    tracing::SpanPtr trace = tracing::StartSpan(trace_context, "storage.backend.request", false, true);
     // Keep the same non-owning CRT client lifetime model as AsyncReadContext.
     // The path and read state remain valid without owning the file or holder.
     Future<int64_t> future;

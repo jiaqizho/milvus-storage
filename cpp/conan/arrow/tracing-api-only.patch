@@ -1,0 +1,236 @@
+--- a/cpp/src/arrow/util/tracing_internal.h
++++ b/cpp/src/arrow/util/tracing_internal.h
+@@ -18,6 +18,7 @@
+ #pragma once
+ 
+ #include <memory>
++#include <optional>
+ 
+ // Pick up ARROW_WITH_OPENTELEMETRY first
+ #include "arrow/util/config.h"
+@@ -114,12 +115,10 @@
+ };
+ 
+ struct Scope {
+-  Scope()
+-      : scope_impl(opentelemetry::trace::Scope(
+-            opentelemetry::nostd::shared_ptr<opentelemetry::trace::Span>(nullptr))) {}
++  Scope() = default;
+   explicit Scope(opentelemetry::trace::Scope ot_scope)
+       : scope_impl(std::move(ot_scope)) {}
+-  opentelemetry::trace::Scope scope_impl;
++  std::optional<opentelemetry::trace::Scope> scope_impl;
+ };
+ 
+ opentelemetry::nostd::shared_ptr<opentelemetry::trace::Span>& UnwrapSpan(
+@@ -215,6 +214,44 @@
+  * ...
+  * #endif
+  */
++
++// The API-only build exposes these helpers to consumers without introducing
++// Arrow-owned spans, callbacks, or provider initialization into their reads.
++#ifdef ARROW_TRACING_API_ONLY
++#undef START_SPAN
++#define START_SPAN(...)
++#undef START_COMPUTE_SPAN
++#define START_COMPUTE_SPAN(...)
++#undef MARK_SPAN
++#define MARK_SPAN(...)
++#undef EVENT
++#define EVENT(...)
++#undef EVENT_ON_CURRENT_SPAN
++#define EVENT_ON_CURRENT_SPAN(...)
++#undef END_SPAN_ON_FUTURE_COMPLETION
++#define END_SPAN_ON_FUTURE_COMPLETION(...)
++#undef PROPAGATE_SPAN_TO_GENERATOR
++#define PROPAGATE_SPAN_TO_GENERATOR(...)
++#undef WRAP_ASYNC_GENERATOR
++#define WRAP_ASYNC_GENERATOR(...)
++#undef WRAP_ASYNC_GENERATOR_WITH_CHILD_SPAN
++#define WRAP_ASYNC_GENERATOR_WITH_CHILD_SPAN(...)
++#undef START_SCOPED_SPAN
++#define START_SCOPED_SPAN(...) ::arrow::internal::tracing::Scope()
++#undef START_SCOPED_SPAN_SV
++#define START_SCOPED_SPAN_SV(...) ::arrow::internal::tracing::Scope()
++#undef START_SCOPED_SPAN_WITH_PARENT_SV
++#define START_SCOPED_SPAN_WITH_PARENT_SV(...) ::arrow::internal::tracing::Scope()
++#undef ACTIVATE_SPAN
++#define ACTIVATE_SPAN(...) ::arrow::internal::tracing::Scope()
++#undef END_SPAN
++#define END_SPAN(target_span)                                                   \
++  do {                                                                          \
++    if ((target_span).valid()) {                                                 \
++      ::arrow::internal::tracing::UnwrapSpan((target_span).details.get())->End(); \
++    }                                                                           \
++  } while (false)
++#endif
+ 
+ #else  // !ARROW_WITH_OPENTELEMETRY
+ 
+--- a/cpp/src/arrow/util/thread_pool.cc
++++ b/cpp/src/arrow/util/thread_pool.cc
+@@ -128,7 +128,7 @@
+ #ifdef ARROW_ENABLE_THREADING
+ Status SerialExecutor::SpawnReal(TaskHints hints, FnOnce<void()> task,
+                                  StopToken stop_token, StopCallback&& stop_callback) {
+-#ifdef ARROW_WITH_OPENTELEMETRY
++#if defined(ARROW_WITH_OPENTELEMETRY) && !defined(ARROW_TRACING_API_ONLY)
+   // Wrap the task to propagate a parent tracing span to it
+   // XXX should there be a generic utility in tracing_internal.h for this?
+   task = [func = std::move(task),
+@@ -172,7 +172,7 @@
+ #else  // ARROW_ENABLE_THREADING
+ Status SerialExecutor::SpawnReal(TaskHints hints, FnOnce<void()> task,
+                                  StopToken stop_token, StopCallback&& stop_callback) {
+-#ifdef ARROW_WITH_OPENTELEMETRY
++#if defined(ARROW_WITH_OPENTELEMETRY) && !defined(ARROW_TRACING_API_ONLY)
+   // Wrap the task to propagate a parent tracing span to it
+   // XXX should there be a generic utility in tracing_internal.h for this?
+   task = [func = std::move(task),
+@@ -623,7 +623,7 @@
+ Status ThreadPool::SpawnReal(TaskHints hints, FnOnce<void()> task, StopToken stop_token,
+                              StopCallback&& stop_callback) {
+   {
+-#ifdef ARROW_WITH_OPENTELEMETRY
++#if defined(ARROW_WITH_OPENTELEMETRY) && !defined(ARROW_TRACING_API_ONLY)
+     // Wrap the task to propagate a parent tracing span to it
+     // This task-wrapping needs to be done before we grab the mutex because the
+     // first call to OT (whatever that happens to be) will attempt to grab this mutex
+--- a/cpp/src/arrow/util/async_util.cc
++++ b/cpp/src/arrow/util/async_util.cc
+@@ -124,7 +124,7 @@
+   std::list<std::unique_ptr<Task>> tasks_;
+ };
+ 
+-#ifdef ARROW_WITH_OPENTELEMETRY
++#if defined(ARROW_WITH_OPENTELEMETRY) && !defined(ARROW_TRACING_API_ONLY)
+ ::arrow::internal::tracing::Scope TraceTaskSubmitted(AsyncTaskScheduler::Task* task,
+                                                      const util::tracing::Span& parent) {
+   if (task->span.valid()) {
+@@ -204,7 +204,7 @@
+     // Capture `task` to keep it alive until finished
+     if (!submit_result->TryAddCallback([this, task_inner = std::move(task)]() mutable {
+           return [this, task_inner2 = std::move(task_inner)](const Status& st) mutable {
+-#ifdef ARROW_WITH_OPENTELEMETRY
++#if defined(ARROW_WITH_OPENTELEMETRY) && !defined(ARROW_TRACING_API_ONLY)
+             TraceTaskFinished(task_inner2.get());
+ #endif
+             // OnTaskFinished might trigger the scheduler to end.  We want to ensure that
+@@ -233,7 +233,7 @@
+     bool aborted = false;
+     if (!IsAborted()) {
+       maybe_error_ = st;
+-#ifdef ARROW_WITH_OPENTELEMETRY
++#if defined(ARROW_WITH_OPENTELEMETRY) && !defined(ARROW_TRACING_API_ONLY)
+       TraceSchedulerAbort(st);
+ #endif
+       // Add one more "task" to represent running the abort callback.  This
+@@ -256,7 +256,7 @@
+       AbortUnlocked(stop_token_.Poll(), std::move(lk));
+       return;
+     }
+-#ifdef ARROW_WITH_OPENTELEMETRY
++#if defined(ARROW_WITH_OPENTELEMETRY) && !defined(ARROW_TRACING_API_ONLY)
+     // It's important that the task's span be active while we run the submit function.
+     // Normally the submit function should transfer the span to the thread task as the
+     // active span.
+@@ -311,7 +311,7 @@
+     int latched_cost = std::min(task->cost(), throttle_->Capacity());
+     std::optional<Future<>> maybe_backoff = throttle_->TryAcquire(latched_cost);
+     if (maybe_backoff) {
+-#ifdef ARROW_WITH_OPENTELEMETRY
++#if defined(ARROW_WITH_OPENTELEMETRY) && !defined(ARROW_TRACING_API_ONLY)
+       TraceTaskQueued(task.get(), span());
+ #endif
+       queue_->Push(std::move(task));
+--- a/cpp/src/arrow/acero/exec_plan.cc
++++ b/cpp/src/arrow/acero/exec_plan.cc
+@@ -130,7 +130,7 @@
+           QueryContext* ctx = query_context();
+           RETURN_NOT_OK(ctx->Init(async_scheduler));
+ 
+-#ifdef ARROW_WITH_OPENTELEMETRY
++#if defined(ARROW_WITH_OPENTELEMETRY) && !defined(ARROW_TRACING_API_ONLY)
+           if (HasMetadata()) {
+             auto pairs = metadata().get()->sorted_pairs();
+             opentelemetry::nostd::shared_ptr<opentelemetry::trace::Span> span =
+--- a/cpp/src/arrow/dataset/file_csv.cc
++++ b/cpp/src/arrow/dataset/file_csv.cc
+@@ -278,7 +278,7 @@
+ static inline Future<std::shared_ptr<csv::StreamingReader>> OpenReaderAsync(
+     const FileSource& source, const CsvFileFormat& format,
+     const std::shared_ptr<ScanOptions>& scan_options, Executor* cpu_executor) {
+-#ifdef ARROW_WITH_OPENTELEMETRY
++#if defined(ARROW_WITH_OPENTELEMETRY) && !defined(ARROW_TRACING_API_ONLY)
+   auto tracer = arrow::internal::tracing::GetTracer();
+   auto span = tracer->StartSpan("arrow::dataset::CsvFileFormat::OpenReaderAsync");
+ #endif
+@@ -314,14 +314,14 @@
+       // Adds the filename to the error
+       [=](const std::shared_ptr<csv::StreamingReader>& reader)
+           -> Result<std::shared_ptr<csv::StreamingReader>> {
+-#ifdef ARROW_WITH_OPENTELEMETRY
++#if defined(ARROW_WITH_OPENTELEMETRY) && !defined(ARROW_TRACING_API_ONLY)
+         span->SetStatus(opentelemetry::trace::StatusCode::kOk);
+         span->End();
+ #endif
+         return reader;
+       },
+       [=](const Status& err) -> Result<std::shared_ptr<csv::StreamingReader>> {
+-#ifdef ARROW_WITH_OPENTELEMETRY
++#if defined(ARROW_WITH_OPENTELEMETRY) && !defined(ARROW_TRACING_API_ONLY)
+         arrow::internal::tracing::MarkSpan(err, span.get());
+         span->End();
+ #endif
+--- a/cpp/src/arrow/dataset/file_ipc.cc
++++ b/cpp/src/arrow/dataset/file_ipc.cc
+@@ -63,7 +63,7 @@
+ static inline Future<std::shared_ptr<ipc::RecordBatchFileReader>> OpenReaderAsync(
+     const FileSource& source,
+     const ipc::IpcReadOptions& options = default_read_options()) {
+-#ifdef ARROW_WITH_OPENTELEMETRY
++#if defined(ARROW_WITH_OPENTELEMETRY) && !defined(ARROW_TRACING_API_ONLY)
+   auto tracer = arrow::internal::tracing::GetTracer();
+   auto span = tracer->StartSpan("arrow::dataset::IpcFileFormat::OpenReaderAsync");
+ #endif
+@@ -73,7 +73,7 @@
+       .Then(
+           [=](const std::shared_ptr<ipc::RecordBatchFileReader>& reader)
+               -> Result<std::shared_ptr<ipc::RecordBatchFileReader>> {
+-#ifdef ARROW_WITH_OPENTELEMETRY
++#if defined(ARROW_WITH_OPENTELEMETRY) && !defined(ARROW_TRACING_API_ONLY)
+             span->SetStatus(opentelemetry::trace::StatusCode::kOk);
+             span->End();
+ #endif
+@@ -81,7 +81,7 @@
+           },
+           [=](const Status& status)
+               -> Result<std::shared_ptr<ipc::RecordBatchFileReader>> {
+-#ifdef ARROW_WITH_OPENTELEMETRY
++#if defined(ARROW_WITH_OPENTELEMETRY) && !defined(ARROW_TRACING_API_ONLY)
+             arrow::internal::tracing::MarkSpan(status, span.get());
+             span->End();
+ #endif
+--- a/cpp/src/parquet/arrow/reader.cc
++++ b/cpp/src/parquet/arrow/reader.cc
+@@ -270,7 +270,7 @@
+       records_to_read +=
+           reader_->metadata()->RowGroup(row_group)->ColumnChunk(i)->num_values();
+     }
+-#ifdef ARROW_WITH_OPENTELEMETRY
++#if defined(ARROW_WITH_OPENTELEMETRY) && !defined(ARROW_TRACING_API_ONLY)
+     std::string column_name = reader_->metadata()->schema()->Column(i)->name();
+     std::string phys_type =
+         TypeToString(reader_->metadata()->schema()->Column(i)->physical_type());
+--- a/cpp/src/arrow/util/future.cc
++++ b/cpp/src/arrow/util/future.cc
+@@ -50,7 +50,7 @@
+   void AddCallback(Callback callback, CallbackOptions opts) {
+     CheckOptions(opts);
+     std::unique_lock<std::mutex> lock(mutex_);
+-#ifdef ARROW_WITH_OPENTELEMETRY
++#if defined(ARROW_WITH_OPENTELEMETRY) && !defined(ARROW_TRACING_API_ONLY)
+     callback = [func = std::move(callback),
+                 active_span = ::arrow::internal::tracing::GetTracer()->GetCurrentSpan()](
+                    const FutureImpl& impl) mutable {

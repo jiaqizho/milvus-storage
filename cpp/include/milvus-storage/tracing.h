@@ -8,6 +8,13 @@
 #include <string>
 #include <opentelemetry/trace/tracer_provider.h>
 
+#include <optional>
+#include <utility>
+#include <folly/io/async/Request.h>
+#include <arrow/status.h>
+#include <arrow/util/tracing.h>
+#include <opentelemetry/trace/tracer.h>
+
 namespace milvus_storage::tracing {
 
 struct TraceParent {
@@ -51,5 +58,55 @@ class TraceScope {
 // or modify OTel TLS. Invalid parents mask enclosing scopes. Destroy on the
 // same execution flow in stack order; Folly fibers may suspend with this guard.
 [[nodiscard]] TraceScope AttachParent(const TraceParent& parent);
+
+// Storage instrumentation and execution-context propagation.
+struct Context;
+using ContextPtr = std::shared_ptr<const Context>;
+ContextPtr Capture();
+// Check the active flow without copying an owning context snapshot.
+bool HasContext();
+void StartCurrent();
+
+class ContextScope {
+  public:
+  explicit ContextScope(ContextPtr context);
+
+  private:
+  std::optional<folly::ShallowCopyRequestContextScopeGuard> scope_;
+};
+
+// Spans are Arrow's actual thin wrapper. The separate context owns request
+// propagation, the provider snapshot, and per-operation accounting.
+using SpanPtr = std::shared_ptr<arrow::util::tracing::Span>;
+
+// Start from Capture(). The context is updated even when tracing is disabled so
+// asynchronous work retains that decision. A null span never owns its parent.
+SpanPtr StartSpan(ContextPtr& context,
+                  const char* name,
+                  bool lazy = false,
+                  bool io = false,
+                  opentelemetry::trace::SpanContext link = opentelemetry::trace::SpanContext::GetInvalid(),
+                  const char* operation = nullptr,
+                  const char* format = nullptr,
+                  bool create_span = true);
+void EnsureStarted(const SpanPtr& span, const ContextPtr& context);
+// A scope-only end leaves status unset. Explicit I/O/completion sites may pass
+// their actual status. Ending an unstarted lazy scope without a result is inert.
+void EndSpan(const SpanPtr& span, const ContextPtr& context, const std::optional<arrow::Status>& status = std::nullopt);
+bool IsEnabled(const ContextPtr& context);
+void AccountRead(const ContextPtr& context, int64_t requested, int64_t returned);
+void SetAttribute(const SpanPtr& span, const ContextPtr& context, const char* key, int64_t value);
+void SetAttribute(const SpanPtr& span, const ContextPtr& context, const char* key, const char* value);
+opentelemetry::trace::SpanContext GetSpanContext(const ContextPtr& context);
+
+// Restores only Storage-owned data, preserving other RequestContext keys.
+template <typename F>
+auto Bind(F&& fn) {
+  return [context = Capture(), fn = std::forward<F>(fn)](auto&&... args) mutable -> decltype(auto) {
+    ContextScope scope(context);
+    StartCurrent();
+    return fn(std::forward<decltype(args)>(args)...);
+  };
+}
 
 }  // namespace milvus_storage::tracing

@@ -8,3 +8,5 @@
 *.cpp text eol=lf
 *.sbt text eol=lf
 *.toml text eol=lf
+# Unified patches preserve whitespace in their context lines.
+cpp/conan/arrow/*.patch whitespace=-blank-at-eol

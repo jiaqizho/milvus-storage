@@ -1,7 +1,7 @@
 // Copyright 2026 Zilliz
 // SPDX-License-Identifier: Apache-2.0
 #include "tracing_bridge.h"
-#include "tracing/runtime.h"
+#include "milvus-storage/tracing.h"
 namespace milvus_storage::rust_bridge::ffi {
 namespace {
 struct ScopedAttachment final : TraceAttachment {

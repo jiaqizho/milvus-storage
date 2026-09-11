@@ -32,11 +32,9 @@
 #include <folly/futures/SharedPromise.h>
 
 #include "milvus-storage/format/format_reader.h"
+#include "milvus-storage/tracing.h"
 
 namespace milvus_storage {
-namespace tracing {
-class OperationTrace;
-}
 
 namespace iceberg {
 class IcebergFormatReader;
@@ -116,7 +114,8 @@ class FormatReaderMetadataCache final : public std::enable_shared_from_this<Form
     std::condition_variable cv;
     MetadataPtr metadata;
     folly::SharedPromise<MetadataResult> async_result;
-    std::shared_ptr<tracing::OperationTrace> trace;
+    tracing::SpanPtr trace;
+    tracing::ContextPtr trace_context;
   };
 
   // Publish the leader's load result to the cache and every same-key waiter.
@@ -160,6 +159,10 @@ class MetadataCache final {
   explicit MetadataCache(bool enabled = true);
 
   [[nodiscard]] bool enabled() const { return enabled_; }
+
+  // A cache load owns the metadata span while invoking a format reader. Direct
+  // format opens still create their own span; unrelated nesting is unaffected.
+  [[nodiscard]] static bool HasTracedLoad();
 
   template <typename ReaderT>
   [[nodiscard]] std::shared_ptr<FormatReaderMetadataCache<ReaderT>> get() const {
