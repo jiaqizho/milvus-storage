@@ -296,6 +296,15 @@ void TraceScope::Finish(const arrow::Status* status) noexcept {
   }
 }
 TraceScope AttachContext(ContextPtr context) noexcept { return TraceScope(std::move(context)); }
+TraceParent::TraceParent(const ot::SpanContext& upstream) noexcept
+    : trace_flags(upstream.trace_flags().flags()),
+      tracestate(upstream.trace_state()->ToHeader()),
+      is_remote(upstream.IsRemote()) {
+  const auto upstream_trace_id = upstream.trace_id().Id();
+  const auto upstream_span_id = upstream.span_id().Id();
+  std::copy(upstream_trace_id.begin(), upstream_trace_id.end(), trace_id.begin());
+  std::copy(upstream_span_id.begin(), upstream_span_id.end(), span_id.begin());
+}
 TraceScope AttachParent(const TraceParent& parent) noexcept {
   contexts_seen.store(true, std::memory_order_relaxed);
   try {

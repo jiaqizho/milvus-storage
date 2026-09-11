@@ -21,6 +21,10 @@
 namespace milvus_storage::tracing {
 
 struct TraceParent {
+  TraceParent() noexcept = default;
+  // Copy the complete upstream identity, including sampling and propagation metadata.
+  explicit TraceParent(const opentelemetry::trace::SpanContext& upstream) noexcept;
+
   std::array<uint8_t, 16> trace_id{};
   std::array<uint8_t, 8> span_id{};
   uint8_t trace_flags = 0;

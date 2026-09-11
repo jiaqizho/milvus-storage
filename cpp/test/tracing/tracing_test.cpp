@@ -90,6 +90,7 @@ static_assert(std::is_nothrow_destructible_v<TraceScope>);
 static_assert(noexcept(TraceScope::Deferred(std::declval<opentelemetry::nostd::string_view>())));
 static_assert(noexcept(AttachContext(ContextPtr{})));
 static_assert(noexcept(AttachParent(std::declval<const TraceParent&>())));
+static_assert(std::is_nothrow_constructible_v<TraceParent, const ot::SpanContext&>);
 static_assert(noexcept(Capture()));
 static_assert(noexcept(SetTracerProvider(ProviderPtr{})));
 static_assert(noexcept(SetTraceOptions(std::declval<const TraceOptions&>())));
@@ -367,14 +368,15 @@ TEST_F(StorageTracingTest, ArrowSpanCanParentStorageOperations) {
   auto& span = arrow::internal::tracing::RewrapSpan(parent_span.details.get(),
                                                     provider->GetTracer("arrow-caller")->StartSpan("caller"));
   const auto context = span->GetContext();
-  TraceParent parent;
-  const auto trace_id = context.trace_id().Id();
-  const auto span_id = context.span_id().Id();
-  std::copy(trace_id.begin(), trace_id.end(), parent.trace_id.begin());
-  std::copy(span_id.begin(), span_id.end(), parent.span_id.begin());
-  parent.trace_flags = context.trace_flags().flags();
+  const ot::SpanContext upstream(context.trace_id(), context.span_id(), ot::TraceFlags(0), true,
+                                 ot::TraceState::FromHeader("vendor=upstream"));
+  const TraceParent parent{upstream};
   {
     auto scope = AttachParent(parent);
+    const auto attached = GetSpanContext(Capture());
+    EXPECT_FALSE(attached.IsSampled());
+    EXPECT_TRUE(attached.IsRemote());
+    EXPECT_EQ(attached.trace_state()->ToHeader(), "vendor=upstream");
     EXPECT_TRUE(Work().ok());
   }
   MARK_SPAN(parent_span, arrow::Status::OK());
