@@ -27,4 +27,10 @@ class NonBlockingReadAtFile {
   virtual arrow::Future<int64_t> ReadAtAsyncInto(int64_t position, int64_t nbytes, uint8_t* out) = 0;
 };
 
+// Files that can also resolve their size without blocking the calling thread.
+class NonBlockingRandomAccessFile : public NonBlockingReadAtFile {
+  public:
+  virtual arrow::Future<int64_t> GetSizeAsync() = 0;
+};
+
 }  // namespace milvus_storage
