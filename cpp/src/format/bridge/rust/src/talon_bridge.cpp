@@ -24,7 +24,6 @@
 #include <arrow/status.h>
 #include <arrow/util/io_util.h>
 
-#include "bridge_util.h"
 #include "milvus-storage/common/extend_status.h"
 
 namespace milvus_storage::talon {
@@ -121,23 +120,27 @@ void TalonIoCallbackImpl(void* context, int32_t error_code, uint64_t value, cons
 arrow::Result<std::shared_ptr<TalonClient>> TalonClient::Make(const std::string& coordinator,
                                                               uint32_t block_size,
                                                               uint32_t max_idle_per_addr) {
-  return CatchRustResult<std::shared_ptr<TalonClient>>("Failed to create Talon client", [&]() {
+  try {
     auto impl = ffi::new_talon_client(coordinator, block_size, max_idle_per_addr);
     return std::shared_ptr<TalonClient>(new TalonClient(std::move(impl)));
-  });
+  } catch (const rust::cxxbridge1::Error& error) {
+    return arrow::Status::IOError("Failed to create Talon client: ", error.what());
+  }
 }
 
 arrow::Result<TalonObjectReader> TalonClient::OpenObject(const std::string& cloud_provider,
                                                          const std::string& bucket,
                                                          const std::string& key,
                                                          const std::optional<TalonObjectStat>& initial_stat) const {
-  return CatchRustResult<TalonObjectReader>("Failed to open Talon object", [&]() {
+  try {
     const bool has_initial_stat = initial_stat.has_value();
     const std::string empty_version;
     return TalonObjectReader(ffi::open_talon_object(*impl_, cloud_provider, bucket, key, has_initial_stat,
                                                     has_initial_stat ? initial_stat->size : 0,
                                                     has_initial_stat ? initial_stat->version : empty_version));
-  });
+  } catch (const rust::cxxbridge1::Error& error) {
+    return arrow::Status::IOError("Failed to open Talon object: ", error.what());
+  }
 }
 
 int64_t TalonObjectReader::KnownSize() const { return ffi::talon_object_known_size(*impl_); }
