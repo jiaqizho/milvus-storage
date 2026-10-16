@@ -26,9 +26,11 @@
 #include <future>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -110,6 +112,73 @@ TEST(S3CrtBuildSupportTest, HeadersAndStaticClientSymbolsAreAvailable) {
   const char* service_name = Aws::S3Crt::S3CrtClient::GetServiceName();
   ASSERT_NE(service_name, nullptr);
   EXPECT_FALSE(std::string(service_name).empty());
+}
+
+class S3CrtThroughputEnvTest : public ::testing::Test {
+  protected:
+  void SetUp() override {
+    if (const auto* value = std::getenv(kEnvName)) {
+      original_value_ = value;
+    }
+    ASSERT_EQ(unsetenv(kEnvName), 0);
+    ASSERT_STATUS_OK(EnsureS3InitializedForTest());
+    options_ = S3Options::FromAccessKey("ak", "sk");
+    options_.cloud_provider = kCloudProviderAWS;
+    options_.use_crt_async_reads = true;
+    options_.region = "us-east-1";
+    options_.scheme = "http";
+    options_.endpoint_override = "127.0.0.1:1";
+  }
+
+  void TearDown() override {
+    if (original_value_) {
+      EXPECT_EQ(setenv(kEnvName, original_value_->c_str(), 1), 0);
+    } else {
+      EXPECT_EQ(unsetenv(kEnvName), 0);
+    }
+  }
+
+  static constexpr const char* kEnvName = "S3_CRT_THROUGHPUT_TARGET_GBPS";
+  std::optional<std::string> original_value_;
+  S3Options options_;
+};
+
+TEST_F(S3CrtThroughputEnvTest, PreservesDefaultWhenUnset) {
+  ClientBuilder<Aws::S3Crt::S3CrtClient> builder(options_);
+  ASSERT_AND_ASSIGN(auto holder, builder.BuildClient());
+  EXPECT_DOUBLE_EQ(builder.config().throughputTargetGbps, 50.0);
+  ASSERT_TRUE(holder->Acquire().ok());
+}
+
+TEST_F(S3CrtThroughputEnvTest, AppliesOverrideToEachNewClient) {
+  for (const auto& [value, expected] :
+       std::vector<std::pair<const char*, double>>{{"200", 200.0}, {"100", 100.0}, {"12.5", 12.5}}) {
+    SCOPED_TRACE(value);
+    ASSERT_EQ(setenv(kEnvName, value, 1), 0);
+    ClientBuilder<Aws::S3Crt::S3CrtClient> builder(options_);
+    ASSERT_AND_ASSIGN(auto holder, builder.BuildClient());
+    EXPECT_DOUBLE_EQ(builder.config().throughputTargetGbps, expected);
+    ASSERT_TRUE(holder->Acquire().ok());
+  }
+}
+
+TEST_F(S3CrtThroughputEnvTest, RejectsInvalidOverrideBeforeCreatingClient) {
+  for (const auto* value : {"", "0", "-1", "invalid", "200Gbps", "nan", "inf", "1e9999", "1e-9999"}) {
+    SCOPED_TRACE(value);
+    ASSERT_EQ(setenv(kEnvName, value, 1), 0);
+    ClientBuilder<Aws::S3Crt::S3CrtClient> builder(options_);
+    const auto result = builder.BuildClient();
+    ASSERT_FALSE(result.ok());
+    EXPECT_TRUE(result.status().IsInvalid()) << result.status().ToString();
+    EXPECT_NE(result.status().message().find(kEnvName), std::string::npos);
+  }
+}
+
+TEST_F(S3CrtThroughputEnvTest, InvalidOverrideFailsFilesystemCreation) {
+  ASSERT_EQ(setenv(kEnvName, "invalid", 1), 0);
+  const auto result = S3FileSystem::Make(options_);
+  ASSERT_FALSE(result.ok());
+  EXPECT_NE(result.status().message().find(kEnvName), std::string::npos);
 }
 
 TEST(S3CrtClientFinalizerTest, RejectsSuccessfulNullClientConstruction) {

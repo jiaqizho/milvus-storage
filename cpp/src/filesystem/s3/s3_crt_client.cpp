@@ -17,8 +17,11 @@
 #ifdef WITH_CRT
 
 #include <algorithm>
+#include <cerrno>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -34,6 +37,7 @@
 #include <aws/s3-crt/S3CrtClient.h>
 #include <aws/s3-crt/S3CrtClientConfiguration.h>
 
+#include "milvus-storage/common/log.h"
 #include "milvus-storage/filesystem/s3/s3_internal.h"
 
 namespace milvus_storage {
@@ -389,8 +393,18 @@ arrow::Result<std::shared_ptr<S3CrtClientHolder>> ClientBuilder<Aws::S3Crt::S3Cr
         client_config_.useVirtualAddressing = use_virtual_addressing;
         // Raise the CRT target from its SDK default so small concurrent range reads
         // get enough connection budget for the Vortex reader workload.
-        // TODO: make this configurable instead of using a fixed workload-specific default.
         client_config_.throughputTargetGbps = 50.0;
+        constexpr const char* kThroughputTargetEnv = "S3_CRT_THROUGHPUT_TARGET_GBPS";
+        if (const char* const value = std::getenv(kThroughputTargetEnv)) {
+          char* end = nullptr;
+          errno = 0;
+          const double target = std::strtod(value, &end);
+          if (errno == ERANGE || end == value || *end != '\0' || !std::isfinite(target) || target <= 0) {
+            return arrow::Status::Invalid(kThroughputTargetEnv, " must be a finite positive number");
+          }
+          client_config_.throughputTargetGbps = target;
+        }
+        LOG_STORAGE_INFO_ << "Creating S3 CRT client with throughputTargetGbps=" << client_config_.throughputTargetGbps;
 
         return std::make_shared<Aws::S3Crt::S3CrtClient>(credentials_provider_, client_config_,
                                                          client_config_.payloadSigningPolicy,
