@@ -292,6 +292,7 @@ arrow::Result<std::shared_ptr<arrow::Table>> ColumnGroupLazyReaderImpl<ReaderT>:
 template <typename ReaderT>
 folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> ColumnGroupLazyReaderImpl<ReaderT>::take_async(
     const TakeTask& task) {
+  FOLLY_ARROW_RETURN_NOT_OK(CheckReadCancellation(task.cancellation));
   FIU_RETURN_ON(FIUKEY_TAKE_ROWS_FAIL,
                 folly::makeSemiFuture(arrow::Result<std::shared_ptr<arrow::Table>>(
                     arrow::Status::IOError(fmt::format("Injected fault: {}", FIUKEY_TAKE_ROWS_FAIL)))));
@@ -312,17 +313,19 @@ folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> ColumnGroupLazyR
 
   // Open one independent reader for this file-scoped task; no mutable format
   // reader is shared with another in-flight take.
-  return open_reader_for_file_async(task.file_index)
-      .deferValue([rows_in_file = std::move(rows_in_file)](arrow::Result<std::shared_ptr<ReaderT>>&& reader_result)
+  return StartReadTask(task.cancellation, open_reader_for_file_async(task.file_index))
+      .deferValue([rows_in_file = std::move(rows_in_file),
+                   cancellation = task.cancellation](arrow::Result<std::shared_ptr<ReaderT>>&& reader_result)
                       -> folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> {
         FOLLY_ARROW_ASSIGN_OR_RAISE(auto reader, std::move(reader_result));
+        FOLLY_ARROW_RETURN_NOT_OK(CheckReadCancellation(cancellation));
         return reader->take_async(rows_in_file)
-            .deferValue(
-                [reader = std::move(reader)](auto&& table_result) -> arrow::Result<std::shared_ptr<arrow::Table>> {
-                  // Lifetime-only capture: backend state must outlive the async take.
-                  (void)reader;
-                  return std::move(table_result);
-                });
+            .deferValue([reader = std::move(reader),
+                         cancellation](auto&& table_result) -> arrow::Result<std::shared_ptr<arrow::Table>> {
+              // Lifetime-only capture: backend state must outlive the async take.
+              (void)reader;
+              return FinishReadResult(cancellation, std::move(table_result));
+            });
       });
 }
 

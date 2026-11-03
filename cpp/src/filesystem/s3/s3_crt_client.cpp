@@ -57,6 +57,10 @@ namespace {
 
 thread_local unsigned crt_callback_depth = 0;
 
+// Defensive fallback for SDK teardown when the last holder is released in a
+// CRT callback or while native operation leases remain. Normal ownership paths
+// must arrange release outside CRT callbacks and after outstanding operations
+// drain; they must not rely on this executor as their regular release path.
 // Only SDK teardown runs here, never network operations. Keep this executor
 // independent of caller executors, which may already have rejected completion.
 const arrow::Result<std::shared_ptr<arrow::internal::ThreadPool>>& CleanupExecutor() {

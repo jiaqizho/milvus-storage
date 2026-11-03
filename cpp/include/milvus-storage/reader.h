@@ -99,6 +99,9 @@ class ChunkReader {
    *       ready future and may therefore block. Native implementations may defer work.
    * @note In the task-based override, parallelism is a task-granularity target,
    *       not a guaranteed concurrency limit.
+   * @note Cancellation in the task-based override is cooperative: queued tasks
+   *       can skip I/O, while started operations finish before returning
+   *       Status::Cancelled(). A real read error takes precedence over cancellation.
    */
   [[nodiscard]] virtual folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>>
   get_chunks_async(const std::vector<int64_t>& chunk_indices, size_t parallelism = 1) {
@@ -314,6 +317,8 @@ class Reader {
    *
    * @note The default implementation invokes get_chunk_reader() before returning
    *       a ready future and may therefore block.
+   * @note Native cancellation skips an open that has not started, or waits for
+   *       an ongoing open before returning Status::Cancelled(). Open errors are preserved.
    */
   [[nodiscard]] virtual folly::SemiFuture<arrow::Result<std::unique_ptr<ChunkReader>>> get_chunk_reader_async(
       int64_t column_group_index, const std::shared_ptr<std::vector<std::string>>& needed_columns = nullptr) const {
@@ -357,6 +362,8 @@ class Reader {
    *       future and may therefore block.
    * @note In the task-based override, parallelism controls task splitting;
    *       actual execution depends on the format backend and caller executor.
+   * @note Cancellation follows get_chunks_async(): started operations finish
+   *       before returning Status::Cancelled(), and real read errors are preserved.
    */
   [[nodiscard]] virtual folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> take_async(
       const std::vector<int64_t>& row_indices,

@@ -724,6 +724,8 @@ const ChunkInfo& ColumnGroupReaderImpl<ReaderT>::get_chunk_info(int64_t chunk_in
 template <typename ReaderT>
 folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>>
 ColumnGroupReaderImpl<ReaderT>::get_chunks_async(const ChunkTask& task) {
+  using ResultType = arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>;
+  FOLLY_ARROW_RETURN_NOT_OK(CheckReadCancellation(task.cancellation));
   FIU_RETURN_ON(FIUKEY_COLUMN_GROUP_READ_FAIL,
                 folly::makeSemiFuture(arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>(
                     arrow::Status::IOError(fmt::format("Injected fault: {}", FIUKEY_COLUMN_GROUP_READ_FAIL)))));
@@ -749,42 +751,44 @@ ColumnGroupReaderImpl<ReaderT>::get_chunks_async(const ChunkTask& task) {
 
   // Each task opens independent mutable format-reader state; immutable cached
   // metadata may still be shared across those readers.
-  return open_reader_for_file_async(task.file_index)
-      .deferValue([range_start = task.range_start, range_end = task.range_end, chunk_infos = std::move(chunk_infos)](
-                      arrow::Result<std::shared_ptr<ReaderT>>&& reader_result) mutable
+  return StartReadTask(task.cancellation, open_reader_for_file_async(task.file_index))
+      .deferValue([range_start = task.range_start, range_end = task.range_end, chunk_infos = std::move(chunk_infos),
+                   cancellation = task.cancellation](arrow::Result<std::shared_ptr<ReaderT>>&& reader_result) mutable
                   -> folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>> {
         FOLLY_ARROW_ASSIGN_OR_RAISE(auto reader, std::move(reader_result));
+        FOLLY_ARROW_RETURN_NOT_OK(CheckReadCancellation(cancellation));
         return reader->read_with_range_async(range_start, range_end)
-            .deferValue([reader = std::move(reader), chunk_infos = std::move(chunk_infos)](auto&& rb_reader_result)
-                            -> arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> {
-              // Lifetime-only capture: drain the Arrow reader before releasing
-              // the independent FormatReader that produced it.
-              (void)reader;
-              ARROW_ASSIGN_OR_RAISE(auto rb_reader, std::move(rb_reader_result));
-              ARROW_ASSIGN_OR_RAISE(auto rbs, rb_reader->ToRecordBatches());
+            .deferValue(
+                [reader = std::move(reader), chunk_infos = std::move(chunk_infos), cancellation](
+                    auto&& rb_reader_result) -> arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> {
+                  // Lifetime-only capture: drain the Arrow reader before releasing
+                  // the independent FormatReader that produced it.
+                  (void)reader;
+                  ARROW_ASSIGN_OR_RAISE(auto rb_reader, std::move(rb_reader_result));
+                  ARROW_ASSIGN_OR_RAISE(auto rbs, rb_reader->ToRecordBatches());
 
-              // A format may coalesce the range into different batch boundaries;
-              // slice it back into one result per logical chunk.
-              std::vector<std::shared_ptr<arrow::RecordBatch>> result;
-              result.reserve(chunk_infos.size());
-              size_t rbs_idx = 0;
-              size_t rbs_offset = 0;
-              for (const auto& chunk_info : chunk_infos) {
-                if (UNLIKELY(rbs_idx >= rbs.size() ||
-                             (rbs[rbs_idx]->num_rows() - rbs_offset) < chunk_info.number_of_rows)) {
-                  return arrow::Status::Invalid(fmt::format(
-                      "Invalid slice of record batches in async read: [chunk_info={}]", chunk_info.ToString()));
-                }
-                auto rb = rbs[rbs_idx]->Slice(rbs_offset, chunk_info.number_of_rows);
-                result.push_back(std::move(rb));
-                rbs_offset += chunk_info.number_of_rows;
-                if (rbs_offset == rbs[rbs_idx]->num_rows()) {
-                  rbs_idx++;
-                  rbs_offset = 0;
-                }
-              }
-              return result;
-            });
+                  // A format may coalesce the range into different batch boundaries;
+                  // slice it back into one result per logical chunk.
+                  std::vector<std::shared_ptr<arrow::RecordBatch>> result;
+                  result.reserve(chunk_infos.size());
+                  size_t rbs_idx = 0;
+                  size_t rbs_offset = 0;
+                  for (const auto& chunk_info : chunk_infos) {
+                    if (UNLIKELY(rbs_idx >= rbs.size() ||
+                                 (rbs[rbs_idx]->num_rows() - rbs_offset) < chunk_info.number_of_rows)) {
+                      return arrow::Status::Invalid(fmt::format(
+                          "Invalid slice of record batches in async read: [chunk_info={}]", chunk_info.ToString()));
+                    }
+                    auto rb = rbs[rbs_idx]->Slice(rbs_offset, chunk_info.number_of_rows);
+                    result.push_back(std::move(rb));
+                    rbs_offset += chunk_info.number_of_rows;
+                    if (rbs_offset == rbs[rbs_idx]->num_rows()) {
+                      rbs_idx++;
+                      rbs_offset = 0;
+                    }
+                  }
+                  return FinishReadResult(cancellation, ResultType(std::move(result)));
+                });
       });
 }
 

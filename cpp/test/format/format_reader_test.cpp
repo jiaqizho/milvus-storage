@@ -28,6 +28,7 @@
 #include <arrow/testing/gtest_util.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/executors/InlineExecutor.h>
+#include <folly/executors/ManualExecutor.h>
 #include <folly/executors/ThreadedExecutor.h>
 #include <folly/synchronization/Baton.h>
 #include <parquet/arrow/schema.h>
@@ -42,6 +43,7 @@
 #include "milvus-storage/writer.h"
 #include "milvus-storage/filesystem/async_random_access_file.h"
 #include "milvus-storage/filesystem/fs.h"
+#include "milvus-storage/format/async_tasks.h"
 #include "milvus-storage/format/format_reader.h"
 #include "milvus-storage/format/iceberg/iceberg_format_reader.h"
 #include "milvus-storage/format/lance/lance_table_reader.h"
@@ -102,6 +104,9 @@ class ExtensionTypeRegistrationGuard {
 };
 
 struct FileSystemReadStats {
+  std::function<arrow::Future<std::shared_ptr<arrow::Buffer>>(
+      const std::shared_ptr<arrow::io::RandomAccessFile>&, int64_t, int64_t)> data_read;
+  std::function<void()> file_destroyed;
   std::atomic<int> open_path_count{0};
   std::atomic<int> open_info_count{0};
   std::atomic<int> async_read_into_count{0};
@@ -223,6 +228,12 @@ class AsyncCountingRandomAccessFile final : public arrow::io::RandomAccessFile,
                                 std::shared_ptr<PendingAsyncOpenState> pending_open = nullptr)
       : file_(std::move(file)), stats_(std::move(stats)), pending_open_(std::move(pending_open)) {}
 
+  ~AsyncCountingRandomAccessFile() override {
+    if (stats_->file_destroyed) {
+      stats_->file_destroyed();
+    }
+  }
+
   arrow::Status Close() override { return file_->Close(); }
   arrow::Status Abort() override { return file_->Abort(); }
   arrow::Result<int64_t> Tell() const override { return file_->Tell(); }
@@ -287,6 +298,9 @@ class AsyncCountingRandomAccessFile final : public arrow::io::RandomAccessFile,
   arrow::Future<std::shared_ptr<arrow::Buffer>> ReadAsync(const arrow::io::IOContext& io_context,
                                                           int64_t position,
                                                           int64_t nbytes) override {
+    if (stats_->data_read) {
+      return stats_->data_read(file_, position, nbytes);
+    }
     return file_->ReadAsync(io_context, position, nbytes);
   }
   arrow::Status WillNeed(const std::vector<arrow::io::ReadRange>& ranges) override { return file_->WillNeed(ranges); }
@@ -777,6 +791,152 @@ TEST_P(FormatReaderTest, ParquetAsyncReadUsesCallerExecutorForDecode) {
   ASSERT_EQ(batches.size(), 1);
   ASSERT_EQ(batches.front()->num_rows(), test_batch_->num_rows());
   ASSERT_GT(executor.add_count(), 1);
+}
+
+TEST_P(FormatReaderTest, ParquetAsyncRepeatedReadsKeepReaderReusable) {
+  if (GetParam() != LOON_FORMAT_PARQUET) {
+    GTEST_SKIP() << "Test parquet only.";
+  }
+  const auto file_path = base_path_ + "/async_repeated.parquet";
+  StorageConfig config;
+  ASSERT_AND_ASSIGN(auto writer, parquet::ParquetFileWriter::Make(schema_, fs_, file_path, config));
+  ASSERT_STATUS_OK(writer->Write(test_batch_));
+  ASSERT_AND_ASSIGN(auto file, writer->Close());
+  ASSERT_AND_ASSIGN(auto reader, FormatReader::create(schema_, LOON_FORMAT_PARQUET, file, properties_, {}, nullptr));
+  CountingExecutor executor;
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_AND_ASSIGN(auto batch_reader,
+                      std::move(reader->read_with_range_async(0, test_batch_->num_rows())).via(&executor).get());
+  }
+  const auto submits = executor.add_count();
+  const auto start = std::chrono::steady_clock::now();
+  for (int i = 0; i < 1000; ++i) {
+    ASSERT_AND_ASSIGN(auto batch_reader,
+                      std::move(reader->read_with_range_async(0, test_batch_->num_rows())).via(&executor).get());
+    ASSERT_AND_ASSIGN(auto batches, batch_reader->ToRecordBatches());
+    ASSERT_EQ(batches.size(), 1);
+    ASSERT_TRUE(batches.front()->Equals(*test_batch_));
+  }
+  RecordProperty(
+      "elapsed_us",
+      std::to_string(
+          std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()));
+  RecordProperty("executor_submissions", executor.add_count() - submits);
+}
+
+TEST_P(FormatReaderTest, ParquetAsyncTasksDrainBeforeRelease) {
+  if (GetParam() != LOON_FORMAT_PARQUET) {
+    GTEST_SKIP() << "Test parquet only.";
+  }
+  const auto file_path = base_path_ + "/async_drain.parquet";
+  ASSERT_AND_ASSIGN(auto sink, fs_->OpenOutputStream(file_path));
+  ASSERT_AND_ASSIGN(auto writer, ::parquet::arrow::FileWriter::Open(*schema_, arrow::default_memory_pool(), sink));
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_STATUS_OK(writer->NewBufferedRowGroup());
+    ASSERT_STATUS_OK(writer->WriteRecordBatch(*test_batch_));
+  }
+  ASSERT_STATUS_OK(writer->Close());
+  ASSERT_STATUS_OK(sink->Close());
+  ASSERT_EQ(SetValue(properties_, PROPERTY_READER_PARQUET_PREBUFFER_HOLE_SIZE_LIMIT, "1"), std::nullopt);
+  ASSERT_EQ(SetValue(properties_, PROPERTY_READER_PARQUET_PREBUFFER_RANGE_SIZE_LIMIT, "2"), std::nullopt);
+  const auto failure = arrow::Status::IOError("first range failed");
+  // Error, cancellation, consumer abandonment, and success share the same
+  // ownership boundary. Eager mode also submits reads from the second row group.
+  for (const std::string mode : {"error", "cancel", "abandon", "success"}) {
+    for (const bool lazy : {false, true}) {
+      for (const bool take : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << "mode=" << mode << " lazy=" << lazy << " take=" << take);
+        ASSERT_EQ(SetValue(properties_, PROPERTY_READER_PARQUET_PREBUFFER_LAZY, lazy ? "true" : "false"), std::nullopt);
+        auto stats = std::make_shared<FileSystemReadStats>();
+        auto counting_fs = std::make_shared<AsyncCountingFileSystem>(fs_, stats);
+        auto reader = std::make_shared<parquet::ParquetFormatReader>(counting_fs, file_path, properties_,
+                                                                     std::vector<std::string>{}, nullptr);
+        folly::ManualExecutor executor;
+        if (take) {
+          ASSERT_STATUS_OK(std::move(reader->open_async()).via(&executor).getVia(&executor));
+        } else {
+          ASSERT_STATUS_OK(reader->open());
+        }
+        std::vector<arrow::Future<std::shared_ptr<arrow::Buffer>>> pending;
+        std::vector<arrow::Result<std::shared_ptr<arrow::Buffer>>> results;
+        bool destroyed = false;
+        std::thread::id destroyed_on;
+        stats->file_destroyed = [&] {
+          destroyed_on = std::this_thread::get_id();
+          destroyed = true;
+        };
+        stats->data_read = [&](const auto& input, int64_t position, int64_t nbytes) {
+          results.push_back(input->ReadAt(position, nbytes));
+          pending.push_back(arrow::Future<std::shared_ptr<arrow::Buffer>>::Make());
+          return pending.back();
+        };
+        auto read = (take ? reader->take_async({0, test_batch_->num_rows()}).deferValue([](auto result) {
+                        return result.status();
+                      })
+                            : reader->read_with_range_async(0, 2 * test_batch_->num_rows()).deferValue([](auto result) {
+                                return result.status();
+                              }));
+        // Cancellation belongs to the common task boundary, not the format.
+        std::vector<folly::SemiFuture<arrow::Result<folly::Unit>>> children;
+        children.push_back(std::move(read).deferValue([](arrow::Status status) -> arrow::Result<folly::Unit> {
+          ARROW_RETURN_NOT_OK(status);
+          return folly::Unit{};
+        }));
+        auto future = CollectReadTasks(folly::CancellationSource{}, std::move(children),
+                                      [](auto) -> arrow::Result<folly::Unit> { return folly::Unit{}; })
+                          .deferValue([](auto result) { return result.status(); })
+                          .via(&executor);
+        executor.drain();
+        ASSERT_GE(pending.size(), 2);
+        reader.reset();
+        if (mode == "error") {
+          pending.front().MarkFinished(failure);
+        } else {
+          if (mode == "cancel") {
+            future.cancel();
+          }
+          if (mode == "abandon") {
+            future = folly::Future<arrow::Status>::makeEmpty();
+          }
+          pending.front().MarkFinished(std::move(results.front()));
+        }
+        executor.drain();
+        if (mode != "abandon") {
+          EXPECT_FALSE(future.isReady());
+        }
+        EXPECT_FALSE(destroyed);
+        // Complete I/O on another thread; release must still run on the caller
+        // executor. Successful lazy reads can submit the next row group afterwards.
+        size_t completed = 1;
+        while (completed < pending.size()) {
+          const auto end = pending.size();
+          std::thread io([&] {
+            for (; completed < end; ++completed) {
+              pending[completed].MarkFinished(std::move(results[completed]));
+            }
+          });
+          io.join();
+          EXPECT_FALSE(destroyed);
+          executor.drain();
+        }
+        if (mode != "abandon") {
+          ASSERT_TRUE(future.isReady());
+          const auto status = std::move(future).get();
+          if (mode == "error") {
+            EXPECT_EQ(status, failure);
+          } else if (mode == "cancel") {
+            EXPECT_TRUE(status.IsCancelled()) << status;
+          } else {
+            EXPECT_TRUE(status.ok()) << status;
+          }
+        }
+        EXPECT_TRUE(destroyed);
+        EXPECT_EQ(destroyed_on, std::this_thread::get_id());
+        stats->file_destroyed = {};
+        stats->data_read = {};
+      }
+    }
+  }
 }
 
 TEST_P(FormatReaderTest, ParquetAsyncReadRejectsInlineExecutor) {

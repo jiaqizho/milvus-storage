@@ -730,6 +730,7 @@ folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>
   SplitAsyncTasks(all_tasks, std::max<size_t>(parallelism, 1), ChunkTask::SplitTraits{get_chunk_info},
                   GetAsyncTaskSplitStrategy(properties_));
 
+  folly::CancellationSource cancellation;
   std::vector<folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>>> futures;
   std::vector<std::vector<int64_t>> task_chunk_lists;
   futures.reserve(all_tasks.size());
@@ -738,22 +739,21 @@ folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>
   // Create every backend future before fan-in. parallelism influences task
   // splitting, but this layer does not impose a separate in-flight limit.
   for (auto& task : all_tasks) {
+    task.cancellation = cancellation.getToken();
     task_chunk_lists.push_back(task.chunk_indices);
     futures.push_back(chunk_reader_->get_chunks_async(task));
   }
 
   // Associate results with task chunk ids, then rebuild the original request;
   // asynchronous completion order is intentionally irrelevant.
-  return folly::collectAll(std::move(futures))
-      .deferValue([chunk_indices, task_chunk_lists = std::move(task_chunk_lists)](
-                      auto&& all_results) -> arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> {
+  return CollectReadTasks(
+      std::move(cancellation), std::move(futures),
+      [chunk_indices, task_chunk_lists = std::move(task_chunk_lists)](
+          auto&& all_results) -> arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> {
         std::unordered_map<int64_t, std::shared_ptr<arrow::RecordBatch>> all_rbs;
         for (size_t i = 0; i < all_results.size(); ++i) {
           auto& tryResult = all_results[i];
-          if (tryResult.hasException()) {
-            return arrow::Status::IOError(tryResult.exception().what().toStdString());
-          }
-          ARROW_ASSIGN_OR_RAISE(auto rbs, std::move(tryResult.value()));
+          auto rbs = std::move(tryResult.value()).ValueOrDie();
 
           auto& chunk_list = task_chunk_lists[i];
           if (rbs.size() != chunk_list.size()) {
@@ -951,12 +951,18 @@ class ReaderImpl : public Reader {
     auto* chunk_reader_ptr = chunk_reader.get();
     // The continuation owns the ChunkReaderImpl while open_async() initializes
     // it through the temporary raw pointer.
-    return chunk_reader_ptr->open_async().deferValue(
+    folly::CancellationSource cancellation;
+    std::vector<folly::SemiFuture<arrow::Result<std::unique_ptr<ChunkReader>>>> futures;
+    auto future = chunk_reader_ptr->open_async().deferValue(
         [chunk_reader =
              std::move(chunk_reader)](arrow::Status status) mutable -> arrow::Result<std::unique_ptr<ChunkReader>> {
           ARROW_RETURN_NOT_OK(status);
           return std::move(chunk_reader);
         });
+    futures.push_back(StartReadTask(cancellation.getToken(), std::move(future)));
+    return CollectReadTasks(
+        std::move(cancellation), std::move(futures),
+        [](auto results) -> arrow::Result<std::unique_ptr<ChunkReader>> { return std::move(results.front().value()); });
   }
 
   /**
@@ -1021,11 +1027,13 @@ class ReaderImpl : public Reader {
 
     // Fan out file-aware tasks across all required column groups, then combine
     // the reordered per-group tables into the requested logical column order.
-    return take_tables_async(row_indices, needed_column_groups, lazy_readers, parallelism)
-        .deferValue([row_indices, resolved_columns = std::move(resolved_columns), schema = schema_,
-                     lazy_readers](auto&& tables_result) -> arrow::Result<std::shared_ptr<arrow::Table>> {
+    folly::CancellationSource cancellation;
+    const auto token = cancellation.getToken();
+    return take_tables_async(row_indices, needed_column_groups, lazy_readers, parallelism, std::move(cancellation))
+        .deferValue([row_indices, resolved_columns = std::move(resolved_columns), schema = schema_, lazy_readers,
+                     token](auto&& tables_result) -> arrow::Result<std::shared_ptr<arrow::Table>> {
           ARROW_ASSIGN_OR_RAISE(auto tables, std::move(tables_result));
-          return build_take_table(tables, row_indices, resolved_columns, schema);
+          return FinishReadResult(token, build_take_table(tables, row_indices, resolved_columns, schema));
         });
   }
 
@@ -1038,7 +1046,8 @@ class ReaderImpl : public Reader {
       const std::vector<int64_t>& row_indices,
       const std::vector<std::shared_ptr<ColumnGroup>>& column_groups,
       std::shared_ptr<std::vector<std::unique_ptr<ColumnGroupLazyReader>>> lazy_readers,
-      size_t parallelism);
+      size_t parallelism,
+      folly::CancellationSource cancellation);
 
   [[nodiscard]] arrow::Result<std::shared_ptr<std::vector<std::unique_ptr<ColumnGroupLazyReader>>>> create_lazy_readers(
       const std::vector<std::shared_ptr<ColumnGroup>>& needed_column_groups,
@@ -1325,7 +1334,8 @@ folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::Table>>>> Rea
     const std::vector<int64_t>& row_indices,
     const std::vector<std::shared_ptr<ColumnGroup>>& column_groups,
     std::shared_ptr<std::vector<std::unique_ptr<ColumnGroupLazyReader>>> lazy_readers,
-    size_t parallelism) {
+    size_t parallelism,
+    folly::CancellationSource cancellation) {
   // Build one flat task list across all required column groups and files before fan-out.
   FOLLY_ARROW_ASSIGN_OR_RAISE(auto all_tasks, TakeTask::Build(column_groups, row_indices));
   auto& readers = *lazy_readers;
@@ -1343,6 +1353,7 @@ folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::Table>>>> Rea
   // Submit the complete cross-column-group task set before waiting, allowing
   // native async backends to overlap work across both files and column groups.
   for (auto& task : all_tasks) {
+    task.cancellation = cancellation.getToken();
     task_cg_indices.push_back(task.reader_index);
     task_positions.push_back(std::move(task.original_positions));
     futures.push_back(readers[task.reader_index]->take_async(task));
@@ -1350,19 +1361,17 @@ folly::SemiFuture<arrow::Result<std::vector<std::shared_ptr<arrow::Table>>>> Rea
 
   // Keep the readers alive for every in-flight task. The saved positions remove
   // both task-splitting order and completion order from the final row order.
-  return folly::collectAll(std::move(futures))
-      .deferValue([row_indices, lazy_readers, task_cg_indices = std::move(task_cg_indices),
-                   task_positions = std::move(task_positions)](
-                      auto&& all_results) -> arrow::Result<std::vector<std::shared_ptr<arrow::Table>>> {
+  return CollectReadTasks(
+      std::move(cancellation), std::move(futures),
+      [row_indices, lazy_readers, task_cg_indices = std::move(task_cg_indices),
+       task_positions =
+           std::move(task_positions)](auto&& all_results) -> arrow::Result<std::vector<std::shared_ptr<arrow::Table>>> {
         std::vector<std::vector<std::shared_ptr<arrow::Table>>> per_cg_tables(lazy_readers->size());
         std::vector<std::vector<size_t>> per_cg_positions(lazy_readers->size());
 
         for (size_t i = 0; i < all_results.size(); ++i) {
           auto& tryResult = all_results[i];
-          if (tryResult.hasException()) {
-            return arrow::Status::IOError(tryResult.exception().what().toStdString());
-          }
-          ARROW_ASSIGN_OR_RAISE(auto table, std::move(tryResult.value()));
+          auto table = std::move(tryResult.value()).ValueOrDie();
           size_t cg_idx = task_cg_indices[i];
           per_cg_tables[cg_idx].push_back(std::move(table));
           per_cg_positions[cg_idx].insert(per_cg_positions[cg_idx].end(), task_positions[i].begin(),

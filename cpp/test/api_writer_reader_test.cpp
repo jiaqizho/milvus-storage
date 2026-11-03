@@ -31,6 +31,7 @@
 #include <arrow/io/api.h>
 #include <arrow/testing/gtest_util.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/executors/ManualExecutor.h>
 
 #include "include/test_env.h"
 #include "milvus-storage/common/arrow_util.h"
@@ -1915,6 +1916,93 @@ TEST_P(APIWriterReaderTest, PublicGetChunkReaderAsync) {
   ASSERT_EQ(chunks.size(), 1);
   ASSERT_EQ(chunks[0]->num_rows(), test_batch_->num_rows());
   ExpectStandardTestValue(chunks[0]->column(0), "id", 0);
+}
+
+TEST_P(APIWriterReaderTest, PublicAsyncCancellationBeforeStartSkipsFileOpen) {
+  ASSERT_EQ(SetValue(properties_, PROPERTY_READER_METADATA_CACHE_ENABLE, "false"), std::nullopt);
+  ASSERT_AND_ASSIGN(auto policy, CreateSinglePolicy(format, schema_));
+  auto writer = Writer::create(base_path_, schema_, std::move(policy), properties_);
+  ASSERT_STATUS_OK(writer->write(test_batch_));
+  ASSERT_AND_ASSIGN(auto cgs, writer->close());
+  auto reader = Reader::create(cgs, schema_, nullptr, properties_);
+  ASSERT_AND_ASSIGN(auto chunks, reader->get_chunk_reader(0));
+
+  folly::ManualExecutor executor;
+  auto range = chunks->get_chunks_async({0}, parallelism_)
+                   .deferValue([](auto result) { return result.status(); })
+                   .via(&executor);
+  auto take = reader->take_async({0, 3, 7}, parallelism_)
+                  .deferValue([](auto result) { return result.status(); })
+                  .via(&executor);
+  auto open = reader->get_chunk_reader_async(0).deferValue([](auto result) { return result.status(); }).via(&executor);
+  range.cancel();
+  take.cancel();
+  open.cancel();
+  // A cancelled queued operation must not reopen its files. Otherwise this
+  // produces a real I/O error, which must not be disguised as cancellation.
+  ASSERT_STATUS_OK(DeleteTestDir(fs_, base_path_));
+  const auto range_status = std::move(range).getVia(&executor);
+  const auto take_status = std::move(take).getVia(&executor);
+  const auto open_status = std::move(open).getVia(&executor);
+  EXPECT_TRUE(range_status.IsCancelled()) << range_status;
+  EXPECT_TRUE(take_status.IsCancelled()) << take_status;
+  EXPECT_TRUE(open_status.IsCancelled()) << open_status;
+  ASSERT_STATUS_OK(CreateTestDir(fs_, base_path_));
+}
+
+TEST_P(APIWriterReaderTest, ColumnGroupCancellationIsIndependentOfFormat) {
+  ASSERT_EQ(SetValue(properties_, PROPERTY_READER_METADATA_CACHE_ENABLE, "false"), std::nullopt);
+  ASSERT_AND_ASSIGN(auto policy, CreateSinglePolicy(format, schema_));
+  auto writer = Writer::create(base_path_, schema_, std::move(policy), properties_);
+  ASSERT_STATUS_OK(writer->write(test_batch_));
+  ASSERT_AND_ASSIGN(auto cgs, writer->close());
+  const auto& group = (*cgs)[0];
+  ASSERT_AND_ASSIGN(auto chunks, ColumnGroupReader::create(schema_, group, group->columns, properties_, nullptr));
+  ASSERT_AND_ASSIGN(auto lazy, ColumnGroupLazyReader::create(schema_, group, properties_, group->columns, nullptr));
+  auto tasks =
+      ChunkTask::Build({0}, [&chunks](int64_t index) -> const ChunkInfo& { return chunks->get_chunk_info(index); });
+  ASSERT_EQ(tasks.size(), 1);
+  TakeTask take_task{0, 0, {0, 3, 7}, {0, 1, 2}};
+  folly::CancellationSource cancellation;
+  tasks[0].cancellation = cancellation.getToken();
+  take_task.cancellation = cancellation.getToken();
+  auto range = chunks->get_chunks_async(tasks[0]);
+  auto take = lazy->take_async(take_task);
+  // The entry check has already run. Cancellation must be checked when queued
+  // children start, before opening the now-missing files.
+  cancellation.requestCancellation();
+  ASSERT_STATUS_OK(DeleteTestDir(fs_, base_path_));
+  folly::ManualExecutor executor;
+  auto range_result = std::move(range).via(&executor).getVia(&executor);
+  auto take_result = std::move(take).via(&executor).getVia(&executor);
+  EXPECT_TRUE(range_result.status().IsCancelled()) << range_result.status();
+  EXPECT_TRUE(take_result.status().IsCancelled()) << take_result.status();
+  ASSERT_STATUS_OK(CreateTestDir(fs_, base_path_));
+}
+
+TEST_P(APIWriterReaderTest, PublicCancellationAfterFanOutSkipsQueuedFileOpen) {
+  ASSERT_EQ(SetValue(properties_, PROPERTY_READER_METADATA_CACHE_ENABLE, "false"), std::nullopt);
+  ASSERT_AND_ASSIGN(auto policy, CreateSinglePolicy(format, schema_));
+  auto writer = Writer::create(base_path_, schema_, std::move(policy), properties_);
+  ASSERT_STATUS_OK(writer->write(test_batch_));
+  ASSERT_AND_ASSIGN(auto cgs, writer->close());
+  auto reader = Reader::create(cgs, schema_, nullptr, properties_);
+  ASSERT_AND_ASSIGN(auto chunks, reader->get_chunk_reader(0));
+  folly::ManualExecutor range_executor;
+  folly::ManualExecutor take_executor;
+  auto range = chunks->get_chunks_async({0}, parallelism_).via(&range_executor);
+  auto take = reader->take_async({0, 3, 7}, parallelism_).via(&take_executor);
+  // Run the root gate and fan out children, but leave each child queued.
+  ASSERT_EQ(range_executor.step(), 1);
+  ASSERT_EQ(take_executor.step(), 1);
+  range.cancel();
+  take.cancel();
+  ASSERT_STATUS_OK(DeleteTestDir(fs_, base_path_));
+  const auto range_result = std::move(range).getVia(&range_executor);
+  const auto take_result = std::move(take).getVia(&take_executor);
+  EXPECT_TRUE(range_result.status().IsCancelled()) << range_result.status();
+  EXPECT_TRUE(take_result.status().IsCancelled()) << take_result.status();
+  ASSERT_STATUS_OK(CreateTestDir(fs_, base_path_));
 }
 
 TEST_P(APIWriterReaderTest, PublicParquetAsyncAPIsPropagateCallerExecutor) {

@@ -30,6 +30,8 @@
 
 namespace milvus_storage::parquet {
 
+class ParquetInputFile;
+
 class ParquetFormatReader final : public FormatReader, public std::enable_shared_from_this<ParquetFormatReader> {
   public:
   struct MetaTrait {
@@ -121,6 +123,9 @@ class ParquetFormatReader final : public FormatReader, public std::enable_shared
   [[nodiscard]] std::shared_ptr<arrow::Schema> get_schema() const override;
 
   private:
+  template <typename T, typename Mapper>
+  [[nodiscard]] folly::SemiFuture<arrow::Result<T>> collect_row_groups_async(std::vector<int> rg_indices, Mapper mapper);
+
   // Read the selected row groups into one Arrow table using the current
   // Parquet leaf-column projection.
   [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Table>> get_chunks_internal(
@@ -151,6 +156,7 @@ class ParquetFormatReader final : public FormatReader, public std::enable_shared
   std::vector<int> projected_leaf_column_indices_;
   std::vector<RowGroupInfo> row_group_infos_;
   std::shared_ptr<::parquet::arrow::FileReader> file_reader_;
+  std::shared_ptr<ParquetInputFile> input_file_;
 };  // ParquetFormatReader
 
 }  // namespace milvus_storage::parquet

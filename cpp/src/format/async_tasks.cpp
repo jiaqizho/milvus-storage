@@ -41,6 +41,7 @@ ChunkTask ChunkTask::SplitTraits::split(ChunkTask& left) const {
 
   ChunkTask right;
   right.file_index = left.file_index;
+  right.cancellation = left.cancellation;
   right.chunk_indices.assign(left.chunk_indices.begin() + mid, left.chunk_indices.end());
   right.range_start = mid_info.row_offset_in_file;
   right.range_end = left.range_end;
@@ -106,6 +107,7 @@ TakeTask TakeTask::SplitTraits::split(TakeTask& left) const {
       left.file_index,
       {left.row_indices.begin() + mid, left.row_indices.end()},
       {left.original_positions.begin() + mid, left.original_positions.end()},
+      left.cancellation,
   };
   left.row_indices.resize(mid);
   left.original_positions.resize(mid);

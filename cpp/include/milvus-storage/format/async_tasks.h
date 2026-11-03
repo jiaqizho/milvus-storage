@@ -19,6 +19,11 @@
 #include <functional>
 #include <memory>
 #include <vector>
+#include <type_traits>
+#include <utility>
+
+#include <folly/CancellationToken.h>
+#include <folly/futures/Future.h>
 
 #include <arrow/result.h>
 
@@ -28,6 +33,88 @@ namespace milvus_storage::api {
 
 struct ColumnGroup;
 struct ChunkInfo;
+
+// Cancellation is cooperative at task boundaries. Work already submitted to a
+// backend retains its owners and finishes before the public result is resolved.
+inline arrow::Status CheckReadCancellation(const folly::CancellationToken& cancellation) {
+  return cancellation.isCancellationRequested() ? arrow::Status::Cancelled("Read cancelled") : arrow::Status::OK();
+}
+
+template <typename T>
+arrow::Result<T> FinishReadResult(const folly::CancellationToken& cancellation, arrow::Result<T> result) {
+  if (!result.ok()) {
+    return result;
+  }
+  ARROW_RETURN_NOT_OK(CheckReadCancellation(cancellation));
+  return result;
+}
+
+// Check at execution time, after fan-out may have queued the child. The nested
+// future must defer its I/O until consumed; no reader raw pointer is retained.
+template <typename T>
+folly::SemiFuture<arrow::Result<T>> StartReadTask(folly::CancellationToken cancellation,
+                                                folly::SemiFuture<arrow::Result<T>> future) {
+  // A blocking fallback or validation may already have finished. Preserve its
+  // result, especially a real error, instead of replacing it with cancellation.
+  if (future.isReady()) {
+    return future;
+  }
+  return folly::makeSemiFuture().deferValue(
+      [cancellation = std::move(cancellation), future = std::move(future)](folly::Unit) mutable
+          -> folly::SemiFuture<arrow::Result<T>> {
+        const auto status = CheckReadCancellation(cancellation);
+        if (!status.ok()) {
+          return folly::makeSemiFuture(arrow::Result<T>(status));
+        }
+        return std::move(future);
+      });
+}
+
+// Always await every child, even if cancellation arrives before fan-in starts:
+// some children may already be in flight or contain a real error. Deferred
+// children use StartReadTask to skip I/O when their shared token is cancelled.
+// Bind the handler to the initial promise: a nested promise's handler does not
+// propagate back through Folly's deferred chain or collectAll fan-in.
+template <typename T, typename Mapper>
+auto CollectReadTasks(folly::CancellationSource cancellation,
+                      std::vector<folly::SemiFuture<arrow::Result<T>>> futures,
+                      Mapper mapper) {
+  using Results = std::vector<folly::Try<arrow::Result<T>>>;
+  using Result = std::invoke_result_t<Mapper, Results&&>;
+  const auto token = cancellation.getToken();
+  folly::Promise<folly::Unit> start;
+  start.setInterruptHandler(
+      [source = std::move(cancellation)](const folly::exception_wrapper&) { source.requestCancellation(); });
+  auto deferred = start.getSemiFuture();
+  start.setValue();
+  return std::move(deferred).deferValue([token, futures = std::move(futures),
+                                         mapper = std::move(mapper)](folly::Unit) mutable -> folly::SemiFuture<Result> {
+    return folly::collectAll(std::move(futures))
+        .deferValue([token, mapper = std::move(mapper)](Results results) mutable -> Result {
+          auto cancelled = arrow::Status::OK();
+          // A cancelled child must not hide another child's real error.
+          for (const auto& child : results) {
+            if (child.hasException()) {
+              if (child.exception().template is_compatible_with<folly::FutureCancellation>()) {
+                cancelled = arrow::Status::Cancelled("Read cancelled");
+                continue;
+              }
+              return arrow::Status::IOError(child.exception().what().toStdString());
+            }
+            const auto& status = child.value().status();
+            if (!status.ok()) {
+              if (!status.IsCancelled()) {
+                return status;
+              }
+              cancelled = status;
+            }
+          }
+          ARROW_RETURN_NOT_OK(cancelled);
+          ARROW_RETURN_NOT_OK(CheckReadCancellation(token));
+          return FinishReadResult(token, mapper(std::move(results)));
+        });
+  });
+}
 
 enum class AsyncTaskSplitStrategy : size_t {
   kNoSplit = 0,
@@ -46,6 +133,7 @@ struct ChunkTask {
   std::vector<int64_t> chunk_indices;
   uint64_t range_start;
   uint64_t range_end;
+  folly::CancellationToken cancellation;  // Bound by the submitting reader, after planning.
 
   class SplitTraits {
  public:
@@ -76,6 +164,7 @@ struct TakeTask {
   uint32_t file_index;
   std::vector<int64_t> row_indices;
   std::vector<size_t> original_positions;
+  folly::CancellationToken cancellation;
 
   class SplitTraits {
  public:

@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <arrow/status.h>
+#include <folly/executors/ManualExecutor.h>
 
 #include <memory>
 #include <string>
@@ -98,6 +99,102 @@ TEST(AsyncTasksTest, FollyArrowAssignOrRaiseSupportsSuccessfulStatusSemiFuture) 
   auto status = std::move(assign_or_raise_status_future(true)).get();
 
   EXPECT_TRUE(status.ok()) << status.ToString();
+}
+
+TEST(AsyncTasksTest, CancellationWaitsForChildrenAndPreservesReadErrors) {
+  for (const int first_result : {0, 1, 2}) {
+    for (const bool fail : {false, true}) {
+      SCOPED_TRACE(::testing::Message() << "first=" << first_result << " fail=" << fail);
+      folly::CancellationSource cancellation;
+      folly::Promise<arrow::Result<int>> first;
+      folly::Promise<arrow::Result<int>> last;
+      std::vector<folly::SemiFuture<arrow::Result<int>>> children;
+      children.push_back(first.getSemiFuture());
+      children.push_back(last.getSemiFuture());
+      bool mapped = false;
+      folly::ManualExecutor executor;
+      auto future = CollectReadTasks(cancellation, std::move(children), [&mapped](auto) -> arrow::Result<int> {
+                      mapped = true;
+                      return 42;
+                    }).via(&executor);
+      executor.drain();
+      future.cancel();
+      EXPECT_TRUE(cancellation.isCancellationRequested());
+      if (first_result == 0) {
+        first.setValue(1);
+      } else if (first_result == 1) {
+        first.setValue(arrow::Status::Cancelled("child cancelled"));
+      } else {
+        first.setException(folly::FutureCancellation());
+      }
+      executor.drain();
+      EXPECT_FALSE(future.isReady());
+      const auto failure = arrow::Status::IOError("actual read failure");
+      last.setValue(fail ? arrow::Result<int>(failure) : arrow::Result<int>(2));
+      executor.drain();
+      ASSERT_TRUE(future.isReady());
+      EXPECT_FALSE(future.hasException());
+      const auto result = std::move(future).get();
+      if (fail) {
+        EXPECT_EQ(result.status(), failure);
+      } else {
+        EXPECT_TRUE(result.status().IsCancelled()) << result.status();
+      }
+      EXPECT_FALSE(mapped);
+    }
+  }
+}
+
+TEST(AsyncTasksTest, ReadFanInCompletesAfterAbandonmentAndIgnoresLateCancel) {
+  for (const bool abandon : {false, true}) {
+    folly::Promise<arrow::Result<int>> pending;
+    std::vector<folly::SemiFuture<arrow::Result<int>>> children;
+    children.push_back(pending.getSemiFuture());
+    auto owner = std::make_shared<int>(7);
+    const std::weak_ptr<int> weak = owner;
+    folly::ManualExecutor executor;
+    auto future =
+        CollectReadTasks(folly::CancellationSource{}, std::move(children), [owner](auto results) -> arrow::Result<int> {
+          return *owner + results[0].value().ValueOrDie();
+        }).via(&executor);
+    owner.reset();
+    executor.drain();
+    if (abandon) {
+      future = folly::Future<arrow::Result<int>>::makeEmpty();
+    }
+    EXPECT_FALSE(weak.expired());
+    pending.setValue(5);
+    executor.drain();
+    if (!abandon) {
+      ASSERT_TRUE(future.isReady());
+      future.cancel();
+      const auto result = std::move(future).get();
+      ASSERT_TRUE(result.ok()) << result.status();
+      EXPECT_EQ(*result, 12);
+    }
+    EXPECT_TRUE(weak.expired());
+  }
+}
+
+TEST(AsyncTasksTest, PreStartCancellationPreservesReadyErrorsAndWaitsForStartedChildren) {
+  folly::CancellationSource cancellation;
+  const auto failure = arrow::Status::IOError("already failed before fan-in");
+  folly::Promise<arrow::Result<int>> pending;
+  std::vector<folly::SemiFuture<arrow::Result<int>>> children;
+  children.push_back(StartReadTask(cancellation.getToken(), folly::makeSemiFuture(arrow::Result<int>(failure))));
+  children.push_back(pending.getSemiFuture());
+  folly::ManualExecutor executor;
+  auto future = CollectReadTasks(std::move(cancellation), std::move(children), [](auto) -> arrow::Result<int> {
+                  ADD_FAILURE() << "Cancellation and errors must skip result assembly";
+                  return 0;
+                }).via(&executor);
+  future.cancel();
+  executor.drain();
+  EXPECT_FALSE(future.isReady());
+  pending.setValue(1);
+  executor.drain();
+  ASSERT_TRUE(future.isReady());
+  EXPECT_EQ(std::move(future).get().status(), failure);
 }
 
 TEST(AsyncTasksTest, ChunkTaskBuildGroupsByFileAndMergesContiguousRanges) {

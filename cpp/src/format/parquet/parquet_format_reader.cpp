@@ -15,6 +15,7 @@
 #include "milvus-storage/format/parquet/parquet_format_reader.h"
 
 #include <cstring>
+#include <atomic>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -39,6 +40,7 @@
 #include <arrow/util/key_value_metadata.h>
 #include <arrow/util/ubsan.h>
 #include <folly/futures/Promise.h>
+#include <folly/Function.h>
 #include <parquet/file_reader.h>
 #include <parquet/arrow/schema.h>
 #include <parquet/metadata.h>
@@ -81,7 +83,8 @@ static arrow::Result<std::shared_ptr<::parquet::arrow::FileReader>> create_parqu
     const std::function<std::string(const std::string&)>& key_retriever,
     std::shared_ptr<::parquet::FileMetaData> metadata = nullptr,
     uint64_t file_size = 0,
-    uint64_t footer_size = 0);
+    uint64_t footer_size = 0,
+    std::shared_ptr<ParquetInputFile>* input_file = nullptr);
 static arrow::Future<std::shared_ptr<arrow::Buffer>> read_file_async_and_transfer(
     const std::shared_ptr<arrow::io::RandomAccessFile>& file,
     int64_t position,
@@ -152,6 +155,145 @@ static ArrowFuture transfer_arrow_future(ArrowFuture arrow_future,
   }
   return transferred;
 }
+
+// During open, route Parquet's ReadAsync through the provider-native async
+// interface, then transfer completion to the caller's Folly executor before
+// Parquet attaches its CPU continuations. During an async data task, track all
+// reads, including eager prefetch for row groups the generator never reaches.
+class ParquetInputFile final : public arrow::io::RandomAccessFile {
+  public:
+  using Batches = std::vector<std::shared_ptr<arrow::RecordBatch>>;
+  struct ReadTask : std::enable_shared_from_this<ReadTask> {
+    // The extra count belongs to the generator. It prevents a fast I/O from
+    // completing the task while the generator can still submit more reads.
+    std::atomic<size_t> pending{1};
+    folly::Function<void(arrow::Result<Batches>)> complete;
+    arrow::Result<Batches> result;
+    std::shared_ptr<::parquet::arrow::FileReader> reader;
+    std::shared_ptr<arrow::internal::Executor> executor;
+    ParquetInputFile* source = nullptr;  // Owned by reader until Finish().
+
+    void Finish(arrow::Status dispatch_status = arrow::Status::OK()) {
+      auto executor_keep_alive = std::move(executor);
+      source->task_.reset();
+      reader.reset();
+      if (!dispatch_status.ok()) {
+        result = result.ok() ? dispatch_status
+                             : result.status().WithMessage(result.status().message(), "; ", dispatch_status.ToString());
+      }
+      auto completion = std::move(complete);
+      completion(std::move(result));
+    }
+
+    void ReadFinished() {
+      if (pending.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+        return;
+      }
+      // Only the error tail reaches here last. Normal successful reads
+      // drain before generator completion and need no extra executor hop.
+      auto self = shared_from_this();
+      auto status = executor->Spawn([self] { self->Finish(); });
+      if (!status.ok()) {
+        // Executor rejection is exceptional: report it without stranding the
+        // task's ownership cycle. Native callback scopes guard SDK teardown.
+        Finish(std::move(status));
+      }
+    }
+
+    void GeneratorFinished(arrow::Result<Batches> batches) {
+      result = std::move(batches);
+      // Arrow's row-group generator/decode runs on the supplied CPU executor.
+      if (pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        Finish();
+      }
+    }
+  };
+
+  bool StartRead(const std::shared_ptr<ReadTask>& task,
+                   std::shared_ptr<::parquet::arrow::FileReader> reader,
+                   std::shared_ptr<arrow::internal::Executor> executor) {
+    if (task_) {
+      return false;
+    }
+    task_ = task;
+    task_->reader = std::move(reader);
+    task_->executor = std::move(executor);
+    task_->source = this;
+    return true;
+  }
+
+  ParquetInputFile(std::shared_ptr<arrow::io::RandomAccessFile> file,
+                   std::shared_ptr<arrow::internal::Executor> executor,
+                   const int64_t file_size)
+      : file_(std::move(file)), executor_(std::move(executor)), file_size_(file_size) {}
+
+  void StartOpen(std::shared_ptr<arrow::internal::Executor> executor, int64_t file_size) {
+    executor_ = std::move(executor);
+    file_size_ = file_size;
+  }
+  void FinishOpen() { executor_.reset(); }
+  const std::shared_ptr<arrow::io::RandomAccessFile>& file() const { return file_; }
+
+  arrow::Status Close() override { return file_->Close(); }
+  arrow::Status Abort() override { return file_->Abort(); }
+  arrow::Result<int64_t> Tell() const override { return file_->Tell(); }
+  bool closed() const override { return file_->closed(); }
+  arrow::Result<int64_t> Read(int64_t nbytes, void* out) override { return file_->Read(nbytes, out); }
+  arrow::Result<std::shared_ptr<arrow::Buffer>> Read(int64_t nbytes) override { return file_->Read(nbytes); }
+  const arrow::io::IOContext& io_context() const override { return file_->io_context(); }
+  arrow::Result<std::string_view> Peek(int64_t nbytes) override { return file_->Peek(nbytes); }
+  bool supports_zero_copy() const override { return file_->supports_zero_copy(); }
+  arrow::Result<std::shared_ptr<const arrow::KeyValueMetadata>> ReadMetadata() override {
+    return file_->ReadMetadata();
+  }
+  arrow::Future<std::shared_ptr<const arrow::KeyValueMetadata>> ReadMetadataAsync(
+      const arrow::io::IOContext& io_context) override {
+    return file_->ReadMetadataAsync(io_context);
+  }
+  arrow::Status Seek(int64_t position) override { return file_->Seek(position); }
+  arrow::Result<int64_t> GetSize() override {
+    return file_size_ >= 0 ? arrow::Result<int64_t>(file_size_) : file_->GetSize();
+  }
+  arrow::Result<int64_t> ReadAt(int64_t position, int64_t nbytes, void* out) override {
+    return file_->ReadAt(position, nbytes, out);
+  }
+  arrow::Result<std::shared_ptr<arrow::Buffer>> ReadAt(int64_t position, int64_t nbytes) override {
+    return file_->ReadAt(position, nbytes);
+  }
+  arrow::Future<std::shared_ptr<arrow::Buffer>> ReadAsync(const arrow::io::IOContext& io_context,
+                                                          int64_t position,
+                                                          int64_t nbytes) override {
+    if (executor_) {
+      return read_file_async_and_transfer(file_, position, nbytes, executor_);
+    }
+    const auto task = task_;
+    auto future = file_->ReadAsync(io_context, position, nbytes);
+    if (task && !future.is_finished()) {
+      task->pending.fetch_add(1, std::memory_order_relaxed);
+      future.AddCallback([task](const arrow::Result<std::shared_ptr<arrow::Buffer>>&) { task->ReadFinished(); });
+    }
+    return future;
+  }
+  std::vector<arrow::Future<std::shared_ptr<arrow::Buffer>>> ReadManyAsync(
+      const arrow::io::IOContext& io_context, const std::vector<arrow::io::ReadRange>& ranges) override {
+    if (executor_ || task_) {
+      std::vector<arrow::Future<std::shared_ptr<arrow::Buffer>>> futures;
+      futures.reserve(ranges.size());
+      for (const auto& range : ranges) {
+        futures.emplace_back(ReadAsync(io_context, range.offset, range.length));
+      }
+      return futures;
+    }
+    return file_->ReadManyAsync(io_context, ranges);
+  }
+  arrow::Status WillNeed(const std::vector<arrow::io::ReadRange>& ranges) override { return file_->WillNeed(ranges); }
+
+  private:
+  std::shared_ptr<arrow::io::RandomAccessFile> file_;
+  std::shared_ptr<arrow::internal::Executor> executor_;
+  int64_t file_size_;
+  std::shared_ptr<ReadTask> task_;
+};
 
 static arrow::Result<std::vector<RowGroupInfo>> try_build_row_group_infos(
     const std::shared_ptr<::parquet::FileMetaData>& metadata) {
@@ -339,7 +481,8 @@ static arrow::Result<std::shared_ptr<::parquet::arrow::FileReader>> create_parqu
     const std::function<std::string(const std::string&)>& key_retriever,
     std::shared_ptr<::parquet::FileMetaData> metadata,
     uint64_t file_size,
-    uint64_t footer_size) {
+    uint64_t footer_size,
+    std::shared_ptr<ParquetInputFile>* input_file) {
   std::unique_ptr<::parquet::arrow::FileReader> result;
 
   ::parquet::arrow::FileReaderBuilder builder;
@@ -367,9 +510,14 @@ static arrow::Result<std::shared_ptr<::parquet::arrow::FileReader>> create_parqu
     metadata = try_parse_footer_metadata(footer_buffer, reader_props);
   }
 
-  ARROW_RETURN_NOT_OK(builder.Open(std::move(parquet_file), reader_props, metadata));
+  auto source = std::make_shared<ParquetInputFile>(
+      std::move(parquet_file), nullptr, file_size > 0 ? static_cast<int64_t>(file_size) : -1);
+  ARROW_RETURN_NOT_OK(builder.Open(source, reader_props, metadata));
   ARROW_RETURN_NOT_OK(
       builder.memory_pool(arrow::default_memory_pool())->properties(arrow_reader_props)->Build(&result));
+  if (input_file) {
+    *input_file = std::move(source);
+  }
   return std::shared_ptr<::parquet::arrow::FileReader>(std::move(result));
 }
 
@@ -509,14 +657,16 @@ arrow::Result<std::shared_ptr<ParquetFormatReader>> ParquetFormatReader::MetaTra
   const auto file_size = file.Get<uint64_t>(api::kPropertyFileSize);
   const auto footer_size = file.Get<uint64_t>(api::kPropertyFooterSize);
 
+  std::shared_ptr<ParquetInputFile> input_file;
   ARROW_ASSIGN_OR_RAISE(
       auto file_reader,
       create_parquet_file_reader(metadata->payload.fs, metadata->path, metadata->payload.properties,
-                                 metadata->payload.key_retriever, std::move(parquet_metadata), file_size, footer_size));
+                                 metadata->payload.key_retriever, std::move(parquet_metadata), file_size, footer_size, &input_file));
 
   auto reader =
       std::make_shared<ParquetFormatReader>(metadata->payload.fs, metadata->path, metadata->payload.properties,
                                             needed_columns, metadata->payload.key_retriever, file_size, footer_size);
+  reader->input_file_ = std::move(input_file);
   reader->schema_ = metadata->file_schema;
   reader->row_group_infos_ = metadata->row_group_infos;
   reader->file_reader_ = std::shared_ptr<::parquet::arrow::FileReader>(std::move(file_reader));
@@ -545,7 +695,8 @@ arrow::Status ParquetFormatReader::open() {
 
   // create file reader
   ARROW_ASSIGN_OR_RAISE(auto file_reader, create_parquet_file_reader(fs_, path_, properties_, key_retriever_,
-                                                                     nullptr /* metadata */, file_size_, footer_size_));
+                                                                     nullptr /* metadata */, file_size_, footer_size_,
+                                                                     &input_file_));
   return finish_open(std::move(file_reader));
 }
 
@@ -622,70 +773,6 @@ static arrow::Future<std::shared_ptr<arrow::Buffer>> read_file_async_and_transfe
   return transfer_arrow_future(file->ReadAsync(file->io_context(), position, nbytes), executor);
 }
 
-// During open, route Parquet's ReadAsync through the provider-native async
-// interface, then transfer completion to the caller's Folly executor before
-// Parquet attaches its CPU continuations. After open, reads are delegated
-// unchanged to the underlying file.
-class ParquetOpenFile final : public arrow::io::RandomAccessFile {
-  public:
-  ParquetOpenFile(std::shared_ptr<arrow::io::RandomAccessFile> file,
-                  std::shared_ptr<arrow::internal::Executor> executor,
-                  const int64_t file_size)
-      : file_(std::move(file)), executor_(std::move(executor)), file_size_(file_size) {}
-
-  void FinishOpen() { executor_.reset(); }
-
-  arrow::Status Close() override { return file_->Close(); }
-  arrow::Status Abort() override { return file_->Abort(); }
-  arrow::Result<int64_t> Tell() const override { return file_->Tell(); }
-  bool closed() const override { return file_->closed(); }
-  arrow::Result<int64_t> Read(int64_t nbytes, void* out) override { return file_->Read(nbytes, out); }
-  arrow::Result<std::shared_ptr<arrow::Buffer>> Read(int64_t nbytes) override { return file_->Read(nbytes); }
-  const arrow::io::IOContext& io_context() const override { return file_->io_context(); }
-  arrow::Result<std::string_view> Peek(int64_t nbytes) override { return file_->Peek(nbytes); }
-  bool supports_zero_copy() const override { return file_->supports_zero_copy(); }
-  arrow::Result<std::shared_ptr<const arrow::KeyValueMetadata>> ReadMetadata() override {
-    return file_->ReadMetadata();
-  }
-  arrow::Future<std::shared_ptr<const arrow::KeyValueMetadata>> ReadMetadataAsync(
-      const arrow::io::IOContext& io_context) override {
-    return file_->ReadMetadataAsync(io_context);
-  }
-  arrow::Status Seek(int64_t position) override { return file_->Seek(position); }
-  arrow::Result<int64_t> GetSize() override { return file_size_; }
-  arrow::Result<int64_t> ReadAt(int64_t position, int64_t nbytes, void* out) override {
-    return file_->ReadAt(position, nbytes, out);
-  }
-  arrow::Result<std::shared_ptr<arrow::Buffer>> ReadAt(int64_t position, int64_t nbytes) override {
-    return file_->ReadAt(position, nbytes);
-  }
-  arrow::Future<std::shared_ptr<arrow::Buffer>> ReadAsync(const arrow::io::IOContext& io_context,
-                                                          int64_t position,
-                                                          int64_t nbytes) override {
-    if (executor_) {
-      return read_file_async_and_transfer(file_, position, nbytes, executor_);
-    }
-    return file_->ReadAsync(io_context, position, nbytes);
-  }
-  std::vector<arrow::Future<std::shared_ptr<arrow::Buffer>>> ReadManyAsync(
-      const arrow::io::IOContext& io_context, const std::vector<arrow::io::ReadRange>& ranges) override {
-    if (executor_) {
-      std::vector<arrow::Future<std::shared_ptr<arrow::Buffer>>> futures;
-      futures.reserve(ranges.size());
-      for (const auto& range : ranges) {
-        futures.emplace_back(ReadAsync(io_context, range.offset, range.length));
-      }
-      return futures;
-    }
-    return file_->ReadManyAsync(io_context, ranges);
-  }
-  arrow::Status WillNeed(const std::vector<arrow::io::ReadRange>& ranges) override { return file_->WillNeed(ranges); }
-
-  private:
-  std::shared_ptr<arrow::io::RandomAccessFile> file_;
-  std::shared_ptr<arrow::internal::Executor> executor_;
-  int64_t file_size_;
-};
 
 static std::optional<uint32_t> try_parse_footer_length(const std::shared_ptr<arrow::Buffer>& buffer,
                                                        const int64_t expected_read_size,
@@ -790,7 +877,7 @@ static arrow::Future<std::shared_ptr<::parquet::FileMetaData>> read_footer_async
 //                       |                  |
 //                      yes                 no
 //                       |                  |
-//                 source = file    source = ParquetOpenFile
+//                    source = ParquetInputFile
 //                       +---------+--------+
 //                                 v
 //                  ParquetFileReader::OpenAsync
@@ -801,10 +888,9 @@ static arrow::Future<std::shared_ptr<::parquet::FileMetaData>> read_footer_async
 // The function owns every value needed by its callbacks and never accesses or
 // mutates ParquetFormatReader state.
 static arrow::Future<std::shared_ptr<::parquet::arrow::FileReader>> create_file_reader_async(
-    std::shared_ptr<arrow::io::RandomAccessFile> file,
+    std::shared_ptr<ParquetInputFile> file,
     const int64_t file_size,
     const int64_t footer_size,
-    const bool has_known_file_size,
     ::parquet::ReaderProperties reader_properties,
     ::parquet::ArrowReaderProperties arrow_reader_properties,
     std::shared_ptr<arrow::internal::Executor> executor) {
@@ -815,21 +901,15 @@ static arrow::Future<std::shared_ptr<::parquet::arrow::FileReader>> create_file_
         arrow::Status::Invalid(fmt::format("Parquet file size is negative. [file_size={}]", file_size)));
   }
 
-  auto metadata_future = read_footer_async(file, file_size, footer_size, reader_properties, executor);
+  auto metadata_future = read_footer_async(file->file(), file_size, footer_size, reader_properties, executor);
   return metadata_future.Then(
-      [file = std::move(file), file_size, has_known_file_size, reader_properties = std::move(reader_properties),
+      [file = std::move(file), file_size, reader_properties = std::move(reader_properties),
        arrow_reader_properties = std::move(arrow_reader_properties), executor = std::move(executor)](
           const std::shared_ptr<::parquet::FileMetaData>& metadata) mutable -> FileReaderFuture {
         try {
-          std::shared_ptr<ParquetOpenFile> open_file;
-          std::shared_ptr<arrow::io::RandomAccessFile> source = file;
-          if (!metadata || !has_known_file_size) {
-            // Native footer parsing needs provider-native ReadAsync routing.
-            // A size resolved asynchronously must also be exposed through the
-            // synchronous GetSize() called by Parquet's reader constructor.
-            open_file = std::make_shared<ParquetOpenFile>(std::move(file), executor, file_size);
-            source = open_file;
-          }
+          auto open_file = file;
+          open_file->StartOpen(executor, file_size);
+          std::shared_ptr<arrow::io::RandomAccessFile> source = open_file;
 
           // Non-null metadata skips Parquet's native footer read. A nullptr is
           // the explicit fallback signal from read_footer_async.
@@ -964,13 +1044,15 @@ folly::SemiFuture<arrow::Status> ParquetFormatReader::open_async() {
       FOLLY_ARROW_ASSIGN_OR_RAISE(file, self->fs_->OpenInputFile(self->path_));
     }
 
+    auto input_file = std::make_shared<ParquetInputFile>(file, nullptr, -1);
+
     // The Arrow Future chain only constructs a complete file reader. It
     // does not publish intermediate state to this ParquetFormatReader.
     arrow::Future<std::shared_ptr<::parquet::arrow::FileReader>> file_reader_future;
     if (self->file_size_ > 0) {
       // The known size is already attached to the opened file.
       file_reader_future = create_file_reader_async(
-          std::move(file), static_cast<int64_t>(self->file_size_), footer_size, /*has_known_file_size=*/true,
+          input_file, static_cast<int64_t>(self->file_size_), footer_size,
           std::move(reader_properties), std::move(arrow_reader_properties), arrow_executor);
     } else {
       // Resolve a missing size without blocking the consuming thread. A
@@ -985,13 +1067,13 @@ folly::SemiFuture<arrow::Status> ParquetFormatReader::open_async() {
         file_size_future = transfer_arrow_future(std::move(submitted_size_future), arrow_executor);
       }
       file_reader_future =
-          file_size_future.Then([file = std::move(file), footer_size, reader_properties = std::move(reader_properties),
+          file_size_future.Then([file = input_file, footer_size, reader_properties = std::move(reader_properties),
                                  arrow_reader_properties = std::move(arrow_reader_properties),
                                  arrow_executor](const int64_t file_size) mutable {
-            // file_size is operation-local. ParquetOpenFile supplies it to
+            // file_size is operation-local. ParquetInputFile supplies it to
             // Parquet without updating ParquetFormatReader::file_size_.
             return create_file_reader_async(std::move(file), file_size, footer_size,
-                                            /*has_known_file_size=*/false, std::move(reader_properties),
+                                            std::move(reader_properties),
                                             std::move(arrow_reader_properties), std::move(arrow_executor));
           });
     }
@@ -1001,14 +1083,16 @@ folly::SemiFuture<arrow::Status> ParquetFormatReader::open_async() {
     // filesystem destruction cannot be triggered by the CRT callback.
     return bridge_arrow_future(std::move(file_reader_future), std::move(arrow_executor))
         .deferValue(
-            [self](arrow::Result<std::shared_ptr<::parquet::arrow::FileReader>>&& file_reader_result) -> arrow::Status {
+            [self, input_file](arrow::Result<std::shared_ptr<::parquet::arrow::FileReader>>&& file_reader_result) -> arrow::Status {
               if (!file_reader_result.ok()) {
                 const auto& status = file_reader_result.status();
                 return status.WithMessage(status.message(), " [path=", self->path_, "]");
               }
 
               auto file_reader = std::move(file_reader_result).ValueOrDie();
-              return self->finish_open(std::move(file_reader));
+              ARROW_RETURN_NOT_OK(self->finish_open(std::move(file_reader)));
+              self->input_file_ = input_file;
+              return arrow::Status::OK();
             });
   });
 }
@@ -1411,10 +1495,13 @@ arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> ParquetFormatReader::re
 arrow::Result<std::shared_ptr<FormatReader>> ParquetFormatReader::clone_reader() {
   assert(file_reader_);
 
+  std::shared_ptr<ParquetInputFile> input_file;
   ARROW_ASSIGN_OR_RAISE(auto parquet_reader, create_parquet_file_reader(fs_, path_, properties_, key_retriever_,
                                                                         file_reader_->parquet_reader()->metadata(),
-                                                                        file_size_, footer_size_));
-  return std::shared_ptr<ParquetFormatReader>(new ParquetFormatReader(*this, std::move(parquet_reader)));
+                                                                        file_size_, footer_size_, &input_file));
+  auto reader = std::shared_ptr<ParquetFormatReader>(new ParquetFormatReader(*this, std::move(parquet_reader)));
+  reader->input_file_ = std::move(input_file);
+  return reader;
 }
 
 ParquetFormatReader::ParquetFormatReader(const ParquetFormatReader& other,
@@ -1430,6 +1517,56 @@ ParquetFormatReader::ParquetFormatReader(const ParquetFormatReader& other,
       projected_leaf_column_indices_(other.projected_leaf_column_indices_),
       row_group_infos_(other.row_group_infos_),
       file_reader_(std::move(cloned_file_reader)) {}
+
+template <typename T, typename Mapper>
+folly::SemiFuture<arrow::Result<T>> ParquetFormatReader::collect_row_groups_async(std::vector<int> rg_indices,
+                                                                                  Mapper mapper) {
+  using Batches = ParquetInputFile::Batches;
+  auto task = std::make_shared<ParquetInputFile::ReadTask>();
+  return folly::makeSemiFuture().deferExValue([task, mapper = std::move(mapper), file_reader = file_reader_,
+                                           input_file = input_file_, rg_indices = std::move(rg_indices),
+                                           columns = projected_leaf_column_indices_](
+                                              folly::Executor::KeepAlive<> executor,
+                                              folly::Unit) mutable -> folly::SemiFuture<arrow::Result<T>> {
+    FOLLY_ARROW_ASSIGN_OR_RAISE(auto arrow_executor, MakeFollyArrowExecutor(std::move(executor)));
+    folly::Promise<arrow::Result<T>> promise;
+    auto future = promise.getSemiFuture();
+    // Keep postprocessing on the generator's caller executor, rather than
+    // adding a second Folly continuation/enqueue to every successful read.
+    task->complete = [promise = std::move(promise), mapper = std::move(mapper)](arrow::Result<Batches> result) mutable {
+      if (!result.ok()) {
+        promise.setValue(result.status());
+        return;
+      }
+      try {
+        promise.setValue(mapper(std::move(result).ValueOrDie()));
+      } catch (const std::bad_alloc& e) {
+        promise.setValue(arrow::Status::OutOfMemory("Failed to materialize Parquet result: ", e.what()));
+      } catch (const std::exception& e) {
+        promise.setValue(arrow::Status::UnknownError("Failed to materialize Parquet result: ", e.what()));
+      }
+    };
+    if (!input_file->StartRead(task, file_reader, std::move(arrow_executor))) {
+      return folly::makeSemiFuture(
+          arrow::Result<T>(arrow::Status::Invalid("Concurrent async reads on one Parquet format reader")));
+    }
+    try {
+      auto generator = file_reader->GetRecordBatchGenerator(file_reader, rg_indices, columns, task->executor.get(), 0);
+      if (!generator.ok()) {
+        task->GeneratorFinished(generator.status());
+      } else {
+        auto batches = arrow::CollectAsyncGenerator(std::move(generator).ValueOrDie());
+        // This collector has one consumer; move its batches instead of
+        // copying the vector and every batch reference on the success path.
+        batches.AddCallback(
+            [task, batches](const arrow::Result<Batches>&) mutable { task->GeneratorFinished(batches.MoveResult()); });
+      }
+    } catch (const std::exception& e) {
+      task->GeneratorFinished(arrow::Status::UnknownError("Failed to read Parquet row groups: ", e.what()));
+    }
+    return future;
+  });
+}
 
 folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>> ParquetFormatReader::read_with_range_async(
     uint64_t start_offset, uint64_t end_offset) {
@@ -1485,56 +1622,33 @@ folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>> Parq
     projected_schema = arrow::schema(std::move(fields));
   }
 
-  // Defer both generator work and executor binding until the future is consumed.
-  // Building this SemiFuture does not create or select a thread pool: Folly keeps
-  // a DeferredExecutor placeholder until via() or get() supplies the executor.
-  return folly::makeSemiFuture().deferExValue(
-      [file_reader = file_reader_, rg_indices = std::move(rg_indices),
-       projected_leaf_column_indices = projected_leaf_column_indices_, first_rg_slice_offset, total_rows,
-       projected_schema = std::move(projected_schema)](folly::Executor::KeepAlive<> executor,
-                                                       folly::Unit) mutable -> folly::SemiFuture<ResultType> {
-        // The callback now receives a concrete KeepAlive token for the consumer's
-        // executor. The Arrow adapter only retains that token and forwards work;
-        // it does not create an executor or worker thread.
-        FOLLY_ARROW_ASSIGN_OR_RAISE(auto arrow_executor, MakeFollyArrowExecutor(std::move(executor)));
-        // file_reader is captured by shared ownership because Arrow may use it
-        // after this continuation returns.
-        FOLLY_ARROW_ASSIGN_OR_RAISE(
-            auto gen, file_reader->GetRecordBatchGenerator(file_reader, rg_indices, projected_leaf_column_indices,
-                                                           arrow_executor.get(), 0));
+  return collect_row_groups_async<std::shared_ptr<arrow::RecordBatchReader>>(
+      std::move(rg_indices),
+      [first_rg_slice_offset, total_rows, projected_schema = std::move(projected_schema)](
+          std::vector<std::shared_ptr<arrow::RecordBatch>> batches) -> ResultType {
+        // Keep the projected schema even when Arrow produces no batches.
+        if (batches.empty()) {
+          return arrow::RecordBatchReader::Make({}, projected_schema);
+        }
 
-        // Resolve the future only after all selected row groups are materialized;
-        // the returned RecordBatchReader is not progressively fed by the generator.
-        auto arrow_future = arrow::CollectAsyncGenerator(std::move(gen));
-        return bridge_arrow_future(
-            arrow_future.Then([first_rg_slice_offset, total_rows, projected_schema = std::move(projected_schema)](
-                                  std::vector<std::shared_ptr<arrow::RecordBatch>> batches)
-                                  -> arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> {
-              // Keep the projected schema even when Arrow produces no batches.
-              if (batches.empty()) {
-                return arrow::RecordBatchReader::Make({}, projected_schema);
-              }
+        // Drop rows before start_offset from the first overlapping row group.
+        if (first_rg_slice_offset > 0) {
+          batches[0] = batches[0]->Slice(first_rg_slice_offset);
+        }
 
-              // Drop rows before start_offset from the first overlapping row group.
-              if (first_rg_slice_offset > 0) {
-                batches[0] = batches[0]->Slice(first_rg_slice_offset);
-              }
+        // The last overlapping row group may extend past end_offset. Trim
+        // only that suffix after accounting for the first-row-group slice.
+        int64_t total_in_batches = 0;
+        for (const auto& batch : batches) {
+          total_in_batches += batch->num_rows();
+        }
+        if (total_in_batches > static_cast<int64_t>(total_rows)) {
+          int64_t excess = total_in_batches - static_cast<int64_t>(total_rows);
+          auto& last = batches.back();
+          last = last->Slice(0, last->num_rows() - excess);
+        }
 
-              // The last overlapping row group may extend past end_offset. Trim
-              // only that suffix after accounting for the first-row-group slice.
-              int64_t total_in_batches = 0;
-              for (const auto& batch : batches) {
-                total_in_batches += batch->num_rows();
-              }
-              if (total_in_batches > static_cast<int64_t>(total_rows)) {
-                int64_t excess = total_in_batches - static_cast<int64_t>(total_rows);
-                auto& last = batches.back();
-                last = last->Slice(0, last->num_rows() - excess);
-              }
-
-              return arrow::RecordBatchReader::Make(std::move(batches), projected_schema);
-            }),
-            std::move(arrow_executor));
+        return arrow::RecordBatchReader::Make(std::move(batches), projected_schema);
       });
 }
 
@@ -1549,56 +1663,36 @@ folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> ParquetFormatRea
   unique_chunk_indices.erase(std::unique(unique_chunk_indices.begin(), unique_chunk_indices.end()),
                              unique_chunk_indices.end());
 
-  // As with range reads, keep the executor unbound while constructing the
-  // SemiFuture. Folly binds its DeferredExecutor placeholder only when the
-  // consumer drives the future with via() or get().
-  return folly::makeSemiFuture().deferExValue(
-      [file_reader = file_reader_, row_indices, chunk_indices = std::move(chunk_indices),
-       unique_chunk_indices = std::move(unique_chunk_indices),
-       projected_leaf_column_indices = projected_leaf_column_indices_, row_group_infos = row_group_infos_](
-          folly::Executor::KeepAlive<> executor,
-          folly::Unit) mutable -> folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>> {
-        // KeepAlive is now the concrete consumer executor token. This adapter
-        // forwards Arrow work to it without creating a separate thread pool.
-        FOLLY_ARROW_ASSIGN_OR_RAISE(auto arrow_executor, MakeFollyArrowExecutor(std::move(executor)));
-        // Read complete row groups once. Exact row selection happens after the
-        // generator output is concatenated below.
-        FOLLY_ARROW_ASSIGN_OR_RAISE(
-            auto gen, file_reader->GetRecordBatchGenerator(file_reader, unique_chunk_indices,
-                                                           projected_leaf_column_indices, arrow_executor.get(), 0));
+  // Copy the group list before moving its ownership into the mapper.
+  auto groups_to_read = unique_chunk_indices;
+  return collect_row_groups_async<std::shared_ptr<arrow::Table>>(
+      std::move(groups_to_read),
+      [row_indices, chunk_indices = std::move(chunk_indices), unique_chunk_indices = std::move(unique_chunk_indices),
+       row_group_infos = row_group_infos_](
+          std::vector<std::shared_ptr<arrow::RecordBatch>> batches) -> arrow::Result<std::shared_ptr<arrow::Table>> {
+        // Generator output is ordered by unique_chunk_indices. Record
+        // each row group's base offset in the concatenated table.
+        ARROW_ASSIGN_OR_RAISE(auto table, arrow::Table::FromRecordBatches(batches));
 
-        auto arrow_future = arrow::CollectAsyncGenerator(std::move(gen));
-        return bridge_arrow_future(
-            arrow_future.Then(
-                [row_indices = std::move(row_indices), chunk_indices = std::move(chunk_indices),
-                 unique_chunk_indices = std::move(unique_chunk_indices),
-                 row_group_infos = std::move(row_group_infos)](std::vector<std::shared_ptr<arrow::RecordBatch>> batches)
-                    -> arrow::Result<std::shared_ptr<arrow::Table>> {
-                  // Generator output is ordered by unique_chunk_indices. Record
-                  // each row group's base offset in the concatenated table.
-                  ARROW_ASSIGN_OR_RAISE(auto table, arrow::Table::FromRecordBatches(batches));
+        std::unordered_map<int, int64_t> chunk_base_offsets;
+        int64_t current_accumulated_rows = 0;
+        for (int chunk_id : unique_chunk_indices) {
+          chunk_base_offsets[chunk_id] = current_accumulated_rows;
+          const auto& rg_info = row_group_infos[chunk_id];
+          current_accumulated_rows += (rg_info.end_offset - rg_info.start_offset);
+        }
 
-                  std::unordered_map<int, int64_t> chunk_base_offsets;
-                  int64_t current_accumulated_rows = 0;
-                  for (int chunk_id : unique_chunk_indices) {
-                    chunk_base_offsets[chunk_id] = current_accumulated_rows;
-                    const auto& rg_info = row_group_infos[chunk_id];
-                    current_accumulated_rows += (rg_info.end_offset - rg_info.start_offset);
-                  }
+        // Translate file-global row indices into offsets in the dense
+        // table containing only the selected row groups.
+        std::vector<int64_t> table_take_indices(row_indices.size());
+        for (size_t i = 0; i < row_indices.size(); ++i) {
+          int chunk_id = chunk_indices[i];
+          table_take_indices[i] =
+              chunk_base_offsets[chunk_id] + (row_indices[i] - row_group_infos[chunk_id].start_offset);
+        }
 
-                  // Translate file-global row indices into offsets in the dense
-                  // table containing only the selected row groups.
-                  std::vector<int64_t> table_take_indices(row_indices.size());
-                  for (size_t i = 0; i < row_indices.size(); ++i) {
-                    int chunk_id = chunk_indices[i];
-                    table_take_indices[i] =
-                        chunk_base_offsets[chunk_id] + (row_indices[i] - row_group_infos[chunk_id].start_offset);
-                  }
-
-                  // Materialize exactly the requested rows in caller order.
-                  return CopySelectedRows(table, table_take_indices);
-                }),
-            std::move(arrow_executor));
+        // Materialize exactly the requested rows in caller order.
+        return CopySelectedRows(table, table_take_indices);
       });
 }
 
